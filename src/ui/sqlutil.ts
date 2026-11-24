@@ -201,3 +201,421 @@ export function detectEditContext(
   const schemaName = s.name;
   return { ctx: { schema: schemaName, table: t.name, pk: t.primaryKey, colMap, pkIdx, types }, reason: "" };
 }
+
+// ---------------------------------------------------------------------------------------------
+// Filter bar support: parse a simple single-table SELECT into head / WHERE / ORDER BY / tail and
+// rebuild it. A small lexer keeps strings, quoted identifiers, comments and parentheses out of the
+// keyword search, so `WHERE note = 'order by x'` is not mistaken for an ORDER BY clause.
+
+interface LexOpts {
+  brackets: boolean;
+  backticks: boolean;
+  backslash: boolean;
+  dollar: boolean;
+  hash: boolean;
+}
+
+function lexOpts(driver: Driver): LexOpts {
+  switch (driver) {
+    case "mysql":
+      return { brackets: false, backticks: true, backslash: true, dollar: false, hash: true };
+    case "mssql":
+      return { brackets: true, backticks: false, backslash: false, dollar: false, hash: false };
+    case "sqlite":
+      return { brackets: true, backticks: true, backslash: false, dollar: false, hash: false };
+    default:
+      return { brackets: false, backticks: false, backslash: false, dollar: true, hash: false };
+  }
+}
+
+type TokKind = "word" | "id" | "str" | "num" | "op" | "comment";
+interface Tok {
+  k: TokKind;
+  s: number;
+  e: number;
+  /** Lower-cased text for words, raw text otherwise. */
+  text: string;
+  /** Parenthesis depth (a "(" has the depth outside it, a ")" the depth outside it as well). */
+  depth: number;
+}
+
+const WORD_START = /[A-Za-z_\u0080-￿]/;
+const WORD_CHAR = /[\w$\u0080-￿]/;
+
+/** Tokenizes `sql`; null when a string, quoted identifier or block comment is not terminated. */
+function lex(sql: string, driver: Driver): Tok[] | null {
+  const o = lexOpts(driver);
+  const out: Tok[] = [];
+  const n = sql.length;
+  let depth = 0;
+  let i = 0;
+  const push = (k: TokKind, s: number, e: number, d = depth): void => {
+    out.push({ k, s, e, text: k === "word" ? sql.slice(s, e).toLowerCase() : sql.slice(s, e), depth: d });
+  };
+  while (i < n) {
+    const c = sql[i];
+    if (/\s/.test(c)) {
+      i++;
+      continue;
+    }
+    if (c === "-" && sql[i + 1] === "-") {
+      let j = i;
+      while (j < n && sql[j] !== "\n") j++;
+      push("comment", i, j);
+      i = j;
+      continue;
+    }
+    if (o.hash && c === "#") {
+      let j = i;
+      while (j < n && sql[j] !== "\n") j++;
+      push("comment", i, j);
+      i = j;
+      continue;
+    }
+    if (c === "/" && sql[i + 1] === "*") {
+      const j = sql.indexOf("*/", i + 2);
+      if (j < 0) return null;
+      push("comment", i, j + 2);
+      i = j + 2;
+      continue;
+    }
+    if (c === "'") {
+      let j = i + 1;
+      for (;;) {
+        if (j >= n) return null;
+        if (o.backslash && sql[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (sql[j] === "'") {
+          if (sql[j + 1] === "'") {
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        j++;
+      }
+      push("str", i, j + 1);
+      i = j + 1;
+      continue;
+    }
+    if (c === '"' || (c === "`" && o.backticks) || (c === "[" && o.brackets)) {
+      const close = c === "[" ? "]" : c;
+      let j = i + 1;
+      for (;;) {
+        if (j >= n) return null;
+        if (sql[j] === close) {
+          if (sql[j + 1] === close) {
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        j++;
+      }
+      push("id", i, j + 1);
+      i = j + 1;
+      continue;
+    }
+    if (c === "$" && o.dollar) {
+      const m = /^\$[A-Za-z_\u0080-￿]*\$/.exec(sql.slice(i, i + 64));
+      if (m) {
+        const j = sql.indexOf(m[0], i + m[0].length);
+        if (j < 0) return null;
+        push("str", i, j + m[0].length);
+        i = j + m[0].length;
+        continue;
+      }
+    }
+    if (/[0-9]/.test(c)) {
+      let j = i + 1;
+      while (j < n && /[\w.]/.test(sql[j])) j++;
+      push("num", i, j);
+      i = j;
+      continue;
+    }
+    if (WORD_START.test(c)) {
+      let j = i + 1;
+      while (j < n && WORD_CHAR.test(sql[j])) j++;
+      push("word", i, j);
+      i = j;
+      continue;
+    }
+    if (c === "(") {
+      push("op", i, i + 1, depth);
+      depth++;
+    } else if (c === ")") {
+      depth = Math.max(0, depth - 1);
+      push("op", i, i + 1, depth);
+    } else push("op", i, i + 1);
+    i++;
+  }
+  return out;
+}
+
+/** Replaces every comment (outside strings) by a space. */
+function blankComments(sql: string, toks: Tok[]): string {
+  let out = "";
+  let at = 0;
+  for (const t of toks) {
+    if (t.k !== "comment") continue;
+    out += sql.slice(at, t.s) + " ";
+    at = t.e;
+  }
+  return out + sql.slice(at);
+}
+
+const AGGREGATES = new Set([
+  "count", "sum", "avg", "min", "max", "group_concat", "string_agg", "array_agg", "json_agg", "jsonb_agg",
+  "listagg", "total", "every", "bool_and", "bool_or", "stddev", "variance", "json_arrayagg", "json_objectagg",
+]);
+const TABLE_STOP = new Set(["where", "order", "limit", "offset", "fetch", "for", "group", "having", "union", "intersect", "except", "window", "join", "inner", "left", "right", "full", "cross", "natural", "on", "using", "into", "lateral", "tablesample", "with", "returning"]);
+const FOR_LOCK = /^(update|share|no|key)$/;
+
+/** A simple single-table SELECT split around its WHERE / ORDER BY clauses. */
+export interface ParsedSelect {
+  /** Leading comments / whitespace of the statement, kept verbatim. */
+  prefix: string;
+  /** `SELECT <cols> FROM <table> [alias]`, comments removed. */
+  head: string;
+  /** WHERE condition without the keyword ("" when absent). */
+  where: string;
+  /** ORDER BY list without the keywords ("" when absent). */
+  order: string;
+  /** Everything from LIMIT / OFFSET / FETCH / FOR on ("" when absent). */
+  tail: string;
+  schema: string | null;
+  table: string;
+}
+
+/**
+ * Splits a simple `SELECT <cols> FROM <table> [WHERE …] [ORDER BY …] [LIMIT/OFFSET/FETCH/FOR …]`.
+ * Returns null for anything else (joins, aggregates, grouping, set operations, subquery sources,
+ * other statement kinds). A trailing `;` is dropped. Comments inside the statement are dropped.
+ */
+export function parseFilterable(statement: string, driver: Driver): ParsedSelect | null {
+  if (driver === "redis" || driver === "kafka") return null;
+  const first = lex(statement, driver);
+  if (!first) return null;
+  const real = first.find((t) => t.k !== "comment");
+  if (!real) return null;
+  const prefix = statement.slice(0, real.s);
+  const body = blankComments(statement.slice(real.s), first.filter((t) => t.s >= real.s)
+    .map((t) => ({ ...t, s: t.s - real.s, e: t.e - real.s })));
+  const toks = lex(body, driver);
+  if (!toks) return null;
+  while (toks.length && toks[toks.length - 1].k === "op" && toks[toks.length - 1].text === ";") toks.pop();
+  if (toks.some((t) => t.k === "op" && t.text === ";")) return null;
+  if (toks.length < 4 || toks[0].k !== "word" || toks[0].text !== "select") return null;
+  const wd = (i: number): string => (toks[i] && toks[i].k === "word" && toks[i].depth === 0 ? toks[i].text : "");
+  const from = toks.findIndex((t) => t.k === "word" && t.depth === 0 && t.text === "from");
+  if (from < 2) return null;
+  for (let i = 1; i < from; i++) {
+    const t = toks[i];
+    if (t.k === "word" && (AGGREGATES.has(t.text) && toks[i + 1]?.text === "(")) return null;
+    if (t.k === "word" && t.depth === 0 && (t.text === "into" || t.text === "over")) return null;
+    if (t.k === "word" && t.text === "over" && toks[i + 1]?.text === "(") return null;
+  }
+  // table reference: ident(.ident){0,2} [[AS] alias]
+  let i = from + 1;
+  const parts: string[] = [];
+  const isName = (t: Tok | undefined): boolean => !!t && (t.k === "id" || (t.k === "word" && !TABLE_STOP.has(t.text) && t.text !== "select"));
+  if (!isName(toks[i])) return null;
+  parts.push(body.slice(toks[i].s, toks[i].e));
+  let end = toks[i].e;
+  i++;
+  while (toks[i]?.text === "." && isName(toks[i + 1]) && parts.length < 3) {
+    parts.push(body.slice(toks[i + 1].s, toks[i + 1].e));
+    end = toks[i + 1].e;
+    i += 2;
+  }
+  if (toks[i]?.text === "." || toks[i]?.text === "(" || toks[i]?.text === ",") return null;
+  if (wd(i) === "as") {
+    if (!isName(toks[i + 1])) return null;
+    end = toks[i + 1].e;
+    i += 2;
+  } else if (isName(toks[i]) && toks[i].k !== "word") {
+    end = toks[i].e;
+    i++;
+  } else if (isName(toks[i])) {
+    end = toks[i].e;
+    i++;
+  }
+  const head = body.slice(0, end).trim();
+  // clauses
+  let whereAt = -1;
+  let orderAt = -1;
+  let tailAt = -1;
+  for (let j = i; j < toks.length; j++) {
+    const t = toks[j];
+    if (t.depth !== 0 || t.k !== "word") continue;
+    const w = t.text;
+    if (w === "where" && whereAt < 0 && orderAt < 0 && tailAt < 0 && j === i) whereAt = j;
+    else if (w === "order" && toks[j + 1]?.text === "by" && toks[j + 1].depth === 0 && orderAt < 0 && tailAt < 0) orderAt = j;
+    else if ((w === "limit" || w === "offset" || w === "fetch" || (w === "for" && FOR_LOCK.test(toks[j + 1]?.text ?? ""))) && tailAt < 0) tailAt = j;
+    else if (w === "union" || w === "intersect" || w === "except" || w === "having" || w === "window" || w === "into" || (w === "group" && toks[j + 1]?.text === "by")) return null;
+    else if (w === "join" && tailAt < 0) return null;
+  }
+  // everything between the table reference and the first clause must be empty
+  const firstClause = [whereAt, orderAt, tailAt].filter((x) => x >= 0).sort((a, b) => a - b)[0];
+  if (firstClause === undefined ? i < toks.length : firstClause !== i) return null;
+  if (whereAt < 0 && orderAt < 0 && tailAt < 0 && i < toks.length) return null;
+  const stop = (from0: number): number => {
+    const nexts = [orderAt, tailAt].filter((x) => x > from0);
+    return nexts.length ? Math.min(...nexts) : toks.length;
+  };
+  const text = (a: number, b: number): string => (a >= b ? "" : body.slice(toks[a].s, toks[b - 1].e).trim());
+  const where = whereAt >= 0 ? text(whereAt + 1, stop(whereAt)) : "";
+  const order = orderAt >= 0 ? text(orderAt + 2, tailAt > orderAt ? tailAt : toks.length) : "";
+  const tail = tailAt >= 0 ? text(tailAt, toks.length) : "";
+  if (orderAt >= 0 && whereAt >= 0 && orderAt < whereAt) return null;
+  const table = parts[parts.length - 1];
+  return {
+    prefix,
+    head,
+    where,
+    order,
+    tail,
+    schema: parts.length >= 2 ? unquote(parts[parts.length - 2]) : null,
+    table: unquote(table),
+  };
+}
+
+/** Rebuilds the statement with new WHERE / ORDER BY texts (empty = clause omitted). */
+export function buildFilteredSql(p: ParsedSelect, where: string, order: string): string {
+  const w = where.trim().replace(/;+\s*$/, "").trim();
+  const o = order.trim().replace(/;+\s*$/, "").trim();
+  return p.prefix + [p.head, w ? "WHERE " + w : "", o ? "ORDER BY " + o : "", p.tail].filter(Boolean).join("\n");
+}
+
+export interface OrderItem {
+  /** Expression text as written, e.g. `"name"` or `t.created_at`. */
+  expr: string;
+  /** Unquoted column name when the expression is a plain (qualified) column, else null. */
+  col: string | null;
+  dir: "ASC" | "DESC" | null;
+  /** "NULLS FIRST" / "NULLS LAST" or "". */
+  nulls: string;
+}
+
+/** Splits an ORDER BY list (without the keywords) into items. */
+export function parseOrderItems(order: string, driver: Driver): OrderItem[] {
+  const toks = lex(order, driver)?.filter((t) => t.k !== "comment");
+  if (!toks || toks.length === 0) return [];
+  const groups: Tok[][] = [[]];
+  for (const t of toks) {
+    if (t.k === "op" && t.text === "," && t.depth === 0) groups.push([]);
+    else groups[groups.length - 1].push(t);
+  }
+  const items: OrderItem[] = [];
+  for (const g of groups) {
+    if (g.length === 0) continue;
+    let end = g.length;
+    let nulls = "";
+    let dir: "ASC" | "DESC" | null = null;
+    const w = (k: number): string => (g[k]?.k === "word" ? g[k].text : "");
+    if (end >= 3 && w(end - 2) === "nulls" && (w(end - 1) === "first" || w(end - 1) === "last")) {
+      nulls = "NULLS " + w(end - 1).toUpperCase();
+      end -= 2;
+    }
+    if (end >= 2 && (w(end - 1) === "asc" || w(end - 1) === "desc")) {
+      dir = w(end - 1) === "asc" ? "ASC" : "DESC";
+      end--;
+    }
+    if (nulls === "" && end >= 3 && w(end - 2) === "nulls" && (w(end - 1) === "first" || w(end - 1) === "last")) {
+      nulls = "NULLS " + w(end - 1).toUpperCase();
+      end -= 2;
+    }
+    if (end === 0) continue;
+    const expr = order.slice(g[0].s, g[end - 1].e);
+    // plain column: name(.name)* with nothing else
+    let col: string | null = null;
+    const nameToks = g.slice(0, end);
+    const plain = nameToks.every((t, k) => (k % 2 === 0 ? t.k === "id" || t.k === "word" : t.text === ".")) && nameToks.length % 2 === 1;
+    if (plain) col = unquote(order.slice(nameToks[nameToks.length - 1].s, nameToks[nameToks.length - 1].e));
+    items.push({ expr, col, dir, nulls });
+  }
+  return items;
+}
+
+export function formatOrderItems(items: OrderItem[]): string {
+  return items.map((it) => [it.expr, it.dir ?? "", it.nulls].filter(Boolean).join(" ")).join(", ");
+}
+
+/** Sort marks for the grid header: column name (lower-case) and direction, in priority order. */
+export function orderMarks(order: string, driver: Driver): { name: string; dir: "asc" | "desc" }[] {
+  const out: { name: string; dir: "asc" | "desc" }[] = [];
+  for (const it of parseOrderItems(order, driver)) if (it.col !== null) out.push({ name: it.col.toLowerCase(), dir: it.dir === "DESC" ? "desc" : "asc" });
+  return out;
+}
+
+/**
+ * New ORDER BY text after a click on a column header: ASC → DESC → cleared. With `append`
+ * (shift-click) the column joins / cycles inside the existing sort instead of replacing it.
+ */
+export function nextOrder(order: string, column: string, append: boolean, driver: Driver): string {
+  const items = parseOrderItems(order, driver);
+  const low = column.toLowerCase();
+  const idx = items.findIndex((it) => it.col !== null && it.col.toLowerCase() === low);
+  const q = quoteIdent(driver, column);
+  if (!append) {
+    if (items.length === 1 && idx === 0) {
+      const it = items[0];
+      if (it.dir === "DESC") return "";
+      return formatOrderItems([{ ...it, dir: "DESC" }]);
+    }
+    return `${q} ASC`;
+  }
+  if (idx < 0) return formatOrderItems([...items, { expr: q, col: column, dir: "ASC", nulls: "" }]);
+  const it = items[idx];
+  if (it.dir === "DESC") items.splice(idx, 1);
+  else items[idx] = { ...it, dir: "DESC" };
+  return formatOrderItems(items);
+}
+
+const RESERVED = new Set([
+  "all", "and", "any", "as", "asc", "between", "by", "case", "check", "column", "constraint", "create", "cross", "current", "default", "desc",
+  "distinct", "else", "end", "except", "exists", "false", "for", "foreign", "from", "full", "group", "having", "in", "index", "inner", "insert",
+  "into", "is", "join", "key", "left", "like", "limit", "natural", "not", "null", "offset", "on", "or", "order", "outer", "primary", "references",
+  "right", "select", "set", "table", "then", "to", "true", "union", "unique", "update", "user", "using", "values", "when", "where", "with",
+  "year", "month", "day", "hour", "minute", "second", "time", "timestamp", "date", "text", "value", "type", "level", "role", "rank", "row", "rows",
+]);
+
+/** True when `name` has to be quoted to be used as an identifier in `driver`'s SQL. */
+export function needsQuote(driver: Driver, name: string): boolean {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return true;
+  if (RESERVED.has(name.toLowerCase())) return true;
+  return driver === "postgres" && name !== name.toLowerCase();
+}
+
+export function quoteIfNeeded(driver: Driver, name: string): string {
+  return needsQuote(driver, name) ? quoteIdent(driver, name) : name;
+}
+
+export interface FilterCompletion {
+  label: string;
+  apply: string;
+  kind: "column" | "keyword";
+  detail?: string;
+}
+
+/** Completion candidates for a filter input: the table's columns plus keywords / operators. */
+export function filterCompletions(
+  kind: "where" | "order",
+  driver: Driver,
+  columns: { name: string; type?: string }[],
+  quoted = false,
+): FilterCompletion[] {
+  const out: FilterCompletion[] = columns.map((c) => {
+    const q = quoted ? quoteIdent(driver, c.name) : quoteIfNeeded(driver, c.name);
+    return { label: q, apply: q, kind: "column" as const, detail: c.type };
+  });
+  const pg = driver === "postgres";
+  const kws =
+    kind === "where"
+      ? ["AND", "OR", "NOT", "IN", "NOT IN", "LIKE", "NOT LIKE", ...(pg ? ["ILIKE", "NOT ILIKE"] : []), "IS NULL", "IS NOT NULL", "BETWEEN", "EXISTS", "TRUE", "FALSE", "NULL"]
+      : ["ASC", "DESC", ...(driver === "mssql" || driver === "mysql" ? [] : ["NULLS FIRST", "NULLS LAST"])];
+  for (const k of kws) out.push({ label: k, apply: k, kind: "keyword" });
+  return out;
+}

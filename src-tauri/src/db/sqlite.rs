@@ -45,6 +45,7 @@ pub fn connect<'a>(
             default_schema: Some("main".to_string()),
             database: Some("main".to_string()),
             backend_id: None,
+            tunnel: None,
         })
     })
 }

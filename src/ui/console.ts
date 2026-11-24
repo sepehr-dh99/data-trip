@@ -3,7 +3,7 @@
 // floating capsule while this console is active.
 import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
-import type { QueryResult, RowEdit, SchemaNode, SessionInfo } from "../types";
+import type { Driver, QueryResult, RowEdit, SchemaNode, SessionInfo } from "../types";
 import { clear, errMsg, h, icon } from "./dom";
 import { DRIVER_LABELS } from "../types";
 import { confirmDialog } from "./confirm";
@@ -12,7 +12,9 @@ import { SqlEditor } from "./editor";
 import { kafkaNames, loadOverview } from "./kafka";
 import { ResultGrid } from "./grid";
 import { store } from "./state";
-import { buildCompletionSchema, detectEditContext, quoteIdent } from "./sqlutil";
+import { buildCompletionSchema, buildFilteredSql, detectEditContext, nextOrder, orderMarks, parseFilterable, quoteIdent } from "./sqlutil";
+import { FilterBar } from "./filterBar";
+import type { FilterState } from "./filterBar";
 import { toast } from "./toast";
 import type { TabPane } from "./tabs";
 
@@ -46,6 +48,8 @@ interface ResultItem {
   maxRows: number;
   grid?: ResultGrid;
   last?: QueryResult;
+  /** Set while the result is a simple single-table SELECT (filter bar + server-side sort). */
+  filter?: FilterState;
 }
 
 let counter = 0;
@@ -68,6 +72,7 @@ export class ConsolePane implements TabPane {
   private tabsEl: HTMLElement;
   private bodyEl: HTMLElement;
   private editorWrap: HTMLElement;
+  private bar: FilterBar;
   private btnRun: HTMLButtonElement;
   private btnRunAll: HTMLButtonElement;
   private btnStop: HTMLButtonElement;
@@ -119,7 +124,8 @@ export class ConsolePane implements TabPane {
     this.bodyEl = h("div", { class: "r-body" });
     const splitter = h("div", { class: "c-split", role: "separator", "aria-orientation": "horizontal", "aria-label": "Resize editor", title: "Drag to resize" });
     this.bindSplitter(splitter);
-    const results = h("div", { class: "c-results" }, this.tabsEl, this.bodyEl);
+    this.bar = new FilterBar(driver, { onApply: (where, order) => this.applyBar(where, order) });
+    const results = h("div", { class: "c-results" }, this.tabsEl, this.bar.el, this.bodyEl);
     this.el = h("div", { class: "console" }, this.editorWrap, splitter, results);
     this.showEmptyResults();
     this.updateSchema();
@@ -290,6 +296,7 @@ export class ConsolePane implements TabPane {
 
   async dispose(): Promise<void> {
     this.alive = false;
+    this.bar.destroy();
     const s = this.session;
     this.session = null;
     this.editor.destroy();
@@ -483,6 +490,7 @@ export class ConsolePane implements TabPane {
     clear(this.tabsEl);
     clear(this.bodyEl);
     this.tabsEl.classList.remove("multi");
+    this.bar.hide();
   }
 
   private showEmptyResults(): void {
@@ -544,6 +552,7 @@ export class ConsolePane implements TabPane {
         }
       }
     });
+    this.syncBar();
     this.host.onStatus(this);
   }
 
@@ -560,6 +569,7 @@ export class ConsolePane implements TabPane {
         void this.rerun(it);
       },
       onExport: () => void this.exportItem(item()),
+      onHeaderSort: (col, append) => this.headerSort(item(), col, append),
     });
   }
 
@@ -589,6 +599,8 @@ export class ConsolePane implements TabPane {
     ref.grid = grid;
     ref.last = res;
     ref.maxRows = maxRows;
+    this.initFilter(ref);
+    this.syncBar();
     const label = ref.tab.querySelector(".r-label");
     if (label) label.textContent = `${total > 1 ? `Result ${n}` : "Result"} · ${res.rows.length.toLocaleString()}${res.truncated ? "+" : ""}`;
     this.status.rows = res.rows.length;
@@ -642,6 +654,111 @@ export class ConsolePane implements TabPane {
       sql ? h("pre", { class: "r-sql" }, sql) : null,
     );
     this.addItem(total > 1 ? `Error · ${n}` : "Error", sql, view, "err");
+  }
+
+  // ---------------------------------------------------------------- filter bar
+
+  private get driver(): Driver {
+    return store.conns.get(this.connId)?.config.driver ?? "postgres";
+  }
+
+  /** Marks the result as filterable when its statement is a simple single-table SELECT. */
+  private initFilter(item: ResultItem): void {
+    const p = this.isLineBased ? null : parseFilterable(item.sql, this.driver);
+    if (!p || !item.grid || !item.last) {
+      item.filter = undefined;
+      item.grid?.setServerSort(null);
+      return;
+    }
+    item.filter = { where: p.where, order: p.order, draftWhere: p.where, draftOrder: p.order, error: null, columns: this.filterColumns(p.schema, p.table, item.last) };
+    item.grid.setServerSort(orderMarks(p.order, this.driver));
+  }
+
+  /** The table's columns from the cached introspection, else the result's own columns. */
+  private filterColumns(schema: string | null, table: string, res: QueryResult): { name: string; type?: string }[] {
+    const low = (x: string): string => x.toLowerCase();
+    const def = this.currentSchemaName();
+    const pool = schema !== null ? this.schemas().filter((s) => low(s.name) === low(schema)) : [...this.schemas()].sort((a, b) => Number(b.name === def) - Number(a.name === def));
+    for (const sc of pool) {
+      const t = sc.tables.find((x) => x.name === table) ?? sc.tables.find((x) => low(x.name) === low(table));
+      if (t) return t.columns.map((c) => ({ name: c.name, type: c.dataType }));
+    }
+    return res.columns.map((c) => ({ name: c.name, type: c.typeName }));
+  }
+
+  /** Shows the filter bar for the active result (or hides it). */
+  private syncBar(): void {
+    const it = this.items[this.activeItem];
+    if (it?.filter) this.bar.show(it.filter, this.driver);
+    else this.bar.hide();
+  }
+
+  private applyBar(where: string, order: string): void {
+    const it = this.items[this.activeItem];
+    if (it?.filter) void this.applyFilter(it, where, order, "bar");
+  }
+
+  /** Header click on a filterable result: sorts server-side by rewriting ORDER BY. */
+  private headerSort(item: ResultItem, column: string, append: boolean): boolean {
+    const f = item.filter;
+    if (!f) return false;
+    if (item.grid?.hasPending()) {
+      toast("Submit or revert pending changes first", "info");
+      return true;
+    }
+    if (this.running) return true;
+    void this.applyFilter(item, f.where, nextOrder(f.order, column, append, this.driver), "header");
+    return true;
+  }
+
+  /**
+   * Re-runs the result's statement with a new WHERE / ORDER BY. On success the editor text (only
+   * that statement) and the grid are updated; on failure the old result stays and the error is
+   * shown under the bar.
+   */
+  private async applyFilter(item: ResultItem, where: string, order: string, from: "bar" | "header"): Promise<void> {
+    const f = item.filter;
+    const p = parseFilterable(item.sql, this.driver);
+    if (!f || !p || this.running) return;
+    if (item.grid?.hasPending()) {
+      toast("Submit or revert pending changes first", "info");
+      return;
+    }
+    const sql = buildFilteredSql(p, where, order);
+    this.setRunning(true, "Filtering…");
+    this.bar.setBusy(true);
+    try {
+      const sess = await this.ensureSession();
+      const res = await api.execute(sess.sessionId, sql, item.maxRows);
+      if (!this.alive) return;
+      this.editor.replaceStatementText(item.sql, sql);
+      const np = parseFilterable(sql, this.driver);
+      item.sql = sql;
+      item.tab.title = sql;
+      item.last = res;
+      f.where = np?.where ?? where.trim();
+      f.order = np?.order ?? order.trim();
+      f.error = null;
+      f.draftOrder = f.order;
+      if (from === "bar" || f.draftWhere === where) f.draftWhere = f.where;
+      if (item.grid) {
+        this.applyGrid(item.grid, res, item.maxRows);
+        item.grid.setServerSort(orderMarks(f.order, this.driver));
+      }
+      const label = item.tab.querySelector(".r-label");
+      if (label) label.textContent = `${(label.textContent ?? "Result").split(" · ")[0]} · ${res.rows.length.toLocaleString()}${res.truncated ? "+" : ""}`;
+      this.status.rows = res.rows.length;
+      this.status.elapsedMs = res.elapsedMs;
+    } catch (e) {
+      f.error = errMsg(e);
+    } finally {
+      if (this.alive) {
+        this.setRunning(false, "Done");
+        this.bar.setBusy(false);
+        if (this.items[this.activeItem] === item) this.syncBar();
+        this.host.onExecuted(this.connId);
+      }
+    }
   }
 
   private async rerun(item: ResultItem): Promise<void> {

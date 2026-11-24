@@ -6,6 +6,16 @@ export interface ImportCandidate {
   sourceName: string;
   status: "ok" | "warning" | "unsupported";
   message?: string;
+  /** The DataGrip source tunnels through SSH (`<ssh-properties><enabled>true`). */
+  usesSsh?: boolean;
+}
+
+interface RawSsl {
+  enabled: string;
+  mode: string;
+  ca: string;
+  cert: string;
+  key: string;
 }
 
 interface RawSource {
@@ -17,6 +27,8 @@ interface RawSource {
   dbms: string;
   product: string;
   readOnly: boolean;
+  sshEnabled: boolean;
+  ssl: RawSsl | null;
 }
 
 function childText(el: Element, tag: string): string {
@@ -53,7 +65,14 @@ function extractRaw(text: string): RawSource[] {
     const el = root.tagName === "data-source" ? root : root.getElementsByTagName("data-source")[0];
     if (!el) continue;
     const dbInfo = Array.from(el.children).find((c) => c.tagName === "database-info");
+    const child = (tag: string): Element | undefined => Array.from(el.children).find((c) => c.tagName === tag);
+    const sshEl = child("ssh-properties");
+    const sslEl = child("ssl-config");
     out.push({
+      sshEnabled: sshEl ? childText(sshEl, "enabled").toLowerCase() === "true" : false,
+      ssl: sslEl
+        ? { enabled: childText(sslEl, "enabled").toLowerCase(), mode: childText(sslEl, "mode").toUpperCase(), ca: childText(sslEl, "ca-cert"), cert: childText(sslEl, "client-cert"), key: childText(sslEl, "client-key") }
+        : null,
       name: (el.getAttribute("name") ?? "").trim(),
       uuid: (el.getAttribute("uuid") ?? "").trim().toLowerCase(),
       jdbcUrl: childText(el, "jdbc-url"),
@@ -81,6 +100,8 @@ function mergeLocal(main: RawSource[], local: RawSource[]): RawSource[] {
       dbms: m.dbms || l.dbms,
       product: m.product || l.product,
       readOnly: m.readOnly || l.readOnly,
+      sshEnabled: m.sshEnabled || l.sshEnabled,
+      ssl: m.ssl ?? l.ssl,
     };
   });
   return main.length === 0 ? local : merged;
@@ -159,7 +180,7 @@ function parseJdbc(url: string, raw: RawSource, base: ConnectionConfig): Parsed 
     const { host, port } = splitHostPort(m[1]);
     const params = parseParams(m[3] ?? "", /&/);
     const ssl = (params["sslmode"] ?? "").toLowerCase();
-    const sslMode = ["require", "verify-ca", "verify-full"].includes(ssl) ? "require" : ssl === "disable" ? "disable" : "prefer";
+    const sslMode = ssl === "verify-ca" || ssl === "verify-full" ? ssl : ssl === "require" ? "require" : ssl === "disable" ? "disable" : "prefer";
     const cfg: ConnectionConfig = {
       ...base,
       driver: "postgres",
@@ -167,6 +188,9 @@ function parseJdbc(url: string, raw: RawSource, base: ConnectionConfig): Parsed 
       port: port ?? 5432,
       database: dec(m[2] ?? "") || params["dbname"] || null,
       sslMode,
+      sslCaPath: params["sslrootcert"] || null,
+      sslCertPath: params["sslcert"] || null,
+      sslKeyPath: params["sslkey"] || null,
     };
     return { config: cfg, status: "ok" };
   }
@@ -241,6 +265,24 @@ function parseJdbc(url: string, raw: RawSource, base: ConnectionConfig): Parsed 
   return unsupported(`${label} isn't supported`);
 }
 
+function warn(c: ImportCandidate, msg: string): void {
+  if (c.status === "ok") c.status = "warning";
+  c.message = c.message ? `${c.message}; ${msg}` : msg;
+}
+
+/** `<ssl-config>`: mode REQUIRE / VERIFY_CA / VERIFY_FULL and the PEM paths (secrets are never involved). */
+function applySsl(c: ImportCandidate, ssl: RawSsl | null): void {
+  const cfg = c.config;
+  if (!cfg || !ssl || ssl.enabled === "false") return;
+  const mode = ssl.mode === "VERIFY_FULL" ? "verify-full" : ssl.mode === "VERIFY_CA" ? "verify-ca" : ssl.mode === "REQUIRE" ? "require" : null;
+  if (mode) cfg.sslMode = mode;
+  else if (ssl.enabled === "true" && (!cfg.sslMode || cfg.sslMode === "prefer")) cfg.sslMode = "require";
+  if (ssl.ca) cfg.sslCaPath = ssl.ca;
+  if (ssl.cert) cfg.sslCertPath = ssl.cert;
+  if (ssl.key) cfg.sslKeyPath = ssl.key;
+  if ([ssl.ca, ssl.cert, ssl.key].some((p) => /\$[A-Za-z_]+\$/.test(p))) warn(c, "SSL file paths contain a DataGrip macro — fix them after import");
+}
+
 function toCandidate(raw: RawSource): ImportCandidate {
   const sourceName = raw.name || raw.uuid || "Unnamed data source";
   if (/kafka/i.test(`${raw.jdbcUrl} ${raw.driverRef} ${raw.product} ${raw.dbms}`)) {
@@ -259,7 +301,13 @@ function toCandidate(raw: RawSource): ImportCandidate {
   if (raw.readOnly) base.readOnly = true;
   const r = parseJdbc(raw.jdbcUrl, raw, base);
   if (r.config && r.config.driver === "sqlite") r.config.username = null;
-  return { config: r.config, sourceName, status: r.status, message: r.message };
+  const out: ImportCandidate = { config: r.config, sourceName, status: r.status, message: r.message };
+  if (r.config && (r.config.driver === "postgres" || r.config.driver === "mysql")) applySsl(out, raw.ssl);
+  if (r.config && raw.sshEnabled) {
+    out.usesSsh = true;
+    warn(out, "uses an SSH tunnel — choose an SSH configuration after import");
+  }
+  return out;
 }
 
 /**

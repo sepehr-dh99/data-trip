@@ -21,6 +21,11 @@ export interface GridCallbacks {
   onSubmit(edits: RowEdit[]): Promise<void>;
   onLoadMore(): void;
   onExport(): void;
+  /**
+   * Header click. Return true when the click was handled (server-side sort) so the grid skips
+   * its own client-side sort. `append` is true for shift-click.
+   */
+  onHeaderSort?(column: string, append: boolean): boolean;
 }
 
 /** Presentation tweaks for read-only uses of the grid (Redis key viewer / console). */
@@ -70,6 +75,8 @@ export class ResultGrid {
   // view state
   private sortCol = -1;
   private sortDir: 1 | -1 = 1;
+  /** Server-side sort marks (ORDER BY items, lower-case names); null = client-side sorting. */
+  private serverSort: { name: string; dir: "asc" | "desc" }[] | null = null;
   private filter = "";
   private anchor: Pos | null = null;
   private head: Pos | null = null;
@@ -289,7 +296,7 @@ export class ResultGrid {
       const l = v === null ? 4 : String(v).length;
       if (l > len) len = l;
     }
-    return Math.max(72, Math.min(360, Math.round(len * (this.numeric[i] ? 7.6 : 7.9) + (this.numeric[i] ? 34 : 26))));
+    return Math.max(80, Math.min(360, Math.round(len * (this.numeric[i] ? 7.6 : 7.9) + (this.numeric[i] ? 34 : 26))));
   }
 
   private totalW(): number {
@@ -403,12 +410,13 @@ export class ResultGrid {
       const sortMark = h("span", { class: "g-sort" });
       const hc = h(
         "div",
-        { class: "g-hc" + (this.numeric[i] ? " num" : ""), role: "columnheader", style: `width:${this.widths[i]}px`, title: `${col.name} — ${col.typeName}${isPk ? " · primary key" : ""}\nClick to sort` },
+        { class: "g-hc" + (this.numeric[i] ? " num" : ""), role: "columnheader", style: `width:${this.widths[i]}px`, title: `${col.name} — ${col.typeName}${isPk ? " · primary key" : ""}\n${this.serverSort ? "Click to sort (ASC, DESC, off) · Shift+click to add a column" : "Click to sort"}` },
         h("div", { class: "g-hc-main" }, isPk ? icon("key", 11) : null, h("span", { class: "g-hc-name" }, col.name), sortMark),
       );
       (hc as HTMLElement & { _sort?: HTMLElement })._sort = sortMark;
       hc.addEventListener("click", (e) => {
         if ((e.target as HTMLElement).classList.contains("g-rs")) return;
+        if (this.cb.onHeaderSort?.(col.name, e.shiftKey)) return;
         this.toggleSort(i);
       });
       const rs = h("div", { class: "g-rs" });
@@ -424,9 +432,32 @@ export class ResultGrid {
     cells.forEach((hc, i) => {
       const m = (hc as HTMLElement & { _sort?: HTMLElement })._sort;
       if (!m) return;
+      if (this.serverSort) {
+        const k = this.serverSort.findIndex((x) => x.name === this.cols[i]?.name.toLowerCase());
+        const mark = k >= 0 ? this.serverSort[k] : null;
+        m.textContent = mark ? (mark.dir === "asc" ? "▲" : "▼") + (this.serverSort.length > 1 ? String(k + 1) : "") : "";
+        hc.classList.toggle("sorted", mark !== null);
+        return;
+      }
       m.textContent = i === this.sortCol ? (this.sortDir === 1 ? "▲" : "▼") : "";
       hc.classList.toggle("sorted", i === this.sortCol);
     });
+  }
+
+  /**
+   * Switches the header to server-side sorting (marks mirror the statement's ORDER BY) or, with
+   * null, back to client-side sorting of the loaded rows.
+   */
+  setServerSort(marks: { name: string; dir: "asc" | "desc" }[] | null): void {
+    const was = this.serverSort !== null;
+    this.serverSort = marks;
+    if (marks !== null && this.sortCol >= 0) {
+      this.sortCol = -1;
+      this.sortDir = 1;
+      this.rebuildOrder();
+    }
+    if (was !== (marks !== null)) this.buildHeader();
+    else this.updateSortMarks();
   }
 
   private toggleSort(c: number): void {

@@ -148,8 +148,17 @@ export async function copyText(text: string): Promise<void> {
   }
 }
 
+/** Error text for people: the machine prefixes `VAULT_TOKEN_INVALID:<profileId>:` / `SSH_HOST_*:…` are dropped. */
+export function humanMsg(m: string): string {
+  const v = /^\s*VAULT_TOKEN_INVALID:[^:]*:\s*/.exec(m);
+  if (v) return m.slice(v[0].length);
+  const s = /^\s*SSH_HOST_(UNKNOWN|CHANGED):(?:\[[^\]]+\]|[^:\s]+):\d+:\S+\s*/.exec(m);
+  if (s) return m.slice(s[0].length) || (s[1] === "CHANGED" ? "The SSH host key has changed." : "The SSH host key is not trusted yet.");
+  return m;
+}
+
 export function errMsg(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  if (typeof e === "string") return e;
+  if (e instanceof Error) return humanMsg(e.message);
+  if (typeof e === "string") return humanMsg(e);
   return String(e);
 }

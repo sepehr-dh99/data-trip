@@ -195,3 +195,34 @@ SASL mechanism, CA / client cert paths, skip TLS verify, show internal topics. K
   `introspect` → []. Transactions are no-ops; cancel aborts the job and reconnects.
 - DataGrip import: `jdbc:kafka://…`-style or Kafka data sources → unsupported for now (DataGrip stores Kafka
   connections outside dataSources.xml).
+
+## v0.7 additions — shared Vault profiles, SSH tunnels, SSL files
+
+| command | args | returns |
+|---|---|---|
+| list_vault_profiles | – | VaultProfile[] |
+| save_vault_profile | profile, token: string\|null | VaultProfile |
+| delete_vault_profile | id | null (refused while connections use it: error lists their names) |
+| vault_token_info | profile, token: string\|null | VaultTokenInfo |
+| renew_vault_token | profileId | VaultTokenInfo |
+| list_ssh_profiles | – | SshProfile[] |
+| save_ssh_profile | profile, secret: string\|null | SshProfile |
+| delete_ssh_profile | id | null (refused while used) |
+| test_ssh_profile | profile, secret: string\|null | SshCheck |
+| trust_ssh_host | host, port, fingerprint | null |
+
+- Profiles are stored in `<config>/vault_profiles.json` and `<config>/ssh_profiles.json`; secrets in the keychain.
+- `VaultConfig.profileId`: credentials resolution takes address/namespace/token/TLS from the profile; the
+  connection keeps secretPath/usernameKey/passwordKey. Saving a profile invalidates the credential cache of every
+  connection using it. A Vault 403 with a profile token yields an AppError whose message starts with
+  `VAULT_TOKEN_INVALID:<profileId>:` so the UI can offer "Paste new token".
+- `ConnectionConfig.sshProfileId`: before connecting, the backend opens (or reuses) an SSH session for the profile
+  (russh, keep-alive) and a local forward 127.0.0.1:<ephemeral> → <db host>:<db port> resolved on the SSH server;
+  the driver connects to the local end. One SSH session per profile is shared by all sessions; forwards are
+  reference-counted and closed when unused. Host keys: trusted store `<data>/known_hosts.json` (+ read-only
+  ~/.ssh/known_hosts); unknown host → AppError `SSH_HOST_UNKNOWN:<host>:<port>:<fingerprint>`; changed key →
+  `SSH_HOST_CHANGED:…` (hard failure). Supported: PostgreSQL, MySQL, SQL Server, Redis. Kafka over SSH: refused
+  with a clear message (brokers advertise their own addresses).
+- SSL: sslMode "verify-ca"/"verify-full" + sslCaPath, sslCertPath, sslKeyPath for PostgreSQL and MySQL.
+- DataGrip import: `<ssh-properties><enabled>true</enabled>` → warning "uses an SSH tunnel — choose an SSH
+  configuration after import"; `<ssl-config>` (ca-cert, client-cert, client-key, mode) mapped when present.

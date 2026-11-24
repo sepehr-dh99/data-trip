@@ -6,8 +6,10 @@ import type { ImportCandidate } from "../import/datagrip";
 import { DRIVER_LABELS } from "../types";
 import type { ConnectionConfig } from "../types";
 import { clear, debounce, errMsg, h, icon } from "./dom";
+import { sshStore, sshLabel } from "./sshDialog";
 import { store } from "./state";
 import { toast } from "./toast";
+import { vaults } from "./vault";
 
 type Mode = "paste" | "file";
 
@@ -31,6 +33,7 @@ export function mergeForImport(cfg: ConnectionConfig, existing: ConnectionConfig
     readOnly: cfg.readOnly === true ? true : existing.readOnly,
     authMethod: existing.authMethod,
     vault: existing.vault,
+    sshProfileId: existing.sshProfileId ?? null,
     folder: existing.folder ?? null,
     scope: existing.scope ?? null,
   };
@@ -60,6 +63,28 @@ export function openImportDialog(onImported: (count: number) => void, initialTex
   const btnImport = h("button", { type: "button", class: "btn primary" }, "Import");
   const btnCancel = h("button", { type: "button", class: "btn ghost" }, "Cancel");
   const btnAll = h("button", { type: "button", class: "btn ghost sm" }, "Select all");
+
+  // ---- apply one Vault profile / SSH configuration to every selected row
+  const selVault = h("select", { class: "input", "aria-label": "Vault profile for selected" });
+  const selSshImp = h("select", { class: "input", "aria-label": "SSH configuration for selected" });
+  const applyRow = h(
+    "div",
+    { class: "import-apply" },
+    h("label", { class: "import-apply-f" }, h("span", { class: "field-label" }, "Vault profile"), selVault),
+    h("label", { class: "import-apply-f" }, h("span", { class: "field-label" }, "SSH configuration"), selSshImp),
+    h("div", { class: "import-apply-hint" }, "Applied to every selected row. Vault rows keep an empty secret path until you open them — the connection dialog asks for it."),
+  );
+  applyRow.style.display = "none";
+  const fillApply = (): void => {
+    clear(selVault);
+    selVault.appendChild(h("option", { value: "" }, "Keep as is (password)"));
+    for (const p of vaults.profiles) selVault.appendChild(h("option", { value: p.id }, p.name));
+    clear(selSshImp);
+    selSshImp.appendChild(h("option", { value: "" }, "No tunnel"));
+    for (const p of sshStore.profiles) selSshImp.appendChild(h("option", { value: p.id }, `${p.name} — ${sshLabel(p)}`));
+    applyRow.style.display = vaults.profiles.length || sshStore.profiles.length ? "" : "none";
+  };
+  void Promise.all([vaults.ensureLoaded(), sshStore.load()]).then(fillApply);
 
   const pasteBox = h("div", { class: "import-pane" }, ta, hint);
   const chooseBtn = h(
@@ -255,6 +280,11 @@ export function openImportDialog(onImported: (count: number) => void, initialTex
       try {
         const existing = c.config.id ? store.conns.get(c.config.id) : undefined;
         const cfg = mergeForImport(c.config, existing?.config);
+        if (selVault.value && cfg.driver !== "sqlite") {
+          cfg.authMethod = "vault";
+          cfg.vault = { secretPath: cfg.vault?.secretPath ?? "", usernameKey: cfg.vault?.usernameKey ?? null, passwordKey: cfg.vault?.passwordKey ?? null, profileId: selVault.value };
+        }
+        if (selSshImp.value && cfg.driver !== "sqlite" && cfg.driver !== "kafka") cfg.sshProfileId = selSshImp.value;
         if (existing && existing.status !== "idle") await store.disconnect(cfg.id);
         await api.saveConnection(cfg, null);
         ok++;
@@ -290,6 +320,7 @@ export function openImportDialog(onImported: (count: number) => void, initialTex
       fileBox,
       h("div", { class: "import-list-head" }, h("span", { class: "field-label" }, "Data sources"), h("div", { class: "spacer" }), btnAll),
       list,
+      applyRow,
     ),
     h(
       "div",

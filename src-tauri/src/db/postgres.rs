@@ -35,9 +35,30 @@ fn options(cfg: &ConnectionConfig, password: Option<&str>) -> PgConnectOptions {
     let mode = match cfg.ssl_mode.as_deref() {
         Some("disable") => PgSslMode::Disable,
         Some("require") => PgSslMode::Require,
+        Some("verify-ca") => PgSslMode::VerifyCa,
+        Some("verify-full") => PgSslMode::VerifyFull,
         _ => PgSslMode::Prefer,
     };
-    o.ssl_mode(mode)
+    o = o.ssl_mode(mode);
+    // VERIFY: sqlx 0.8 PgConnectOptions::{ssl_root_cert, ssl_client_cert, ssl_client_key} take impl AsRef<Path>.
+    if let Some(p) = path_opt(&cfg.ssl_ca_path) {
+        o = o.ssl_root_cert(p);
+    }
+    if let Some(p) = path_opt(&cfg.ssl_cert_path) {
+        o = o.ssl_client_cert(p);
+    }
+    if let Some(p) = path_opt(&cfg.ssl_key_path) {
+        o = o.ssl_client_key(p);
+    }
+    o
+}
+
+/// Non-empty path with a leading `~` expanded.
+fn path_opt(p: &Option<String>) -> Option<String> {
+    p.as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(crate::vault::expand_tilde)
 }
 
 pub fn connect<'a>(
@@ -68,6 +89,7 @@ pub fn connect<'a>(
             default_schema,
             database,
             backend_id,
+            tunnel: None,
         })
     })
 }

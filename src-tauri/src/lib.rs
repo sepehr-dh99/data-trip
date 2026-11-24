@@ -6,7 +6,9 @@ pub mod db;
 pub mod error;
 pub mod export;
 pub mod model;
+pub mod profiles;
 pub mod session;
+pub mod ssh;
 pub mod store;
 pub mod vault;
 
@@ -19,6 +21,8 @@ pub struct AppState {
     pub vault_cache: Arc<vault::VaultCache>,
     pub creds: credentials::CredentialSource,
     pub sessions: session::SessionRegistry,
+    pub profiles: Arc<profiles::Profiles>,
+    pub tunnels: Arc<ssh::TunnelManager>,
 }
 
 pub fn run() {
@@ -32,12 +36,21 @@ pub fn run() {
             let store = tauri::async_runtime::block_on(store::Store::open(&config_dir, &data_dir))?;
             let store = Arc::new(store);
             let vault_cache = Arc::new(vault::VaultCache::new());
-            let creds = credentials::CredentialSource::new(store.clone(), vault_cache.clone());
+            let profiles = Arc::new(profiles::Profiles::new(&config_dir, store.clone()));
+            let tunnels = Arc::new(ssh::TunnelManager::new(profiles.clone(), &data_dir));
+            let creds = credentials::CredentialSource::new(
+                store.clone(),
+                vault_cache.clone(),
+                profiles.clone(),
+                tunnels.clone(),
+            );
             app.manage(AppState {
                 store,
                 vault_cache,
                 creds,
                 sessions: session::SessionRegistry::new(),
+                profiles,
+                tunnels,
             });
             Ok(())
         })
@@ -62,6 +75,16 @@ pub fn run() {
             commands::read_text_file,
             commands::test_vault,
             commands::set_vault_token,
+            commands::list_vault_profiles,
+            commands::save_vault_profile,
+            commands::delete_vault_profile,
+            commands::vault_token_info,
+            commands::renew_vault_token,
+            commands::list_ssh_profiles,
+            commands::save_ssh_profile,
+            commands::delete_ssh_profile,
+            commands::test_ssh_profile,
+            commands::trust_ssh_host,
             commands::redis_scan,
             commands::redis_get,
             commands::redis_delete,

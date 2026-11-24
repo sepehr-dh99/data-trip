@@ -38,6 +38,17 @@ pub struct ConnectionConfig {
     /// MSSQL only: trust server certificate.
     #[serde(default)]
     pub trust_server_certificate: bool,
+    /// PEM CA bundle for verify-ca / verify-full (PostgreSQL, MySQL).
+    #[serde(default)]
+    pub ssl_ca_path: Option<String>,
+    /// Client certificate / key for mutual TLS (PostgreSQL, MySQL).
+    #[serde(default)]
+    pub ssl_cert_path: Option<String>,
+    #[serde(default)]
+    pub ssl_key_path: Option<String>,
+    /// Connect through this shared SSH tunnel (SshProfile.id). The DB host/port are resolved on the SSH server.
+    #[serde(default)]
+    pub ssh_profile_id: Option<String>,
     /// Accent colour shown in the UI, e.g. "#ff5f57".
     #[serde(default)]
     pub color: Option<String>,
@@ -125,6 +136,86 @@ pub struct VaultConfig {
     pub ca_cert_path: Option<String>,
     #[serde(default)]
     pub skip_tls_verify: bool,
+    /// When set, address / namespace / token / TLS settings come from this shared Vault profile and the
+    /// fields above (except secret_path, username_key, password_key) are ignored.
+    #[serde(default)]
+    pub profile_id: Option<String>,
+}
+
+/// A shared Vault login used by many connections (e.g. "Prod Vault", "Stage Vault").
+/// The token itself is stored in the OS keychain (service "DataTrip-VaultProfile", user = id), never in JSON.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultProfile {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// Keychain = the pasted token; File = read token_file on every use; Env = VAULT_TOKEN.
+    #[serde(default)]
+    pub token_source: VaultTokenSource,
+    #[serde(default)]
+    pub token_file: Option<String>,
+    #[serde(default)]
+    pub ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub skip_tls_verify: bool,
+    /// Accent shown in the UI.
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+/// From `auth/token/lookup-self`. Never contains the token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultTokenInfo {
+    pub display_name: Option<String>,
+    pub policies: Vec<String>,
+    /// Remaining seconds; 0 = never expires (root / no TTL).
+    pub ttl_secs: i64,
+    /// ISO 8601, when Vault reports one.
+    pub expire_time: Option<String>,
+    pub renewable: bool,
+}
+
+/// A shared SSH tunnel configuration (bastion / jump host). Secrets (key passphrase or password) live in the
+/// OS keychain (service "DataTrip-SSH", user = id).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshProfile {
+    #[serde(default)]
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    pub user: String,
+    /// "key" (default) | "password" | "agent"
+    #[serde(default)]
+    pub auth_method: Option<String>,
+    /// Private key path for "key" auth, e.g. "~/.ssh/id_ed25519". OpenSSH and PEM formats.
+    #[serde(default)]
+    pub private_key_path: Option<String>,
+    /// Connection keep-alive interval in seconds (default 30).
+    #[serde(default)]
+    pub keepalive_secs: Option<u64>,
+}
+
+/// Result of `test_ssh_profile`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshCheck {
+    /// "SHA256:…" fingerprint of the server host key.
+    pub fingerprint: String,
+    pub key_type: String,
+    /// "trusted" (matches a stored key) | "new" (never seen: the UI asks the user, then calls trust_ssh_host)
+    /// | "changed" (differs from the stored key — possible MITM; refuse until the user re-trusts explicitly).
+    pub host_key_status: String,
+    /// Set only when the host key is trusted and authentication succeeded.
+    pub authenticated: bool,
 }
 
 /// Result of `test_vault`: never contains the password or token.

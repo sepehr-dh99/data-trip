@@ -125,6 +125,7 @@ pub fn connect<'a>(
             default_schema: None,
             database: Some(db.to_string()),
             backend_id: None,
+            tunnel: None,
         })
     })
 }

@@ -23,6 +23,8 @@ import { openScopePicker } from "./scopePicker";
 import { store } from "./state";
 import { connColor } from "./sqlutil";
 import { toast } from "./toast";
+import { VAULT_TOKEN_RE, vaults } from "./vault";
+import { showTokenPastePrompt } from "./vaultChips";
 
 const IS_MAC = /Mac/.test(navigator.userAgent);
 const MOD = IS_MAC ? "⌘" : "Ctrl+";
@@ -121,7 +123,10 @@ export class App {
     }, initialText);
   }
 
-  /** Cmd/Ctrl+V outside editable elements with DataGrip settings on the clipboard opens the import dialog. */
+  /**
+   * Cmd/Ctrl+V outside editable elements: DataGrip settings open the import dialog, a Vault token
+   * (hvs./hvb./hvr./s./b.) offers "Use this token for: [Prod] [Stage]".
+   */
   private onPaste(e: ClipboardEvent): void {
     const t = e.target;
     if (t instanceof HTMLElement && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.closest(".cm-editor"))) return;
@@ -130,6 +135,9 @@ export class App {
     if (text.includes("#DataSourceSettings#") || text.includes("<data-source")) {
       e.preventDefault();
       this.importDataGrip(text);
+    } else if (VAULT_TOKEN_RE.test(text.trim())) {
+      e.preventDefault();
+      showTokenPastePrompt(text.trim());
     }
   }
 
@@ -141,6 +149,9 @@ export class App {
     }
     this.renderEmpty();
     this.renderTabs();
+    // Shared Vault profiles: load them, look the tokens up, keep the sidebar chips counting down.
+    vaults.start();
+    void vaults.load();
   }
 
   // ------------------------------------------------------------------ layout
@@ -306,7 +317,8 @@ export class App {
     if (!entry) return;
     if (entry.status !== "connected") {
       try {
-        await this.explorer.connect(connId);
+        // On a recoverable failure (expired Vault token…) the explorer retries the connect after the fix and opens the console then.
+        await this.explorer.connect(connId, () => void this.openConsole(connId, opts));
       } catch {
         return;
       }

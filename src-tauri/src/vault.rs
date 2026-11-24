@@ -3,7 +3,7 @@
 //! included in error messages.
 
 use crate::error::{AppError, AppResult};
-use crate::model::{VaultConfig, VaultTokenSource};
+use crate::model::{VaultConfig, VaultProfile, VaultTokenInfo, VaultTokenSource};
 use futures::future::BoxFuture;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -329,6 +329,148 @@ pub fn fetch<'a>(
             return Err(AppError::new(format!("Vault error: {}", d)));
         }
         parse_secret(cfg, &path, &body)
+    })
+}
+
+/// Connection-level Vault config with address / namespace / token source / TLS taken from a shared profile.
+/// secret_path, username_key and password_key stay from the connection. The result has no profile_id.
+pub fn merge_profile(conn: &VaultConfig, p: &VaultProfile) -> VaultConfig {
+    let mut c = conn.clone();
+    c.address = p.address.clone();
+    c.namespace = p.namespace.clone();
+    c.token_source = p.token_source;
+    c.token_file = p.token_file.clone();
+    c.ca_cert_path = p.ca_cert_path.clone();
+    c.skip_tls_verify = p.skip_tls_verify;
+    c.profile_id = None;
+    c
+}
+
+/// Config for talking to Vault on behalf of a profile alone (token lookup / renew).
+pub fn config_from_profile(p: &VaultProfile) -> VaultConfig {
+    merge_profile(&VaultConfig::default(), p)
+}
+
+/// True when an error message from `fetch` means Vault rejected the token (HTTP 403).
+pub fn is_token_rejection(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("permission denied")
+        || m.contains("invalid token")
+        || m.contains("denied access")
+        || m.contains("token expired")
+}
+
+/// `VAULT_TOKEN_INVALID:<profileId>:<text>` - the UI parses the prefix to offer "paste new token".
+pub fn token_invalid_error(profile_id: &str, profile_name: &str) -> AppError {
+    AppError::new(format!(
+        "VAULT_TOKEN_INVALID:{}:Token for {} is expired or invalid",
+        profile_id, profile_name
+    ))
+}
+
+pub enum TokenError {
+    /// HTTP 403 from Vault: the token is expired, revoked or invalid.
+    Invalid,
+    Other(AppError),
+}
+
+impl From<AppError> for TokenError {
+    fn from(e: AppError) -> Self {
+        TokenError::Other(e)
+    }
+}
+
+fn parse_token_info(body: &Value) -> VaultTokenInfo {
+    let data = body.get("data").unwrap_or(&Value::Null);
+    let policies = data
+        .get("policies")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    VaultTokenInfo {
+        display_name: data
+            .get("display_name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        policies,
+        ttl_secs: data.get("ttl").and_then(|v| v.as_i64()).unwrap_or(0),
+        expire_time: data
+            .get("expire_time")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        renewable: data
+            .get("renewable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    }
+}
+
+/// `auth/token/lookup-self`, optionally after `auth/token/renew-self` (empty body).
+/// The token is never included in errors.
+pub fn token_info<'a>(
+    cfg: &'a VaultConfig,
+    keychain_token: Option<String>,
+    explicit_token: Option<String>,
+    renew: bool,
+) -> BoxFuture<'a, Result<VaultTokenInfo, TokenError>> {
+    Box::pin(async move {
+        let addr = resolve_address(cfg)?;
+        let token = resolve_token(cfg, keychain_token, explicit_token)?;
+        let client = build_client(cfg)?;
+        if renew {
+            let mut req = client
+                .post(format!("{}/v1/auth/token/renew-self", addr))
+                .header("X-Vault-Token", token.as_str());
+            if let Some(ns) = non_empty(&cfg.namespace) {
+                req = req.header("X-Vault-Namespace", ns);
+            }
+            let resp = req.send().await.map_err(|e| net_error(&addr, &e))?;
+            let status = resp.status();
+            if status.as_u16() == 403 {
+                return Err(TokenError::Invalid);
+            }
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                return Err(TokenError::Other(match vault_errors(&body) {
+                    Some(d) => AppError::new(format!("Could not renew the Vault token: {}", d)),
+                    None => AppError::new(format!(
+                        "Could not renew the Vault token (HTTP {}).",
+                        status.as_u16()
+                    )),
+                }));
+            }
+        }
+        let mut req = client
+            .get(format!("{}/v1/auth/token/lookup-self", addr))
+            .header("X-Vault-Token", token.as_str());
+        if let Some(ns) = non_empty(&cfg.namespace) {
+            req = req.header("X-Vault-Namespace", ns);
+        }
+        let resp = req.send().await.map_err(|e| net_error(&addr, &e))?;
+        let status = resp.status();
+        let text = resp.text().await.map_err(|e| net_error(&addr, &e))?;
+        let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if status.as_u16() == 403 {
+            return Err(TokenError::Invalid);
+        }
+        if !status.is_success() {
+            return Err(TokenError::Other(match vault_errors(&body) {
+                Some(d) => AppError::new(format!("Vault error ({}): {}", status.as_u16(), d)),
+                None => AppError::new(format!("Vault returned HTTP {}.", status.as_u16())),
+            }));
+        }
+        if body.is_null() {
+            return Err(TokenError::Other(AppError::new(format!(
+                "Vault at {} returned an unexpected (non-JSON) response.",
+                addr
+            ))));
+        }
+        Ok(parse_token_info(&body))
     })
 }
 

@@ -113,6 +113,8 @@ pub struct Connected {
     pub database: Option<String>,
     /// Server-side connection/process id (Postgres pid, MySQL connection id).
     pub backend_id: Option<i64>,
+    /// SSH forward this connection runs through; released when dropped. Set by the credentials layer.
+    pub tunnel: Option<crate::ssh::ForwardLease>,
 }
 
 /// Connects with a 15 second timeout.

@@ -349,6 +349,7 @@ pub fn connect<'a>(
             default_schema: None,
             database: None,
             backend_id: None,
+            tunnel: None,
         })
     })
 }

@@ -21,6 +21,12 @@ import type { TNode } from "./redis";
 import { KeyTrie, dbLabel, leafName, parseTtlInput, redisDbMeta, ttlLong, ttlShort, typeInfo } from "./redis";
 import { collate, forgetOverview, loadOverview, onOverview, overviewOf, overviewState, stateClass, stateLabel } from "./kafka";
 import { deleteTopicFlow, openCreateTopicDialog } from "./kafkaDialogs";
+import { handleActionError } from "./recovery";
+import { openSshProfilesDialog } from "./sshDialog";
+import { vaults } from "./vault";
+import { assignVaultProfile } from "./vaultAssign";
+import { VaultChips } from "./vaultChips";
+import { openVaultProfilesDialog } from "./vaultDialog";
 
 const OVERSCAN = 8;
 /** Indent (px) per tree depth: compact = 12 per level (spec); comfortable keeps 0 / 16 / 30, then +14. */
@@ -184,6 +190,9 @@ export class Explorer {
               { label: "New connection…", icon: "plus", onClick: () => host.addConnection() },
               { label: "Import from DataGrip…", icon: "download", onClick: () => host.importDataGrip() },
               { sep: true },
+              { label: "Vault profiles…", icon: "key", onClick: () => openVaultProfilesDialog() },
+              { label: "SSH configurations…", icon: "server", onClick: () => openSshProfilesDialog() },
+              { sep: true },
               { label: "Density: Compact", checked: this.density === "compact", onClick: () => this.setDensity("compact") },
               { label: "Density: Comfortable", checked: this.density === "comfortable", onClick: () => this.setDensity("comfortable") },
             ],
@@ -208,6 +217,7 @@ export class Explorer {
         h("label", { class: "side-search" }, icon("search", 12), this.filterInput),
         addBtn,
       ),
+      new VaultChips().el,
       this.tree,
     );
     this.el.setAttribute("aria-label", "Explorer");
@@ -1279,15 +1289,47 @@ export class Explorer {
           }
         },
       },
+      { label: "Use Vault profile", icon: "key", hint: "▸", onClick: () => window.setTimeout(() => this.vaultProfileMenu(ev.clientX, ev.clientY, members), 0) },
+      { sep: true },
       { label: "Ungroup", icon: "x", onClick: () => void setFolderForMany(ids, null) },
     ]);
   }
 
-  async connect(id: string): Promise<void> {
+  /** Second level of the folder menu: bulk-assign a shared Vault profile to every connection in the folder. */
+  private vaultProfileMenu(x: number, y: number, members: ConnEntry[]): void {
+    const ids = members.map((m) => m.config.id);
+    const apply = async (pid: string | null): Promise<void> => {
+      try {
+        const n = await assignVaultProfile(pid, ids);
+        toast(pid ? `${vaults.get(pid)?.name ?? "Profile"} applied to ${n} connection${n === 1 ? "" : "s"}` : `Vault profile removed from ${n} connection${n === 1 ? "" : "s"}`, "ok");
+      } catch (e) {
+        toast(errMsg(e), "error");
+      }
+    };
+    const items = vaults.profiles.map((p) => ({
+      label: p.name,
+      checked: members.length > 0 && members.every((m) => m.config.authMethod === "vault" && m.config.vault?.profileId === p.id),
+      onClick: () => void apply(p.id),
+    }));
+    showMenu(x, y, [
+      ...(items.length ? items : [{ label: "No Vault profiles yet", disabled: true }]),
+      { sep: true },
+      { label: "None", icon: "x", onClick: () => void apply(null) },
+      { label: "Manage profiles…", icon: "key", onClick: () => openVaultProfilesDialog() },
+    ], { minWidth: 200 });
+  }
+
+  async connect(id: string, after?: () => void): Promise<void> {
     try {
       await store.connect(id);
       this.expandConnection(id);
     } catch (err) {
+      // Expired Vault token or unknown SSH host: fix it inline, then retry this connect (and run `after`).
+      const retry = async (): Promise<void> => {
+        await this.connect(id);
+        if (store.conns.get(id)?.status === "connected") after?.();
+      };
+      if (handleActionError(err, retry)) return;
       const msg = errMsg(err);
       const authFail = /password|authentication|access denied|login failed|auth failed|28P01|28000/i.test(msg);
       toast(`Could not connect: ${msg}${authFail ? "\nEdit connection to set the password." : ""}`, "error");

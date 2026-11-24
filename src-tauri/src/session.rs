@@ -97,6 +97,8 @@ pub struct Session {
     /// Job number that most recently acquired the connection.
     active_job: AtomicU64,
     backend_id: Mutex<Option<i64>>,
+    /// SSH forward the current connection runs through (None without a tunnel); replaced on reconnect.
+    tunnel: Mutex<Option<crate::ssh::ForwardLease>>,
 }
 
 /// Marks the session's connection broken if dropped while armed, i.e. when the job that owns
@@ -151,6 +153,7 @@ impl Session {
             next_job: AtomicU64::new(0),
             active_job: AtomicU64::new(0),
             backend_id: Mutex::new(connected.backend_id),
+            tunnel: Mutex::new(connected.tunnel),
         });
         Ok((session, info))
     }
@@ -169,6 +172,7 @@ impl Session {
             let lost_tx = self.in_tx.swap(false, Ordering::SeqCst);
             let connected = self.creds.connect(&self.config, None, None, true).await?;
             *lock(&self.backend_id) = connected.backend_id;
+            *lock(&self.tunnel) = connected.tunnel;
             *slot = Some(connected.conn);
             self.broken.store(false, Ordering::SeqCst);
             if lost_tx {
@@ -605,6 +609,8 @@ impl Session {
                 c.close().await;
             }
         }
+        // Release the SSH forward (the listener closes when no session uses it any more).
+        drop(lock(&self.tunnel).take());
     }
 }
 

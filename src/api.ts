@@ -21,6 +21,10 @@ import type {
   ServerInfo,
   SessionInfo,
   VaultCheck,
+  VaultProfile,
+  VaultTokenInfo,
+  SshProfile,
+  SshCheck,
 } from "./types";
 
 /** Normalizes any thrown value from invoke() into an Error with a readable message. */
@@ -96,6 +100,30 @@ export const api = {
   kafkaCreateTopic: (sessionId: string, topic: string, partitions: number, replicationFactor: number) =>
     call<null>("kafka_create_topic", { sessionId, topic, partitions, replicationFactor }),
   kafkaDeleteTopic: (sessionId: string, topic: string) => call<null>("kafka_delete_topic", { sessionId, topic }),
+
+  // ── Shared Vault profiles ──
+  listVaultProfiles: () => call<VaultProfile[]>("list_vault_profiles"),
+  /** token: null = keep stored token, "" = clear, otherwise store (keychain source). Returns the saved profile (id filled). */
+  saveVaultProfile: (profile: VaultProfile, token: string | null) =>
+    call<VaultProfile>("save_vault_profile", { profile, token }),
+  deleteVaultProfile: (id: string) => call<null>("delete_vault_profile", { id }),
+  /** Looks up the token (auth/token/lookup-self). token overrides the stored one (to check before saving). */
+  vaultTokenInfo: (profile: VaultProfile, token: string | null) =>
+    call<VaultTokenInfo>("vault_token_info", { profile, token }),
+  renewVaultToken: (profileId: string) => call<VaultTokenInfo>("renew_vault_token", { profileId }),
+
+  // ── Shared SSH tunnels ──
+  listSshProfiles: () => call<SshProfile[]>("list_ssh_profiles"),
+  /** secret = key passphrase or password; null = keep, "" = clear. */
+  saveSshProfile: (profile: SshProfile, secret: string | null) =>
+    call<SshProfile>("save_ssh_profile", { profile, secret }),
+  deleteSshProfile: (id: string) => call<null>("delete_ssh_profile", { id }),
+  /** Connects to the SSH server, checks the host key and (if trusted) authenticates. Never opens a tunnel. */
+  testSshProfile: (profile: SshProfile, secret: string | null) =>
+    call<SshCheck>("test_ssh_profile", { profile, secret }),
+  /** Stores host:port → fingerprint as trusted (after the user confirms it). */
+  trustSshHost: (host: string, port: number, fingerprint: string) =>
+    call<null>("trust_ssh_host", { host, port, fingerprint }),
 
   /** Reads a UTF-8 text file chosen by the user (max 8 MiB). Used by importers. */
   readTextFile: (path: string) => call<string>("read_text_file", { path }),

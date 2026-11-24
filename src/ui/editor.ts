@@ -1,5 +1,5 @@
 // ALL CodeMirror usage lives here, behind the small SqlEditor interface.
-import { Compartment, EditorState } from "@codemirror/state";
+import { Compartment, EditorState, Prec } from "@codemirror/state";
 import type { Extension } from "@codemirror/state";
 import {
   EditorView,
@@ -13,12 +13,14 @@ import {
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
 import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
+import type { CompletionContext } from "@codemirror/autocomplete";
 import { HighlightStyle, StreamLanguage, bracketMatching, indentOnInput, syntaxHighlighting } from "@codemirror/language";
 import { MSSQL, MySQL, PostgreSQL, SQLite, sql } from "@codemirror/lang-sql";
 import { tags as t } from "@lezer/highlight";
 import { splitStatements, statementAt } from "../sqlsplit";
 import type { SplitOptions } from "../sqlsplit";
 import type { Driver } from "../types";
+import { filterCompletions } from "./sqlutil";
 import { REDIS_COMMANDS, redisLinesAt, splitRedisLines } from "./redis";
 import { CONSUME_FLAGS, KAFKA_COMMANDS, PRODUCE_FIELDS } from "./kafka";
 
@@ -226,7 +228,7 @@ const theme = EditorView.theme(
       overflow: "auto",
     },
     ".cm-content": { caretColor: "var(--accent)", padding: "8px 0" },
-    ".cm-line": { padding: "0 20px 0 0" },
+    ".cm-line": { padding: "0 20px 0 12px" },
     ".cm-cursor, .cm-dropCursor": { borderLeftColor: "var(--accent)", borderLeftWidth: "2px" },
     ".cm-gutters": {
       backgroundColor: "transparent",
@@ -397,6 +399,23 @@ export class SqlEditor {
     return s ? { text: s.text, from: s.start, to: s.end } : null;
   }
 
+  /**
+   * Replaces the statement whose trimmed text is `oldText` with `newText` (a trailing `;` stays).
+   * With several identical statements the one under the cursor wins, else the first. Returns
+   * false (and leaves the document alone) when no statement matches any more.
+   */
+  replaceStatementText(oldText: string, newText: string): boolean {
+    if (this.lineBased()) return false;
+    const norm = (x: string): string => x.replace(/\s+/g, " ").trim();
+    const want = norm(oldText);
+    const all = this.getAllStatements().filter((s) => norm(s.text) === want);
+    if (all.length === 0) return false;
+    const head = this.view.state.selection.main.head;
+    const hit = all.find((s) => head >= s.from && head <= s.to) ?? all[0];
+    this.view.dispatch({ changes: { from: hit.from, to: hit.to, insert: newText } });
+    return true;
+  }
+
   /** Splits arbitrary text (e.g. a selection) into statements using this editor's dialect. */
   splitText(text: string): string[] {
     if (this.lineBased()) return splitRedisLines(text).map((l) => l.text);
@@ -506,6 +525,147 @@ export class TextEditor {
 
   setText(text: string): void {
     this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
+  }
+
+  focus(): void {
+    this.view.focus();
+  }
+
+  destroy(): void {
+    this.view.destroy();
+  }
+}
+
+// ---- Single-line SQL input for the result filter bar (WHERE / ORDER BY).
+
+export interface FilterInputOptions {
+  kind: "where" | "order";
+  driver: Driver;
+  doc?: string;
+  placeholder: string;
+  /** Enter or Ctrl/Cmd+Enter. */
+  onSubmit: () => void;
+  /** Escape (when no completion popup is open). */
+  onCancel: () => void;
+  onChange: () => void;
+}
+
+const filterTheme = EditorView.theme(
+  {
+    "&": { height: "auto", fontSize: "12.5px" },
+    ".cm-scroller": { lineHeight: "24px", overflowX: "auto", overflowY: "hidden", scrollbarWidth: "none" },
+    ".cm-content": { padding: "0" },
+    ".cm-line": { padding: "0 4px 0 8px" },
+  },
+  { dark: true },
+);
+
+export class FilterInput {
+  private view: EditorView;
+  private lang = new Compartment();
+  private driver: Driver;
+  private columns: { name: string; type?: string }[] = [];
+  private silent = false;
+
+  constructor(parent: HTMLElement, private opts: FilterInputOptions) {
+    this.driver = opts.driver;
+    this.view = new EditorView({
+      state: EditorState.create({
+        doc: opts.doc ?? "",
+        extensions: [
+          history(),
+          drawSelection(),
+          closeBrackets(),
+          syntaxHighlighting(highlight),
+          this.lang.of(this.langExtension()),
+          // Single line: pasted line breaks become spaces.
+          EditorState.transactionFilter.of((tr: { docChanged: boolean; newDoc: { lines: number; toString(): string }; startState: { doc: { length: number } } }) => {
+            if (!tr.docChanged || tr.newDoc.lines <= 1) return tr;
+            const text = tr.newDoc.toString().replace(/\s*\n\s*/g, " ");
+            return [{ changes: { from: 0, to: tr.startState.doc.length, insert: text }, selection: { anchor: text.length } }];
+          }),
+          // The completion popup's own Enter / Escape bindings run first (highest precedence).
+          keymap.of([
+            ...closeBracketsKeymap,
+            ...historyKeymap,
+            { key: "Enter", run: () => (opts.onSubmit(), true) },
+            { key: "Mod-Enter", run: () => (opts.onSubmit(), true) },
+            { key: "Escape", run: () => (opts.onCancel(), true) },
+            ...defaultKeymap,
+          ]),
+          theme,
+          Prec.high(filterTheme),
+          EditorView.updateListener.of((u: { docChanged: boolean }) => {
+            if (u.docChanged && !this.silent) opts.onChange();
+          }),
+        ],
+      }),
+      parent,
+    });
+    parent.addEventListener(
+      "keydown",
+      (e: KeyboardEvent) => {
+        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+          e.preventDefault();
+          e.stopPropagation();
+          opts.onSubmit();
+        }
+      },
+      true,
+    );
+  }
+
+  private langExtension(): Extension {
+    return [
+      sql({ dialect: DIALECTS[this.driver as keyof typeof DIALECTS] ?? PostgreSQL, upperCaseKeywords: true }),
+      autocompletion({ icons: false, override: [(ctx: CompletionContext) => this.complete(ctx)] }),
+      placeholder(this.opts.placeholder),
+    ];
+  }
+
+  private complete(ctx: CompletionContext): { from: number; options: unknown[]; validFor: RegExp } | null {
+    const line = ctx.state.doc.lineAt(ctx.pos);
+    const before = line.text.slice(0, ctx.pos - line.from);
+    // no completion inside a string literal
+    if (((before.match(/'/g) ?? []).length & 1) === 1) return null;
+    const m = /(?:"(?:[^"]|"")*|`(?:[^`]|``)*|\[[^\]]*|[\w$\u0080-\uffff]+)$/.exec(before);
+    const word = m ? m[0] : "";
+    if (word === "" && !ctx.explicit) return null;
+    const quoted = /^["`\[]/.test(word);
+    const options = filterCompletions(this.opts.kind, this.driver, this.columns, quoted)
+      .filter((c) => !quoted || c.kind === "column")
+      .map((c) => ({
+        label: c.label,
+        apply: c.apply,
+        type: c.kind === "column" ? "property" : "keyword",
+        detail: c.detail,
+        boost: c.kind === "column" ? 5 : 0,
+      }));
+    return { from: ctx.pos - word.length, options, validFor: /^["`\[]?[\w$\u0080-\uffff]*$/ };
+  }
+
+  /** Columns offered for completion; also re-applies the dialect. */
+  setColumns(columns: { name: string; type?: string }[], driver: Driver): void {
+    this.columns = columns;
+    if (driver !== this.driver) {
+      this.driver = driver;
+      this.view.dispatch({ effects: this.lang.reconfigure(this.langExtension()) });
+    }
+  }
+
+  getText(): string {
+    return this.view.state.doc.toString();
+  }
+
+  /** Replaces the text without reporting a change. */
+  setText(text: string): void {
+    if (text === this.getText()) return;
+    this.silent = true;
+    try {
+      this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
+    } finally {
+      this.silent = false;
+    }
   }
 
   focus(): void {

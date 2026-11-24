@@ -1,5 +1,7 @@
 // Connection registry shared by the explorer, consoles and shell.
 import { api } from "../api";
+import { humanMsg } from "./dom";
+import { handleActionError } from "./recovery";
 import type { ConnectionConfig, DatabaseNode, ObjectGroup, SchemaNode, SessionInfo } from "../types";
 
 export type ConnStatus = "idle" | "connecting" | "connected" | "error";
@@ -30,7 +32,7 @@ export interface ConnEntry {
   dbs: Map<string, DbEntry>;
 }
 
-const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+const errText = (e: unknown): string => humanMsg(e instanceof Error ? e.message : String(e));
 
 type Listener = () => void;
 
@@ -96,7 +98,7 @@ class Store {
       e.status = "connected";
     } catch (err) {
       e.status = "error";
-      e.error = err instanceof Error ? err.message : String(err);
+      e.error = errText(err);
       this.closeAll(e);
       e.session = null;
       this.emit();
@@ -169,6 +171,11 @@ class Store {
       } catch (err) {
         entry.status = "error";
         entry.error = errText(err);
+        // Expired Vault token / unknown SSH host: offer the fix inline, then open the database again.
+        handleActionError(err, () => {
+          if (e.dbs.get(name) === entry) e.dbs.delete(name);
+          return this.ensureDb(id, name).then(() => this.emit());
+        });
         if (entry.session) void api.closeSession(entry.session.sessionId).catch(() => undefined);
         entry.session = null;
       } finally {

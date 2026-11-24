@@ -3,6 +3,11 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import { DEFAULT_PORTS, DRIVER_LABELS } from "../types";
 import type { AuthMethod, ConnectionConfig, Driver, KafkaConfig, VaultCheck, VaultConfig, VaultTokenSource } from "../types";
+import { handleActionError } from "./recovery";
+import { openSshProfilesDialog, sshLabel, sshStore } from "./sshDialog";
+import { statusText, statusTone, vaults } from "./vault";
+import { openTokenPopover } from "./vaultChips";
+import { openVaultProfilesDialog } from "./vaultDialog";
 import { clear, errMsg, h, icon } from "./dom";
 import { CONN_COLORS, DRIVER_COLORS } from "./sqlutil";
 import { DRIVER_ABBR } from "./scopePicker";
@@ -53,14 +58,19 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   });
   const chkClear = h("input", { type: "checkbox" });
   const inFile = h("input", { class: "input", type: "text", value: cfg.filePath ?? "", placeholder: "/path/to/database.sqlite", spellcheck: false });
-  const selSsl = h(
-    "select",
-    { class: "input" },
-    h("option", { value: "disable" }, "Disable"),
-    h("option", { value: "prefer" }, "Prefer"),
-    h("option", { value: "require" }, "Require"),
-  );
-  selSsl.value = cfg.sslMode ?? "prefer";
+  const SSL_BASIC: [string, string][] = [["disable", "Disable"], ["prefer", "Prefer"], ["require", "Require"]];
+  const SSL_FULL: [string, string][] = [...SSL_BASIC, ["verify-ca", "Verify CA"], ["verify-full", "Verify full"]];
+  const selSsl = h("select", { class: "input", "aria-label": "SSL mode" });
+  const setSslOptions = (full: boolean): void => {
+    const cur = selSsl.value || cfg.sslMode || "prefer";
+    clear(selSsl);
+    for (const [v, l] of full ? SSL_FULL : SSL_BASIC) selSsl.appendChild(h("option", { value: v }, l));
+    selSsl.value = (full ? SSL_FULL : SSL_BASIC).some(([v]) => v === cur) ? cur : "prefer";
+  };
+  setSslOptions(cfg.driver === "postgres" || cfg.driver === "mysql");
+  const inSslCa = h("input", { class: "input", type: "text", placeholder: "/path/to/ca.pem", value: cfg.sslCaPath ?? "", spellcheck: false, "aria-label": "CA certificate path" });
+  const inSslCert = h("input", { class: "input", type: "text", placeholder: "/path/to/client.pem (optional)", value: cfg.sslCertPath ?? "", spellcheck: false, "aria-label": "Client certificate path" });
+  const inSslKey = h("input", { class: "input", type: "text", placeholder: "/path/to/client.key (optional)", value: cfg.sslKeyPath ?? "", spellcheck: false, "aria-label": "Client key path" });
   const chkTrust = h("input", { type: "checkbox", checked: cfg.trustServerCertificate === true });
   const chkRo = h("input", { type: "checkbox", checked: cfg.readOnly === true });
   // ----- Kafka -----
@@ -80,6 +90,10 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   const v0: Partial<VaultConfig> = existing?.vault ?? {};
   let authMethod: AuthMethod = cfg.authMethod === "vault" ? "vault" : "password";
   let tokenSource: VaultTokenSource = v0.tokenSource ?? "file";
+  let profileDefaulted = editing;
+  let vaultProfileId: string | null = v0.profileId ?? null;
+  const selVProfile = h("select", { class: "input", "aria-label": "Vault profile" });
+  const vSummary = h("div", { class: "vault-summary" });
   const inVAddr = h("input", { class: "input", type: "text", placeholder: "https://vault.example.com:8200", value: v0.address ?? "", spellcheck: false });
   const inVPath = h("input", { class: "input", type: "text", placeholder: "database/creds/readonly", value: v0.secretPath ?? "", spellcheck: false });
   const inVTokenFile = h("input", { class: "input", type: "text", placeholder: "~/.vault-token", value: v0.tokenFile ?? "", spellcheck: false });
@@ -132,15 +146,26 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   const tokenEnvPane = h("div", { class: "vault-note" }, "Reads VAULT_TOKEN from the environment DataTrip was started in.");
   const tokenKeyPane = h("div", { class: "vault-pane" }, inVToken);
   const btnVault = h("button", { type: "button", class: "btn" }, icon("key", 14), "Test Vault");
+  const vAddrField = field("Vault address", h("div", { class: "vault-stack" }, inVAddr, hint("Leave empty to use VAULT_ADDR")));
+  const vTokenField = field("Token source", h("div", { class: "vault-stack" }, tokenSeg, tokenFilePane, tokenEnvPane, tokenKeyPane));
+  const vCustomA = h("div", { class: "vault-sub" }, field("Namespace", inVNs));
+  const vCustomB = h(
+    "div",
+    { class: "vault-sub" },
+    field("CA certificate", h("div", { class: "row2 tight" }, inVCa, browse(inVCa, "Choose CA certificate (PEM)"))),
+    h("label", { class: "check" }, chkVSkip, h("span", null, "Skip TLS verification")),
+    h("div", { class: "vault-warn" }, icon("alert", 13), "Insecure: the Vault server's identity is not checked. Use a CA certificate instead when you can."),
+  );
   const vaultFields = h(
     "div",
     { class: "vault-fields" },
-    field("Vault address", h("div", { class: "vault-stack" }, inVAddr, hint("Leave empty to use VAULT_ADDR"))),
+    field("Vault profile", h("div", { class: "vault-stack" }, selVProfile, vSummary)),
+    vAddrField,
     field(
       "Secret path",
       h("div", { class: "vault-stack" }, inVPath, hint("KV v2: secret/data/<name> · KV v1: kv/<name> · Dynamic: database/creds/<role>")),
     ),
-    field("Token source", h("div", { class: "vault-stack" }, tokenSeg, tokenFilePane, tokenEnvPane, tokenKeyPane)),
+    vTokenField,
     h(
       "details",
       { class: "vault-adv" },
@@ -148,15 +173,95 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       h(
         "div",
         { class: "vault-adv-body" },
-        field("Namespace", inVNs),
+        vCustomA,
         h("div", { class: "row2" }, field("Username key", inVUserKey), field("Password key", inVPassKey)),
-        field("CA certificate", h("div", { class: "row2 tight" }, inVCa, browse(inVCa, "Choose CA certificate (PEM)"))),
-        h("label", { class: "check" }, chkVSkip, h("span", null, "Skip TLS verification")),
-        h("div", { class: "vault-warn" }, icon("alert", 13), "Insecure: the Vault server's identity is not checked. Use a CA certificate instead when you can."),
+        vCustomB,
       ),
     ),
     h("div", { class: "vault-test" }, btnVault, vaultResult),
   );
+
+  // ----- SSH tunnel -----
+  const chkSsh = h("input", { type: "checkbox", checked: !!cfg.sshProfileId });
+  const selSsh = h("select", { class: "input", "aria-label": "SSH configuration" });
+  const sshState = h("span", { class: "ssh-state" });
+  const sshKafkaNote = h("div", { class: "vault-note" }, "SSH tunnels aren't supported for Kafka — brokers advertise their own addresses.");
+  const sshFields = h(
+    "div",
+    { class: "vault-sub" },
+    h("label", { class: "check" }, chkSsh, h("span", null, "Connect through an SSH tunnel (bastion)")),
+    field("SSH configuration", h("div", { class: "vault-stack" }, selSsh, hint("The database host and port are resolved from the SSH server, so use the address as the bastion sees it."))),
+  );
+  const sshSec = h(
+    "details",
+    { class: "vault-adv ssh-sec", open: !!cfg.sshProfileId },
+    h("summary", null, icon("chevron", 12), "SSH tunnel", sshState),
+    h("div", { class: "vault-adv-body" }, sshFields, sshKafkaNote),
+  );
+  let sshId: string | null = cfg.sshProfileId ?? null;
+  const fillSsh = (): void => {
+    clear(selSsh);
+    selSsh.appendChild(h("option", { value: "" }, sshStore.profiles.length ? "Choose a configuration…" : "No configurations yet"));
+    for (const p of sshStore.profiles) selSsh.appendChild(h("option", { value: p.id }, `${p.name} — ${sshLabel(p)}`));
+    selSsh.appendChild(h("option", { value: "__new" }, "New SSH configuration…"));
+    selSsh.appendChild(h("option", { value: "__manage" }, "Manage…"));
+    selSsh.value = sshId && sshStore.get(sshId) ? sshId : "";
+    syncSsh();
+  };
+  const syncSsh = (): void => {
+    const kafka = driver === "kafka";
+    sshSec.style.display = driver === "sqlite" ? "none" : "";
+    sshFields.style.display = kafka ? "none" : "";
+    sshKafkaNote.style.display = kafka ? "" : "none";
+    selSsh.disabled = !chkSsh.checked;
+    const p = sshId ? sshStore.get(sshId) : undefined;
+    sshState.textContent = kafka ? "not supported" : chkSsh.checked ? "On" + (p ? " · " + p.name : "") : "Off";
+    sshState.classList.toggle("on", chkSsh.checked && !kafka);
+  };
+  selSsh.addEventListener("change", () => {
+    const v = selSsh.value;
+    if (v === "__new" || v === "__manage") {
+      selSsh.value = sshId && sshStore.get(sshId) ? sshId : "";
+      openSshProfilesDialog({
+        create: v === "__new",
+        select: sshId ?? undefined,
+        onSaved: (p) => {
+          sshId = p.id;
+          chkSsh.checked = true;
+          fillSsh();
+        },
+        onClose: () => void sshStore.load().then(fillSsh),
+      });
+      return;
+    }
+    sshId = v || null;
+    syncSsh();
+  });
+  chkSsh.addEventListener("change", () => {
+    if (chkSsh.checked && !sshId && sshStore.profiles.length === 1) {
+      sshId = sshStore.profiles[0].id;
+      selSsh.value = sshId;
+    }
+    syncSsh();
+  });
+  void sshStore.load().then(fillSsh);
+
+  // ----- SSL files (PostgreSQL / MySQL) -----
+  const sslFiles = h(
+    "div",
+    { class: "kafka-tls ssl-files" },
+    h("div", { class: "kafka-tls-title" }, icon("key", 13), "SSL certificates"),
+    field("CA certificate", h("div", { class: "row2 tight" }, inSslCa, browse(inSslCa, "Choose CA certificate (PEM)", result))),
+    field("Client certificate", h("div", { class: "row2 tight" }, inSslCert, browse(inSslCert, "Choose client certificate (PEM)", result))),
+    field("Client key", h("div", { class: "row2 tight" }, inSslKey, browse(inSslKey, "Choose client key (PEM)", result))),
+  );
+  const syncSsl = (): void => {
+    const sqlLike = driver === "postgres" || driver === "mysql";
+    const verify = selSsl.value === "verify-ca" || selSsl.value === "verify-full";
+    const filled = inSslCa.value.trim() !== "" || inSslCert.value.trim() !== "" || inSslKey.value.trim() !== "";
+    sslFiles.style.display = sqlLike && (verify || filled) ? "" : "none";
+  };
+  selSsl.addEventListener("change", syncSsl);
 
   const protoBtns = KAFKA_PROTOCOLS.map(([v, label]) => {
     const b = h("button", { type: "button", class: "seg-btn", role: "radio", onclick: () => setProtocol(v) }, label);
@@ -295,6 +400,9 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     tlsRow.style.display = redis ? "" : "none";
     internalRow.style.display = kafka ? "" : "none";
     sslField.style.display = sqlite || redis || kafka ? "none" : "";
+    setSslOptions(d === "postgres" || d === "mysql");
+    syncSsl();
+    syncSsh();
     dbField.style.display = redis || kafka ? "none" : "";
     dbIdxField.style.display = redis ? "" : "none";
     portField.style.display = kafka ? "none" : "";
@@ -306,6 +414,50 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     syncAuth();
   };
 
+  const fillVProfiles = (): void => {
+    clear(selVProfile);
+    for (const p of vaults.profiles) selVProfile.appendChild(h("option", { value: p.id }, p.name));
+    selVProfile.appendChild(h("option", { value: "" }, "Custom (this connection only)"));
+    selVProfile.appendChild(h("option", { value: "__manage" }, "Manage profiles…"));
+    selVProfile.value = vaultProfileId && vaults.get(vaultProfileId) ? vaultProfileId : "";
+    if (selVProfile.value === "") vaultProfileId = null;
+  };
+  const syncVProfile = (): void => {
+    clear(vSummary);
+    const p = vaultProfileId ? vaults.get(vaultProfileId) : undefined;
+    vSummary.style.display = p ? "" : "none";
+    if (!p) return;
+    const host = (p.address ?? "").replace(/^https?:\/\//, "");
+    const tone = (p.tokenSource ?? "keychain") === "keychain" ? statusTone(p.id) : "idle";
+    const tok = (p.tokenSource ?? "keychain") === "keychain" ? "token " + (statusText(p.id).startsWith("expires") ? statusText(p.id) : statusText(p.id)) : p.tokenSource === "file" ? "token from file" : "token from VAULT_TOKEN";
+    vSummary.className = "vault-summary " + tone;
+    vSummary.append(
+      h("span", { class: "vchip-dot", style: `--pc:${p.color ?? "#8e8e93"}` }),
+      h("span", { class: "vs-text" }, `${p.name} · ${host.length > 24 ? host.slice(0, 24) + "…" : host || "VAULT_ADDR"} · `, h("span", { class: "vs-tok " + tone }, tok)),
+      (p.tokenSource ?? "keychain") === "keychain"
+        ? h("button", { class: "btn ghost sm", type: "button", onclick: (e: Event) => openTokenPopover(p.id, e.currentTarget as HTMLElement) }, icon("key", 13), "Paste token")
+        : h("span"),
+    );
+  };
+  selVProfile.addEventListener("change", () => {
+    if (selVProfile.value === "__manage") {
+      selVProfile.value = vaultProfileId ?? "";
+      openVaultProfilesDialog({ select: vaultProfileId ?? undefined, onClose: () => { fillVProfiles(); syncAuth(); } });
+      return;
+    }
+    vaultProfileId = selVProfile.value || null;
+    syncAuth();
+  });
+  const unsubVaults = vaults.subscribe(() => syncVProfile());
+  void vaults.ensureLoaded().then(() => {
+    if (!editing && vaultProfileId === null && vaults.profiles.length && !profileDefaulted) {
+      profileDefaulted = true;
+      vaultProfileId = vaults.profiles[0].id;
+    }
+    fillVProfiles();
+    syncAuth();
+    for (const p of vaults.profiles) if (vaults.state(p.id).status === "unknown") void vaults.lookup(p.id);
+  });
   const setProtocol = (p: string): void => {
     kProtocol = p;
     syncAuth();
@@ -350,6 +502,12 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     passField.style.display = vault ? "none" : "";
     clearRow.style.display = vault || noCreds ? "none" : "";
     vaultFields.style.display = vault ? "" : "none";
+    const prof = vaultProfileId ? vaults.get(vaultProfileId) : undefined;
+    vAddrField.style.display = prof ? "none" : "";
+    vTokenField.style.display = prof ? "none" : "";
+    vCustomA.style.display = prof ? "none" : "";
+    vCustomB.style.display = prof ? "none" : "";
+    syncVProfile();
     tokenFilePane.style.display = tokenSource === "file" ? "" : "none";
     tokenEnvPane.style.display = tokenSource === "env" ? "" : "none";
     tokenKeyPane.style.display = tokenSource === "keychain" ? "" : "none";
@@ -378,7 +536,11 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       database: sqlite || kafka ? null : driver === "redis" ? String(redisIndex() ?? 0) : inDb.value.trim() || null,
       username: sqlite || (kafka && !kafkaSasl()) ? null : inUser.value.trim() || null,
       filePath: sqlite ? inFile.value.trim() || null : null,
-      sslMode: sqlite || kafka ? null : driver === "redis" ? (chkTls.checked ? "require" : "disable") : (selSsl.value as "disable" | "prefer" | "require"),
+      sslMode: sqlite || kafka ? null : driver === "redis" ? (chkTls.checked ? "require" : "disable") : (selSsl.value as ConnectionConfig["sslMode"]),
+      sslCaPath: sslShown() ? inSslCa.value.trim() || null : null,
+      sslCertPath: sslShown() ? inSslCert.value.trim() || null : null,
+      sslKeyPath: sslShown() ? inSslKey.value.trim() || null : null,
+      sshProfileId: sqlite || kafka || !chkSsh.checked ? null : sshId,
       trustServerCertificate: driver === "mssql" ? chkTrust.checked : false,
       color,
       readOnly: chkRo.checked,
@@ -389,6 +551,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       kafka: kafka ? collectKafka() : null,
     };
   };
+  const sslShown = (): boolean => (driver === "postgres" || driver === "mysql") && sslFiles.style.display !== "none";
   const collectKafka = (): KafkaConfig => ({
     securityProtocol: kProtocol,
     saslMechanism: kafkaSasl() ? selSasl.value : null,
@@ -398,7 +561,17 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     skipTlsVerify: kafkaTls() && chkKSkip.checked,
     showInternal: chkKInternal.checked,
   });
-  const collectVault = (): VaultConfig => ({
+  const collectVault = (): VaultConfig =>
+    vaultProfileId
+      ? {
+          profileId: vaultProfileId,
+          secretPath: inVPath.value.trim(),
+          usernameKey: inVUserKey.value.trim() || null,
+          passwordKey: inVPassKey.value.trim() || null,
+        }
+      : collectVaultCustom();
+  const collectVaultCustom = (): VaultConfig => ({
+    profileId: null,
     address: inVAddr.value.trim() || null,
     namespace: inVNs.value.trim() || null,
     tokenSource,
@@ -411,7 +584,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   });
   const isVault = (): boolean => authMethod === "vault" && driver !== "sqlite" && !(driver === "kafka" && !kafkaSasl());
   /** Token typed for the keychain source (null = none typed). */
-  const typedToken = (): string | null => (isVault() && tokenSource === "keychain" && inVToken.value.trim() !== "" ? inVToken.value.trim() : null);
+  const typedToken = (): string | null => (isVault() && !vaultProfileId && tokenSource === "keychain" && inVToken.value.trim() !== "" ? inVToken.value.trim() : null);
   const vaultProblem = (): string | null => (isVault() && inVPath.value.trim() === "" ? "Enter the Vault secret path." : null);
   const kafkaProblem = (): string | null => {
     if (driver !== "kafka") return null;
@@ -419,7 +592,9 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     if (kafkaTls() && inKCert.value.trim() !== "" && inKKey.value.trim() === "") return "A client certificate needs its private key.";
     return null;
   };
-  const formProblem = (): string | null => (driver === "redis" && redisIndex() === null ? "Database index must be a whole number from 0 to 15." : kafkaProblem() ?? vaultProblem());
+  const sslProblem = (): string | null => (sslShown() && inSslCert.value.trim() !== "" && inSslKey.value.trim() === "" ? "A client certificate needs its private key." : null);
+  const sshProblem = (): string | null => (driver !== "sqlite" && driver !== "kafka" && chkSsh.checked && !sshId ? "Choose an SSH configuration for the tunnel (or turn the tunnel off)." : null);
+  const formProblem = (): string | null => (driver === "redis" && redisIndex() === null ? "Database index must be a whole number from 0 to 15." : kafkaProblem() ?? vaultProblem() ?? sslProblem() ?? sshProblem());
   const showErr = (el: HTMLElement, msg: string): void => {
     el.className = el.className.replace(/\b(ok|err|busy)\b/g, "").trim() + " err";
     clear(el);
@@ -440,9 +615,13 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   const close = (): void => {
     overlay.classList.add("leaving");
     window.removeEventListener("keydown", onKey, true);
+    unsubVaults();
     window.setTimeout(() => overlay.remove(), 160);
   };
   const onKey = (e: KeyboardEvent): void => {
+    // A dialog opened on top (SSH / Vault manager, confirm…) owns the keyboard.
+    const open = document.querySelectorAll(".overlay:not(.leaving)");
+    if (open[open.length - 1] !== overlay) return;
     if (e.key === "Escape") {
       e.stopPropagation();
       close();
@@ -453,7 +632,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   };
 
   btnCancel.onclick = close;
-  btnTest.onclick = async () => {
+  const runTest = async (): Promise<void> => {
     const problem = formProblem();
     if (problem) return showErr(result, problem);
     btnTest.disabled = true;
@@ -468,17 +647,20 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       result.className = "test-result err";
       clear(result);
       result.append(icon("alert", 15), h("span", null, errMsg(e)));
+      // Expired Vault token / unknown SSH host: fix inline and run the test again.
+      handleActionError(e, runTest);
     } finally {
       btnTest.disabled = false;
     }
   };
+  btnTest.onclick = () => void runTest();
   const describeVault = (r: VaultCheck): string => {
     const kind = r.secretKind === "dynamic" ? "dynamic credentials" : r.secretKind + " secret";
     const parts = [kind, r.username ? "user " + r.username : "no username in secret"];
     if (r.secretKind === "dynamic" && r.leaseDurationSecs) parts.push("lease " + fmtLease(r.leaseDurationSecs));
     return parts.join(" · ");
   };
-  btnVault.onclick = async () => {
+  const runVaultTest = async (): Promise<void> => {
     const problem = vaultProblem();
     if (problem) return showErr(vaultResult, problem);
     btnVault.disabled = true;
@@ -491,10 +673,12 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       vaultResult.append(icon("check", 15), h("span", null, describeVault(r)));
     } catch (e) {
       showErr(vaultResult, errMsg(e));
+      handleActionError(e, runVaultTest);
     } finally {
       btnVault.disabled = false;
     }
   };
+  btnVault.onclick = () => void runVaultTest();
   btnSave.onclick = async () => {
     const problem = formProblem();
     if (problem) return showErr(result, problem);
@@ -529,9 +713,11 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       h("div", { class: "row2" }, field("Name", inName), field("Folder", h("div", { class: "folder-combo" }, inFolder, folderList))),
       netFields,
       vaultFields,
+      sshSec,
       kafkaTlsFields,
       fileFields,
       optionRow,
+      sslFiles,
       field("Color", h("div", { class: "swatches" }, swatches)),
       result,
     ),
@@ -543,7 +729,14 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   });
   document.body.appendChild(overlay);
   window.addEventListener("keydown", onKey, true);
+  fillVProfiles();
   setDriver(driver, false);
   pick(color, false);
+  for (const i of [inSslCa, inSslCert, inSslKey]) i.addEventListener("input", syncSsl);
+  if (editing && authMethod === "vault" && vaultProfileId && !inVPath.value.trim()) {
+    vaultResult.className = "test-result vault-result busy";
+    vaultResult.textContent = "This connection has no Vault secret path yet — enter where its credentials live.";
+    window.setTimeout(() => inVPath.focus(), 50);
+  }
   (driver === "sqlite" ? inFile : inName).focus();
 }

@@ -11,8 +11,15 @@ export interface ConnectionConfig {
   database?: string | null;
   username?: string | null;
   filePath?: string | null;
-  sslMode?: "disable" | "prefer" | "require" | null;
+  sslMode?: "disable" | "prefer" | "require" | "verify-ca" | "verify-full" | null;
   trustServerCertificate?: boolean;
+  /** PEM CA bundle for verify-ca / verify-full (PostgreSQL, MySQL). */
+  sslCaPath?: string | null;
+  /** Client certificate / key for mutual TLS (PostgreSQL, MySQL). */
+  sslCertPath?: string | null;
+  sslKeyPath?: string | null;
+  /** Connect through this shared SSH tunnel (SshProfile.id). */
+  sshProfileId?: string | null;
   color?: string | null;
   readOnly?: boolean;
   /** How credentials are obtained. Default "password" (OS keychain). */
@@ -53,6 +60,51 @@ export interface VaultConfig {
   passwordKey?: string | null;
   caCertPath?: string | null;
   skipTlsVerify?: boolean;
+  /** Shared Vault profile; when set, address/namespace/token/TLS come from the profile. */
+  profileId?: string | null;
+}
+
+/** A shared Vault login (e.g. "Prod Vault"). The token is kept in the OS keychain, never returned. */
+export interface VaultProfile {
+  id: string;
+  name: string;
+  address?: string | null;
+  namespace?: string | null;
+  /** keychain = pasted token · file = read tokenFile each use · env = VAULT_TOKEN */
+  tokenSource?: VaultTokenSource;
+  tokenFile?: string | null;
+  caCertPath?: string | null;
+  skipTlsVerify?: boolean;
+  color?: string | null;
+}
+
+export interface VaultTokenInfo {
+  displayName: string | null;
+  policies: string[];
+  /** Remaining seconds; 0 = never expires. */
+  ttlSecs: number;
+  expireTime: string | null;
+  renewable: boolean;
+}
+
+/** A shared SSH tunnel (bastion). Passphrase/password live in the OS keychain. */
+export interface SshProfile {
+  id: string;
+  name: string;
+  host: string;
+  port?: number | null;
+  user: string;
+  /** "key" (default) | "password" | "agent" */
+  authMethod?: "key" | "password" | "agent" | null;
+  privateKeyPath?: string | null;
+  keepaliveSecs?: number | null;
+}
+
+export interface SshCheck {
+  fingerprint: string;
+  keyType: string;
+  hostKeyStatus: "trusted" | "new" | "changed";
+  authenticated: boolean;
 }
 
 /** Result of testVault — never includes secrets. */

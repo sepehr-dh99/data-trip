@@ -1,11 +1,13 @@
 //! Tauri commands. Names and arguments mirror CONTRACT.md / src/api.ts.
 
+use crate::credentials::CredentialSource;
 use crate::error::{AppError, AppResult};
 use crate::model::{
     AuthMethod, ConnectionConfig, DatabaseNode, Driver, ExportFormat, HistoryEntry,
     KafkaConsumeRequest, KafkaConsumeResult, KafkaGroupDetail, KafkaOverview, KafkaProduceRequest,
     KafkaProduceResult, KafkaTopicDetail, ObjectGroup, QueryResult, RedisScanResult, RedisValue,
-    RowEdit, SchemaNode, ServerInfo, SessionInfo, VaultCheck, VaultTokenSource,
+    RowEdit, SchemaNode, ServerInfo, SessionInfo, SshCheck, SshProfile, VaultCheck, VaultProfile,
+    VaultTokenInfo,
 };
 use crate::session::Session;
 use crate::{vault, AppState};
@@ -241,12 +243,13 @@ pub async fn test_vault(
         _ => return Err(AppError::new("This connection does not use Vault.")),
     };
     let explicit = vault_token.filter(|t| !t.trim().is_empty());
-    let keychain = if vcfg.token_source == VaultTokenSource::Keychain && explicit.is_none() {
-        state.store.get_vault_token(&config.id)
-    } else {
-        None
-    };
-    let secret = vault::fetch(&vcfg, keychain, explicit).await?;
+    let prepared = state
+        .creds
+        .prepare_vault(&vcfg, &config.id, explicit.is_some())
+        .await?;
+    let secret = vault::fetch(&prepared.config, prepared.keychain_token, explicit)
+        .await
+        .map_err(|e| CredentialSource::map_vault_error(e, &prepared.profile))?;
     Ok(VaultCheck {
         username: secret.username,
         secret_kind: secret.kind.to_string(),
@@ -432,4 +435,116 @@ pub async fn kafka_delete_topic(
 ) -> AppResult<()> {
     let s = state.sessions.get(&session_id)?;
     s.kafka_delete_topic(topic).await
+}
+
+// ----- shared Vault profiles -----
+
+#[tauri::command]
+pub async fn list_vault_profiles(state: State<'_, AppState>) -> AppResult<Vec<VaultProfile>> {
+    state.profiles.list_vault().await
+}
+
+/// `token`: None keeps the stored token, "" clears it, anything else replaces it.
+#[tauri::command]
+pub async fn save_vault_profile(
+    state: State<'_, AppState>,
+    profile: VaultProfile,
+    token: Option<String>,
+) -> AppResult<VaultProfile> {
+    let saved = state.profiles.save_vault(profile, token).await?;
+    for conn_id in state.profiles.connections_using_vault(&saved.id).await? {
+        state.vault_cache.invalidate(&conn_id);
+    }
+    Ok(saved)
+}
+
+#[tauri::command]
+pub async fn delete_vault_profile(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    state.profiles.delete_vault(&id).await
+}
+
+fn token_error(e: vault::TokenError, id: &str, name: &str) -> AppError {
+    match e {
+        vault::TokenError::Invalid => vault::token_invalid_error(id, name),
+        vault::TokenError::Other(e) => e,
+    }
+}
+
+/// Looks up the token (typed override, else the profile's own source). Never returns the token.
+#[tauri::command]
+pub async fn vault_token_info(
+    state: State<'_, AppState>,
+    profile: VaultProfile,
+    token: Option<String>,
+) -> AppResult<VaultTokenInfo> {
+    let explicit = token.filter(|t| !t.trim().is_empty());
+    let cfg = vault::config_from_profile(&profile);
+    let keychain = if explicit.is_none() {
+        state.profiles.vault_token(&profile.id)
+    } else {
+        None
+    };
+    vault::token_info(&cfg, keychain, explicit, false)
+        .await
+        .map_err(|e| token_error(e, &profile.id, &profile.name))
+}
+
+/// `auth/token/renew-self`, then `lookup-self`, with the stored profile's token.
+#[tauri::command]
+pub async fn renew_vault_token(
+    state: State<'_, AppState>,
+    profile_id: String,
+) -> AppResult<VaultTokenInfo> {
+    let profile = state.profiles.get_vault(&profile_id).await?;
+    let cfg = vault::config_from_profile(&profile);
+    let keychain = state.profiles.vault_token(&profile.id);
+    let info = vault::token_info(&cfg, keychain, None, true)
+        .await
+        .map_err(|e| token_error(e, &profile.id, &profile.name))?;
+    for conn_id in state.profiles.connections_using_vault(&profile.id).await? {
+        state.vault_cache.invalidate(&conn_id);
+    }
+    Ok(info)
+}
+
+// ----- shared SSH profiles -----
+
+#[tauri::command]
+pub async fn list_ssh_profiles(state: State<'_, AppState>) -> AppResult<Vec<SshProfile>> {
+    state.profiles.list_ssh().await
+}
+
+/// `secret`: None keeps the stored passphrase/password, "" clears it, anything else replaces it.
+#[tauri::command]
+pub async fn save_ssh_profile(
+    state: State<'_, AppState>,
+    profile: SshProfile,
+    secret: Option<String>,
+) -> AppResult<SshProfile> {
+    state.profiles.save_ssh(profile, secret).await
+}
+
+#[tauri::command]
+pub async fn delete_ssh_profile(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    state.profiles.delete_ssh(&id).await
+}
+
+#[tauri::command]
+pub async fn test_ssh_profile(
+    state: State<'_, AppState>,
+    profile: SshProfile,
+    secret: Option<String>,
+) -> AppResult<SshCheck> {
+    let tunnels = state.tunnels.clone();
+    tunnels.test(&profile, secret).await
+}
+
+#[tauri::command]
+pub async fn trust_ssh_host(
+    state: State<'_, AppState>,
+    host: String,
+    port: u16,
+    fingerprint: String,
+) -> AppResult<()> {
+    state.tunnels.trust_host(&host, port, &fingerprint)
 }
