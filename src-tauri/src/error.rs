@@ -74,6 +74,12 @@ impl From<csv::Error> for AppError {
     }
 }
 
+impl From<reqwest::Error> for AppError {
+    fn from(e: reqwest::Error) -> Self {
+        AppError::new(e.to_string())
+    }
+}
+
 impl From<tauri::Error> for AppError {
     fn from(e: tauri::Error) -> Self {
         AppError::new(e.to_string())

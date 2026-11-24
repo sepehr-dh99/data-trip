@@ -2,11 +2,11 @@
 
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    ConnectionConfig, ExportFormat, HistoryEntry, QueryResult, RowEdit, SchemaNode, ServerInfo,
-    SessionInfo,
+    AuthMethod, ConnectionConfig, ExportFormat, HistoryEntry, QueryResult, RowEdit, SchemaNode,
+    ServerInfo, SessionInfo, VaultCheck, VaultTokenSource,
 };
 use crate::session::Session;
-use crate::{db, AppState};
+use crate::{vault, AppState};
 use std::time::Instant;
 use tauri::State;
 
@@ -21,11 +21,14 @@ pub async fn save_connection(
     config: ConnectionConfig,
     password: Option<String>,
 ) -> AppResult<ConnectionConfig> {
-    state.store.save_connection(config, password).await
+    let saved = state.store.save_connection(config, password).await?;
+    state.vault_cache.invalidate(&saved.id);
+    Ok(saved)
 }
 
 #[tauri::command]
 pub async fn delete_connection(state: State<'_, AppState>, id: String) -> AppResult<()> {
+    state.vault_cache.invalidate(&id);
     state.store.delete_connection(&id).await
 }
 
@@ -34,12 +37,18 @@ pub async fn test_connection(
     state: State<'_, AppState>,
     config: ConnectionConfig,
     password: Option<String>,
+    vault_token: Option<String>,
 ) -> AppResult<ServerInfo> {
-    let pw = match password {
-        Some(p) => Some(p),
-        None => state.store.get_password(&config.id),
-    };
-    let connected = db::connect(&config, pw.as_deref()).await?;
+    // Unsaved edits: never read or populate the Vault credential cache.
+    let creds = state.creds.clone();
+    let connected = creds
+        .connect(
+            &config,
+            password,
+            vault_token.filter(|t| !t.trim().is_empty()),
+            false,
+        )
+        .await?;
     let version = connected.server_version.clone();
     connected.conn.close().await;
     Ok(ServerInfo { version })
@@ -51,8 +60,7 @@ pub async fn open_session(
     connection_id: String,
 ) -> AppResult<SessionInfo> {
     let config = state.store.get_connection(&connection_id).await?;
-    let password = state.store.get_password(&config.id);
-    let (session, info) = Session::open(config, password).await?;
+    let (session, info) = Session::open(config, state.creds.clone()).await?;
     state.sessions.insert(session);
     Ok(info)
 }
@@ -191,4 +199,68 @@ pub async fn export_query(
         }
     }
     res
+}
+
+/// Reads the Vault secret for an (possibly unsaved) config and reports what was found.
+/// Never returns the password or token, and does not touch the credential cache.
+#[tauri::command]
+pub async fn test_vault(
+    state: State<'_, AppState>,
+    config: ConnectionConfig,
+    vault_token: Option<String>,
+) -> AppResult<VaultCheck> {
+    let vcfg = match (config.auth_method, config.vault.as_ref()) {
+        (AuthMethod::Vault, Some(v)) => v.clone(),
+        _ => return Err(AppError::new("This connection does not use Vault.")),
+    };
+    let explicit = vault_token.filter(|t| !t.trim().is_empty());
+    let keychain = if vcfg.token_source == VaultTokenSource::Keychain && explicit.is_none() {
+        state.store.get_vault_token(&config.id)
+    } else {
+        None
+    };
+    let secret = vault::fetch(&vcfg, keychain, explicit).await?;
+    Ok(VaultCheck {
+        username: secret.username,
+        secret_kind: secret.kind.to_string(),
+        lease_duration_secs: secret.lease_secs,
+        renewable: secret.renewable,
+    })
+}
+
+/// Stores the Vault token in the OS keychain; an empty token deletes it.
+#[tauri::command]
+pub async fn set_vault_token(
+    state: State<'_, AppState>,
+    connection_id: String,
+    token: String,
+) -> AppResult<()> {
+    if connection_id.trim().is_empty() {
+        return Err(AppError::new("Save the connection before storing a token."));
+    }
+    state.store.set_vault_token(&connection_id, token.trim());
+    state.vault_cache.invalidate(&connection_id);
+    Ok(())
+}
+
+const MAX_TEXT_FILE: u64 = 8 * 1024 * 1024;
+
+/// Reads a UTF-8 text file (max 8 MiB). Used by importers.
+#[tauri::command]
+pub async fn read_text_file(path: String) -> AppResult<String> {
+    let path = vault::expand_tilde(path.trim());
+    let meta = std::fs::metadata(&path)
+        .map_err(|e| AppError::new(format!("Could not read {}: {}", path, e)))?;
+    if !meta.is_file() {
+        return Err(AppError::new(format!("{} is not a file", path)));
+    }
+    if meta.len() > MAX_TEXT_FILE {
+        return Err(AppError::new("File is larger than 8 MiB"));
+    }
+    let bytes = std::fs::read(&path)
+        .map_err(|e| AppError::new(format!("Could not read {}: {}", path, e)))?;
+    if bytes.len() as u64 > MAX_TEXT_FILE {
+        return Err(AppError::new("File is larger than 8 MiB"));
+    }
+    String::from_utf8(bytes).map_err(|_| AppError::new("File is not valid UTF-8 text"))
 }

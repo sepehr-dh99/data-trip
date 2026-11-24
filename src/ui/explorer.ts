@@ -11,6 +11,7 @@ import { toast } from "./toast";
 export interface ExplorerHost {
   openConsole(connId: string, opts?: { sql?: string; run?: boolean; title?: string }): void;
   addConnection(): void;
+  importDataGrip(): void;
   editConnection(id: string): void;
   deleteConnection(id: string): void;
   copy(text: string): void;
@@ -61,7 +62,24 @@ export class Explorer {
         "div",
         { class: "panel-head" },
         h("div", { class: "panel-title" }, icon("database", 15), "Explorer"),
-        h("button", { class: "icon-btn", type: "button", title: "New connection", "aria-label": "New connection", onclick: () => host.addConnection() }, icon("plus", 16)),
+        h(
+          "button",
+          {
+            class: "icon-btn",
+            type: "button",
+            title: "Add",
+            "aria-label": "Add connection",
+            "aria-haspopup": "menu",
+            onclick: (ev: MouseEvent) => {
+              const r = (ev.currentTarget as HTMLElement).getBoundingClientRect();
+              showMenu(r.left, r.bottom + 4, [
+                { label: "New connection…", icon: "plus", onClick: () => host.addConnection() },
+                { label: "Import from DataGrip…", icon: "download", onClick: () => host.importDataGrip() },
+              ]);
+            },
+          },
+          icon("plus", 16),
+        ),
       ),
       h("div", { class: "panel-search" }, icon("search", 13), this.filterInput),
       this.tree,
@@ -103,6 +121,7 @@ export class Explorer {
           h("div", { class: "side-empty-title" }, "No connections yet"),
           h("div", { class: "side-empty-text" }, "Add a PostgreSQL, MySQL, SQLite or SQL Server database to start exploring."),
           h("button", { class: "btn primary", type: "button", onclick: () => this.host.addConnection() }, icon("plus", 14), "Add connection"),
+          h("button", { class: "btn ghost sm", type: "button", onclick: () => this.host.importDataGrip() }, icon("download", 14), "Import from DataGrip…"),
         ),
       );
       return;
@@ -324,7 +343,9 @@ export class Explorer {
       await store.connect(id);
       this.expandConnection(id);
     } catch (err) {
-      toast(`Could not connect: ${errMsg(err)}`, "error");
+      const msg = errMsg(err);
+      const authFail = /password|authentication|access denied|login failed|auth failed|28P01|28000/i.test(msg);
+      toast(`Could not connect: ${msg}${authFail ? "\nEdit connection to set the password." : ""}`, "error");
     }
   }
 

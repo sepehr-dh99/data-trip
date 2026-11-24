@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const KEYRING_SERVICE: &str = "DataTrip";
+const VAULT_KEYRING_SERVICE: &str = "DataTrip-Vault";
 const HISTORY_KEEP: i64 = 5000;
 
 pub struct Store {
@@ -18,6 +19,8 @@ pub struct Store {
     history: SqlitePool,
     /// Used only when the OS keyring is unavailable. Never written to disk.
     mem_passwords: Mutex<HashMap<String, String>>,
+    /// Same fallback for Vault tokens (keychain token source).
+    mem_vault_tokens: Mutex<HashMap<String, String>>,
 }
 
 impl Store {
@@ -50,6 +53,7 @@ impl Store {
             file_lock: tokio::sync::Mutex::new(()),
             history: pool,
             mem_passwords: Mutex::new(HashMap::new()),
+            mem_vault_tokens: Mutex::new(HashMap::new()),
         })
     }
 
@@ -128,6 +132,7 @@ impl Store {
             self.write_connections(&list)?;
         }
         self.clear_password(id);
+        self.clear_vault_token(id);
         Ok(())
     }
 
@@ -167,6 +172,52 @@ impl Store {
             Err(keyring::Error::NoEntry) => None,
             Err(_) => None,
         }
+    }
+
+    // ----- vault tokens -----
+
+    fn mem_tokens(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
+        self.mem_vault_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Stores the Vault token for a connection; an empty token deletes it.
+    pub fn set_vault_token(&self, id: &str, token: &str) {
+        if id.is_empty() {
+            return;
+        }
+        if token.is_empty() {
+            self.clear_vault_token(id);
+            return;
+        }
+        let res =
+            keyring::Entry::new(VAULT_KEYRING_SERVICE, id).and_then(|e| e.set_password(token));
+        match res {
+            Ok(()) => {
+                self.mem_tokens().remove(id);
+            }
+            Err(_) => {
+                self.mem_tokens().insert(id.to_string(), token.to_string());
+            }
+        }
+    }
+
+    pub fn clear_vault_token(&self, id: &str) {
+        let _ = keyring::Entry::new(VAULT_KEYRING_SERVICE, id).and_then(|e| e.delete_credential());
+        self.mem_tokens().remove(id);
+    }
+
+    pub fn get_vault_token(&self, id: &str) -> Option<String> {
+        if id.is_empty() {
+            return None;
+        }
+        if let Some(t) = self.mem_tokens().get(id) {
+            return Some(t.clone());
+        }
+        keyring::Entry::new(VAULT_KEYRING_SERVICE, id)
+            .and_then(|e| e.get_password())
+            .ok()
     }
 
     // ----- history -----

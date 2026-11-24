@@ -82,3 +82,20 @@ The frontend shows `message`.
   MSSQL: schemas of the current database (exclude sys, INFORMATION_SCHEMA, db_* roles, guest).
 - History DB: `history(id INTEGER PK, connection_id TEXT, sql TEXT, executed_at TEXT ISO, elapsed_ms INTEGER, rows INTEGER NULL, ok INTEGER, error TEXT NULL)`; keep last 5000.
 - Passwords: `keyring` service "DataTrip", user = connection id. Never written to the JSON file.
+
+## v0.2 additions
+
+| command | args | returns |
+|---|---|---|
+| read_text_file | path: string | string (UTF-8, max 8 MiB) |
+| test_vault | config: ConnectionConfig, vaultToken: string\|null | VaultCheck |
+| set_vault_token | connectionId, token: string ("" clears) | null |
+
+- `ConnectionConfig.authMethod` = "password" (default) | "vault"; `vault: VaultConfig`.
+- Vault: GET `{address}/v1/{secretPath}` with `X-Vault-Token` (+ `X-Vault-Namespace`). KV v2 data at
+  `data.data`, KV v1 / dynamic at `data`. Dynamic secrets (response has `lease_id`) are cached per connection
+  until 30 s before lease expiry so console tabs share one generated DB user; leases are not revoked on close
+  (Vault expires them). The Vault username replaces `ConnectionConfig.username` for that connect.
+- DataGrip import (frontend only): parses `#DataSourceSettings#` clipboard blocks and `.idea/dataSources.xml`
+  (+ optional `dataSources.local.xml` for user names) into ConnectionConfig. DataGrip `uuid` becomes the
+  connection id, so re-importing updates instead of duplicating. Passwords are never imported.

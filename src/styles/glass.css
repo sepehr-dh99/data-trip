@@ -2311,3 +2311,253 @@ kbd {
 .input:focus-visible {
   outline: none;
 }
+
+/* ── Import dialog ── */
+.toast-msg {
+  white-space: pre-line;
+}
+.dialog.import-dialog {
+  width: 660px;
+}
+.import-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.import-ta {
+  height: 104px;
+  padding: 10px 12px;
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  white-space: pre;
+  overflow: auto;
+}
+.import-hint {
+  font-size: 12px;
+  color: var(--text-3);
+  line-height: 1.4;
+}
+.import-file-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.import-list-head {
+  display: flex;
+  align-items: center;
+  margin-bottom: -6px;
+}
+.import-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 280px;
+  min-height: 64px;
+  overflow: auto;
+  padding: 2px;
+}
+.import-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 18px 12px;
+  color: var(--text-3);
+  font-size: 12.5px;
+  border-radius: 12px;
+  background: var(--inset);
+}
+.import-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 12px;
+  background: var(--inset);
+  border: 1px solid var(--inset-border);
+  cursor: pointer;
+}
+.import-row:hover:not(.disabled) {
+  border-color: var(--accent-ring);
+}
+.import-row.disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.import-badge {
+  flex: none;
+  min-width: 30px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  font: 700 10.5px var(--font-ui);
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.import-badge.none {
+  color: var(--text-3);
+  background: var(--inset);
+}
+.import-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.import-name {
+  font-weight: 650;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.import-sub {
+  font: 11.5px var(--font-mono);
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.import-sub:empty {
+  display: none;
+}
+.import-msg {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+.import-msg.warning {
+  color: var(--warn);
+}
+.import-chip {
+  flex: none;
+  height: 22px;
+  padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.import-chip.new {
+  color: var(--ok);
+  background: var(--ok-soft);
+}
+.import-chip.update {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.import-chip.warning {
+  color: var(--warn);
+  background: rgba(214, 150, 20, 0.16);
+}
+.import-chip.unsupported {
+  color: var(--text-3);
+  background: var(--inset);
+  border: 1px solid var(--inset-border);
+}
+.import-foot {
+  align-items: center;
+}
+.import-note {
+  flex: 1;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--text-2);
+}
+.import-note .ico {
+  margin-top: 1px;
+  flex: none;
+}
+
+/* ── Vault auth ── */
+.vault-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.vault-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+.vault-hint {
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.35;
+}
+.vault-note {
+  font-size: 12px;
+  color: var(--text-2);
+  padding: 8px 12px;
+  border-radius: var(--r-ctl);
+  background: var(--inset);
+}
+.vault-adv {
+  border-radius: var(--r-ctl);
+  background: var(--inset);
+  padding: 0 12px;
+}
+.vault-adv > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text-2);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.vault-adv > summary::-webkit-details-marker {
+  display: none;
+}
+.vault-adv > summary .ico {
+  transition: transform var(--dur) var(--ease);
+}
+.vault-adv[open] > summary .ico {
+  transform: rotate(90deg);
+}
+.vault-adv-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 2px 0 14px;
+}
+.vault-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--warn);
+}
+.vault-warn .ico {
+  flex: none;
+  margin-top: 1px;
+}
+.vault-test {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.vault-test .btn {
+  flex: none;
+}
+.vault-test .vault-result {
+  flex: 1;
+  min-width: 0;
+}

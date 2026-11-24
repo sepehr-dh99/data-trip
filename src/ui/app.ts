@@ -6,6 +6,7 @@ import { confirmDialog } from "./confirm";
 import { ConsolePane } from "./console";
 import type { ConsoleHost } from "./console";
 import { openConnectionDialog } from "./connDialog";
+import { openImportDialog } from "./importDialog";
 import { brandMark, clear, copyText, errMsg, h, icon } from "./dom";
 import { Explorer } from "./explorer";
 import { HistoryPanel } from "./history";
@@ -37,6 +38,7 @@ export class App {
     this.explorer = new Explorer({
       openConsole: (id, o) => void this.openConsole(id, o),
       addConnection: () => this.addConnection(),
+      importDataGrip: () => this.importDataGrip(),
       editConnection: (id) => this.editConnection(id),
       deleteConnection: (id) => void this.deleteConnection(id),
       copy: (t) => void copyText(t).then(() => toast("Copied to clipboard", "ok")),
@@ -59,6 +61,27 @@ export class App {
     store.subscribe(() => this.onStoreChange());
     store.onSchema((id) => this.tabs.filter((t) => t.connId === id).forEach((t) => t.updateSchema()));
     window.addEventListener("keydown", (e) => this.onKey(e));
+    window.addEventListener("paste", (e) => this.onPaste(e));
+  }
+
+  private importDataGrip(initialText = ""): void {
+    if (document.querySelector(".import-dialog")) return;
+    openImportDialog((n) => {
+      if (n > 0) this.renderTabs();
+      this.renderEmpty();
+    }, initialText);
+  }
+
+  /** Cmd/Ctrl+V outside editable elements with DataGrip settings on the clipboard opens the import dialog. */
+  private onPaste(e: ClipboardEvent): void {
+    const t = e.target;
+    if (t instanceof HTMLElement && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.closest(".cm-editor"))) return;
+    if (document.querySelector(".overlay")) return;
+    const text = e.clipboardData?.getData("text/plain") ?? "";
+    if (text.includes("#DataSourceSettings#") || text.includes("<data-source")) {
+      e.preventDefault();
+      this.importDataGrip(text);
+    }
   }
 
   async start(): Promise<void> {
@@ -315,6 +338,7 @@ export class App {
           hasConns
             ? h("button", { class: "btn primary lg", type: "button", onclick: () => void this.newConsole() }, icon("terminal", 16), "New console")
             : h("button", { class: "btn primary lg", type: "button", onclick: () => this.addConnection() }, icon("plus", 16), "Add connection"),
+          hasConns ? null : h("button", { class: "btn lg", type: "button", onclick: () => this.importDataGrip() }, icon("download", 16), "Import from DataGrip…"),
         ),
         h(
           "div",

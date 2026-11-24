@@ -41,6 +41,75 @@ pub struct ConnectionConfig {
     pub color: Option<String>,
     #[serde(default)]
     pub read_only: bool,
+    /// How credentials are obtained. Default: stored password (OS keychain).
+    #[serde(default)]
+    pub auth_method: AuthMethod,
+    /// Required when `auth_method == Vault`.
+    #[serde(default)]
+    pub vault: Option<VaultConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMethod {
+    #[default]
+    Password,
+    Vault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VaultTokenSource {
+    /// Read the token from a file (default `~/.vault-token`, as written by `vault login`).
+    #[default]
+    File,
+    /// Read the `VAULT_TOKEN` environment variable.
+    Env,
+    /// Token stored in the OS keychain via `set_vault_token`.
+    Keychain,
+}
+
+/// HashiCorp Vault credential source. Works with KV v1, KV v2 (`<mount>/data/<path>`)
+/// and dynamic secrets engines such as `database/creds/<role>`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultConfig {
+    /// e.g. "https://vault.example.com:8200". Falls back to the VAULT_ADDR env var.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Vault Enterprise namespace (X-Vault-Namespace).
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub token_source: VaultTokenSource,
+    /// Used when token_source == File. Default "~/.vault-token".
+    #[serde(default)]
+    pub token_file: Option<String>,
+    /// Path after /v1/, e.g. "secret/data/db/prod" or "database/creds/readonly".
+    #[serde(default)]
+    pub secret_path: String,
+    /// Key holding the username in the secret's data. Default "username".
+    #[serde(default)]
+    pub username_key: Option<String>,
+    /// Key holding the password in the secret's data. Default "password".
+    #[serde(default)]
+    pub password_key: Option<String>,
+    /// Optional PEM CA bundle for a private Vault CA.
+    #[serde(default)]
+    pub ca_cert_path: Option<String>,
+    #[serde(default)]
+    pub skip_tls_verify: bool,
+}
+
+/// Result of `test_vault`: never contains the password or token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultCheck {
+    pub username: Option<String>,
+    /// "kv2" | "kv1" | "dynamic"
+    pub secret_kind: String,
+    pub lease_duration_secs: Option<u64>,
+    pub renewable: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,18 +1,23 @@
 //! DataTrip backend: Tauri builder, shared state and command registration.
 
 pub mod commands;
+pub mod credentials;
 pub mod db;
 pub mod error;
 pub mod export;
 pub mod model;
 pub mod session;
 pub mod store;
+pub mod vault;
 
+use std::sync::Arc;
 use tauri::Manager;
 
 /// Shared application state, managed by Tauri.
 pub struct AppState {
-    pub store: store::Store,
+    pub store: Arc<store::Store>,
+    pub vault_cache: Arc<vault::VaultCache>,
+    pub creds: credentials::CredentialSource,
     pub sessions: session::SessionRegistry,
 }
 
@@ -25,8 +30,13 @@ pub fn run() {
             std::fs::create_dir_all(&config_dir)?;
             std::fs::create_dir_all(&data_dir)?;
             let store = tauri::async_runtime::block_on(store::Store::open(&config_dir, &data_dir))?;
+            let store = Arc::new(store);
+            let vault_cache = Arc::new(vault::VaultCache::new());
+            let creds = credentials::CredentialSource::new(store.clone(), vault_cache.clone());
             app.manage(AppState {
                 store,
+                vault_cache,
+                creds,
                 sessions: session::SessionRegistry::new(),
             });
             Ok(())
@@ -47,6 +57,9 @@ pub fn run() {
             commands::apply_edits,
             commands::list_history,
             commands::export_query,
+            commands::read_text_file,
+            commands::test_vault,
+            commands::set_vault_token,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DataTrip");

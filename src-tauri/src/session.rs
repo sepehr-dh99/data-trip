@@ -1,5 +1,6 @@
 //! Open sessions: one dedicated physical connection each, with cancel and manual-transaction support.
 
+use crate::credentials::CredentialSource;
 use crate::db::{self, DbConn};
 use crate::error::{AppError, AppResult};
 use crate::export;
@@ -36,7 +37,8 @@ pub enum JobOut {
 pub struct Session {
     pub id: String,
     pub config: ConnectionConfig,
-    password: Option<String>,
+    /// Re-resolves credentials (keychain password or Vault secret) on every (re)connect.
+    creds: CredentialSource,
     conn: tokio::sync::Mutex<Option<DbConn>>,
     auto_commit: AtomicBool,
     in_tx: AtomicBool,
@@ -73,9 +75,9 @@ impl Session {
     /// Connects and registers nothing; the caller inserts the session into the registry.
     pub async fn open(
         config: ConnectionConfig,
-        password: Option<String>,
+        creds: CredentialSource,
     ) -> AppResult<(Arc<Session>, SessionInfo)> {
-        let connected = db::connect(&config, password.as_deref()).await?;
+        let connected = creds.connect(&config, None, None, true).await?;
         let info = SessionInfo {
             session_id: uuid::Uuid::new_v4().to_string(),
             connection_id: config.id.clone(),
@@ -86,7 +88,7 @@ impl Session {
         let session = Arc::new(Session {
             id: info.session_id.clone(),
             config,
-            password,
+            creds,
             conn: tokio::sync::Mutex::new(Some(connected.conn)),
             auto_commit: AtomicBool::new(true),
             in_tx: AtomicBool::new(false),
@@ -111,7 +113,7 @@ impl Session {
             // Drop the old connection without a graceful close (it may be mid-protocol).
             drop(slot.take());
             let lost_tx = self.in_tx.swap(false, Ordering::SeqCst);
-            let connected = db::connect(&self.config, self.password.as_deref()).await?;
+            let connected = self.creds.connect(&self.config, None, None, true).await?;
             *lock(&self.backend_id) = connected.backend_id;
             *slot = Some(connected.conn);
             self.broken.store(false, Ordering::SeqCst);
@@ -316,9 +318,7 @@ impl Session {
         if matches!(self.config.driver, Driver::Postgres | Driver::Mysql) {
             let id = *lock(&self.backend_id);
             if let Some(id) = id {
-                server_cancelled = db::cancel_backend(&self.config, self.password.as_deref(), id)
-                    .await
-                    .is_ok();
+                server_cancelled = self.creds.cancel_backend(&self.config, id).await.is_ok();
             }
         }
         if !server_cancelled {

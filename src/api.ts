@@ -9,6 +9,7 @@ import type {
   SchemaNode,
   ServerInfo,
   SessionInfo,
+  VaultCheck,
 } from "./types";
 
 /** Normalizes any thrown value from invoke() into an Error with a readable message. */
@@ -28,8 +29,8 @@ export const api = {
   saveConnection: (config: ConnectionConfig, password: string | null) =>
     call<ConnectionConfig>("save_connection", { config, password }),
   deleteConnection: (id: string) => call<null>("delete_connection", { id }),
-  testConnection: (config: ConnectionConfig, password: string | null) =>
-    call<ServerInfo>("test_connection", { config, password }),
+  testConnection: (config: ConnectionConfig, password: string | null, vaultToken: string | null = null) =>
+    call<ServerInfo>("test_connection", { config, password, vaultToken }),
 
   openSession: (connectionId: string) => call<SessionInfo>("open_session", { connectionId }),
   closeSession: (sessionId: string) => call<null>("close_session", { sessionId }),
@@ -49,4 +50,14 @@ export const api = {
     call<HistoryEntry[]>("list_history", { connectionId, search, limit }),
   exportQuery: (sessionId: string, sql: string, format: ExportFormat, path: string) =>
     call<number>("export_query", { sessionId, sql, format, path }),
+
+  /** Reads a UTF-8 text file chosen by the user (max 8 MiB). Used by importers. */
+  readTextFile: (path: string) => call<string>("read_text_file", { path }),
+
+  /** Resolves the Vault secret for this config and reports what it found (no secrets returned). */
+  testVault: (config: ConnectionConfig, vaultToken: string | null) =>
+    call<VaultCheck>("test_vault", { config, vaultToken }),
+  /** Stores (or with "" clears) the Vault token in the OS keychain for tokenSource "keychain". */
+  setVaultToken: (connectionId: string, token: string) =>
+    call<null>("set_vault_token", { connectionId, token }),
 };

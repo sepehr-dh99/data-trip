@@ -15,6 +15,36 @@ export interface ConnectionConfig {
   trustServerCertificate?: boolean;
   color?: string | null;
   readOnly?: boolean;
+  /** How credentials are obtained. Default "password" (OS keychain). */
+  authMethod?: AuthMethod;
+  /** Required when authMethod === "vault". */
+  vault?: VaultConfig | null;
+}
+
+export type AuthMethod = "password" | "vault";
+
+/** file = ~/.vault-token (as written by `vault login`), env = VAULT_TOKEN, keychain = set via setVaultToken */
+export type VaultTokenSource = "file" | "env" | "keychain";
+
+/** HashiCorp Vault credential source: KV v1, KV v2 (<mount>/data/<path>) or dynamic engines (database/creds/<role>). */
+export interface VaultConfig {
+  address?: string | null;
+  namespace?: string | null;
+  tokenSource?: VaultTokenSource;
+  tokenFile?: string | null;
+  secretPath: string;
+  usernameKey?: string | null;
+  passwordKey?: string | null;
+  caCertPath?: string | null;
+  skipTlsVerify?: boolean;
+}
+
+/** Result of testVault — never includes secrets. */
+export interface VaultCheck {
+  username: string | null;
+  secretKind: "kv2" | "kv1" | "dynamic";
+  leaseDurationSecs: number | null;
+  renewable: boolean;
 }
 
 export interface ServerInfo {
