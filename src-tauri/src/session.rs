@@ -1,0 +1,373 @@
+//! Open sessions: one dedicated physical connection each, with cancel and manual-transaction support.
+
+use crate::db::{self, DbConn};
+use crate::error::{AppError, AppResult};
+use crate::export;
+use crate::model::{
+    ConnectionConfig, Driver, ExportFormat, QueryResult, RowEdit, SchemaNode, SessionInfo,
+};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::task::AbortHandle;
+
+pub enum Job {
+    Execute {
+        sql: String,
+        max_rows: usize,
+    },
+    Export {
+        sql: String,
+        format: ExportFormat,
+        path: String,
+    },
+    Introspect,
+    Edits(Vec<RowEdit>),
+    Simple(String),
+}
+
+pub enum JobOut {
+    Query(QueryResult),
+    Count(u64),
+    Schema(Vec<SchemaNode>),
+    Unit,
+}
+
+pub struct Session {
+    pub id: String,
+    pub config: ConnectionConfig,
+    password: Option<String>,
+    conn: tokio::sync::Mutex<Option<DbConn>>,
+    auto_commit: AtomicBool,
+    in_tx: AtomicBool,
+    broken: AtomicBool,
+    /// Abort handles of spawned jobs (running or waiting for the connection), by job number.
+    running: Mutex<HashMap<u64, AbortHandle>>,
+    next_job: AtomicU64,
+    /// Job number that most recently acquired the connection.
+    active_job: AtomicU64,
+    backend_id: Mutex<Option<i64>>,
+}
+
+/// Marks the session's connection broken if dropped while armed, i.e. when the job that owns
+/// the connection is aborted (cancel/close) or panics mid-protocol. Runs before the connection
+/// lock is released, so the next job always sees the flag.
+struct BrokenOnAbort<'a> {
+    session: &'a Session,
+    armed: bool,
+}
+
+impl Drop for BrokenOnAbort<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.session.broken.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Session {
+    /// Connects and registers nothing; the caller inserts the session into the registry.
+    pub async fn open(
+        config: ConnectionConfig,
+        password: Option<String>,
+    ) -> AppResult<(Arc<Session>, SessionInfo)> {
+        let connected = db::connect(&config, password.as_deref()).await?;
+        let info = SessionInfo {
+            session_id: uuid::Uuid::new_v4().to_string(),
+            connection_id: config.id.clone(),
+            driver: config.driver,
+            server_version: connected.server_version.clone(),
+            default_schema: connected.default_schema.clone(),
+        };
+        let session = Arc::new(Session {
+            id: info.session_id.clone(),
+            config,
+            password,
+            conn: tokio::sync::Mutex::new(Some(connected.conn)),
+            auto_commit: AtomicBool::new(true),
+            in_tx: AtomicBool::new(false),
+            broken: AtomicBool::new(false),
+            running: Mutex::new(HashMap::new()),
+            next_job: AtomicU64::new(0),
+            active_job: AtomicU64::new(0),
+            backend_id: Mutex::new(connected.backend_id),
+        });
+        Ok((session, info))
+    }
+
+    /// Reconnects when the connection is missing or was marked broken.
+    fn ensure_connected<'a>(
+        &'a self,
+        slot: &'a mut Option<DbConn>,
+    ) -> futures::future::BoxFuture<'a, AppResult<()>> {
+        Box::pin(async move {
+            if slot.is_some() && !self.broken.load(Ordering::SeqCst) {
+                return Ok(());
+            }
+            // Drop the old connection without a graceful close (it may be mid-protocol).
+            drop(slot.take());
+            let lost_tx = self.in_tx.swap(false, Ordering::SeqCst);
+            let connected = db::connect(&self.config, self.password.as_deref()).await?;
+            *lock(&self.backend_id) = connected.backend_id;
+            *slot = Some(connected.conn);
+            self.broken.store(false, Ordering::SeqCst);
+            if lost_tx {
+                return Err(AppError::new(
+                    "The connection was reset and the open transaction was rolled back. \
+                     Run your statements again.",
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    fn begin_if_needed<'a>(
+        &'a self,
+        conn: &'a mut DbConn,
+    ) -> futures::future::BoxFuture<'a, AppResult<()>> {
+        Box::pin(async move {
+            if !self.auto_commit.load(Ordering::SeqCst) && !self.in_tx.load(Ordering::SeqCst) {
+                conn.run_simple(db::begin_sql(self.config.driver)).await?;
+                self.in_tx.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        })
+    }
+
+    fn run_locked(
+        self: Arc<Self>,
+        seq: u64,
+        job: Job,
+    ) -> futures::future::BoxFuture<'static, AppResult<JobOut>> {
+        Box::pin(async move {
+            let mut guard = self.conn.lock().await;
+            self.active_job.store(seq, Ordering::SeqCst);
+            // Declared after `guard`, so it is dropped (and flags the connection) first.
+            let mut tripwire = BrokenOnAbort {
+                session: &*self,
+                armed: true,
+            };
+            let res = self.run_job(&mut guard, job).await;
+            tripwire.armed = false;
+            res
+        })
+    }
+
+    fn run_job<'a>(
+        &'a self,
+        slot: &'a mut Option<DbConn>,
+        job: Job,
+    ) -> futures::future::BoxFuture<'a, AppResult<JobOut>> {
+        Box::pin(async move {
+            self.ensure_connected(slot).await?;
+            let conn = match slot.as_mut() {
+                Some(c) => c,
+                None => return Err(AppError::new("Not connected")),
+            };
+            match job {
+                Job::Execute { sql, max_rows } => {
+                    // Track transactions the user opens or ends with typed statements, so that
+                    // manual mode re-issues BEGIN after a typed COMMIT/ROLLBACK (instead of
+                    // silently auto-committing everything that follows).
+                    let ctl = db::tx_control(self.config.driver, &sql);
+                    if ctl != Some(db::TxControl::Begin) {
+                        self.begin_if_needed(conn).await?;
+                    }
+                    let r = conn.execute(&sql, max_rows).await?;
+                    match ctl {
+                        Some(db::TxControl::Begin) => self.in_tx.store(true, Ordering::SeqCst),
+                        Some(db::TxControl::End) | Some(db::TxControl::ImplicitCommit) => {
+                            self.in_tx.store(false, Ordering::SeqCst)
+                        }
+                        None => {}
+                    }
+                    Ok(JobOut::Query(r))
+                }
+                Job::Export { sql, format, path } => {
+                    self.begin_if_needed(conn).await?;
+                    let n = export::export(conn, &sql, format, &path).await?;
+                    Ok(JobOut::Count(n))
+                }
+                Job::Introspect => Ok(JobOut::Schema(conn.introspect().await?)),
+                Job::Edits(edits) => {
+                    if self.config.read_only {
+                        return Err(AppError::new(
+                            "This connection is read-only; edits are not allowed",
+                        ));
+                    }
+                    self.begin_if_needed(conn).await?;
+                    let manual = self.in_tx.load(Ordering::SeqCst);
+                    let n = conn.apply_edits(&edits, manual).await?;
+                    Ok(JobOut::Count(n))
+                }
+                Job::Simple(sql) => {
+                    conn.run_simple(&sql).await?;
+                    Ok(JobOut::Unit)
+                }
+            }
+        })
+    }
+
+    /// Runs a job on a spawned task so that it can be aborted by `cancel`.
+    async fn run(self: &Arc<Self>, job: Job) -> AppResult<JobOut> {
+        let seq = self.next_job.fetch_add(1, Ordering::SeqCst) + 1;
+        let me = Arc::clone(self);
+        let handle = tokio::spawn(async move { me.run_locked(seq, job).await });
+        lock(&self.running).insert(seq, handle.abort_handle());
+        let joined = handle.await;
+        lock(&self.running).remove(&seq);
+        // A job aborted while owning the connection has already marked it broken
+        // (BrokenOnAbort); one aborted while still waiting for the lock left it intact.
+        match joined {
+            Ok(r) => r,
+            Err(e) => {
+                if e.is_cancelled() {
+                    Err(AppError::new("Query cancelled"))
+                } else {
+                    Err(AppError::new(format!("Internal error: {}", e)))
+                }
+            }
+        }
+    }
+
+    pub async fn execute(self: &Arc<Self>, sql: String, max_rows: usize) -> AppResult<QueryResult> {
+        match self.run(Job::Execute { sql, max_rows }).await? {
+            JobOut::Query(r) => Ok(r),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn export(
+        self: &Arc<Self>,
+        sql: String,
+        format: ExportFormat,
+        path: String,
+    ) -> AppResult<u64> {
+        match self.run(Job::Export { sql, format, path }).await? {
+            JobOut::Count(n) => Ok(n),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn introspect(self: &Arc<Self>) -> AppResult<Vec<SchemaNode>> {
+        match self.run(Job::Introspect).await? {
+            JobOut::Schema(s) => Ok(s),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn apply_edits(self: &Arc<Self>, edits: Vec<RowEdit>) -> AppResult<u64> {
+        match self.run(Job::Edits(edits)).await? {
+            JobOut::Count(n) => Ok(n),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn set_auto_commit(self: &Arc<Self>, on: bool) -> AppResult<()> {
+        if on && self.in_tx.load(Ordering::SeqCst) {
+            self.run(Job::Simple(db::commit_sql(self.config.driver).to_string()))
+                .await?;
+            self.in_tx.store(false, Ordering::SeqCst);
+        }
+        self.auto_commit.store(on, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub async fn commit(self: &Arc<Self>) -> AppResult<()> {
+        if !self.in_tx.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let res = self
+            .run(Job::Simple(db::commit_sql(self.config.driver).to_string()))
+            .await;
+        // COMMIT ends the transaction even when it fails (the server rolls back).
+        self.in_tx.store(false, Ordering::SeqCst);
+        res.map(|_| ())
+    }
+
+    pub async fn rollback(self: &Arc<Self>) -> AppResult<()> {
+        if !self.in_tx.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let res = self
+            .run(Job::Simple(
+                db::rollback_sql(self.config.driver).to_string(),
+            ))
+            .await;
+        self.in_tx.store(false, Ordering::SeqCst);
+        res.map(|_| ())
+    }
+
+    /// Cancels the running statement. Postgres/MySQL: server-side cancel on a fresh connection
+    /// (the session stays usable). Otherwise, or if that fails: abort the task and reconnect later.
+    pub async fn cancel(&self) -> AppResult<()> {
+        // Target the job that owns the connection, not merely the most recently queued one.
+        let active = self.active_job.load(Ordering::SeqCst);
+        let handle = lock(&self.running).remove(&active);
+        let handle = match handle {
+            Some(h) => h,
+            None => return Ok(()),
+        };
+        let mut server_cancelled = false;
+        if matches!(self.config.driver, Driver::Postgres | Driver::Mysql) {
+            let id = *lock(&self.backend_id);
+            if let Some(id) = id {
+                server_cancelled = db::cancel_backend(&self.config, self.password.as_deref(), id)
+                    .await
+                    .is_ok();
+            }
+        }
+        if !server_cancelled {
+            // BrokenOnAbort marks the connection broken if the job is actually interrupted.
+            handle.abort();
+        }
+        Ok(())
+    }
+
+    pub async fn close(&self) {
+        let handles: Vec<AbortHandle> = lock(&self.running).drain().map(|(_, h)| h).collect();
+        for h in handles {
+            h.abort();
+        }
+        let mut guard = self.conn.lock().await;
+        if let Some(c) = guard.take() {
+            if self.broken.load(Ordering::SeqCst) {
+                // Interrupted mid-protocol: a graceful close could block; just drop it.
+                drop(c);
+            } else {
+                c.close().await;
+            }
+        }
+    }
+}
+
+pub struct SessionRegistry {
+    map: Mutex<HashMap<String, Arc<Session>>>,
+}
+
+impl SessionRegistry {
+    pub fn new() -> Self {
+        SessionRegistry {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn insert(&self, s: Arc<Session>) {
+        lock(&self.map).insert(s.id.clone(), s);
+    }
+
+    pub fn get(&self, id: &str) -> AppResult<Arc<Session>> {
+        lock(&self.map)
+            .get(id)
+            .cloned()
+            .ok_or_else(|| AppError::new("Session not found (it may have been closed)"))
+    }
+
+    pub fn remove(&self, id: &str) -> Option<Arc<Session>> {
+        lock(&self.map).remove(id)
+    }
+}

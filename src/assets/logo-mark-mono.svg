@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <title>DataTrip</title>
+  <mask id="dt-mono-hole" maskUnits="userSpaceOnUse" x="0" y="0" width="64" height="64">
+    <path d="M14.95 52.23 V6.98 H31.75 A22.62 22.62 0 0 1 54.38 29.61 A22.62 22.62 0 0 1 36.46 51.74" fill="none" stroke="#fff" stroke-width="9.63" stroke-linecap="round" stroke-linejoin="round" /><circle cx="14.95" cy="52.23" r="9.63" fill="#fff" />
+    <circle cx="14.95" cy="52.23" r="3.92" fill="#000"/>
+  </mask>
+  <rect width="64" height="64" fill="currentColor" mask="url(#dt-mono-hole)"/>
+</svg>
