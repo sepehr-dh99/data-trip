@@ -7,13 +7,14 @@
   --font-ui: -apple-system, "Segoe UI Variable", "Segoe UI", system-ui, Inter, sans-serif;
   --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
 
-  --text: rgba(16, 20, 32, 0.92);
-  --text-2: rgba(16, 20, 32, 0.68);
-  --text-3: rgba(16, 20, 32, 0.52);
+  /* Neutral ink (no hue cast). On light glass: text >= 12:1, text-2 >= 5:1, text-3 >= 3.4:1. */
+  --text: rgba(0, 0, 0, 0.86);
+  --text-2: rgba(0, 0, 0, 0.6);
+  --text-3: rgba(0, 0, 0, 0.47);
 
-  /* Accent #FF1A3C. --accent is the brand colour (rings, carets, indicators, large shapes).
-     Fills that carry white text use --accent-grad-* (>= 4.6:1 with #fff); small accent-coloured text
-     on glass uses --accent-text (>= 5:1 on light glass). */
+  /* Accent #FF1A3C — used ONLY for primary buttons, focus ring, caret, active-tab indicator,
+     selection outline, links and small indicators. Never as a surface wash.
+     Fills that carry white text use --accent-grad-* (>= 4.6:1 with #fff); small accent text uses --accent-text. */
   --accent: #ff1a3c;
   --accent-hover: #ff3b57;
   --accent-press: #e0002b;
@@ -21,52 +22,68 @@
   --on-accent: #ffffff;
   --accent-grad-a: #ec0b34;
   --accent-grad-b: #d4002a;
-  --accent-soft: rgba(255, 26, 60, 0.085);
-  --accent-soft-2: rgba(255, 26, 60, 0.16);
-  --accent-sel: rgba(255, 26, 60, 0.13);
-  --accent-ring: rgba(255, 26, 60, 0.45);
-  --accent-glow: rgba(255, 26, 60, 0.34);
+  --accent-soft: rgba(255, 26, 60, 0.06);
+  --accent-soft-2: rgba(255, 26, 60, 0.14);
+  --accent-sel: rgba(255, 26, 60, 0.08);
+  --accent-ring: rgba(255, 26, 60, 0.55);
+  --accent-glow: rgba(214, 0, 43, 0.2);
+  --focus-ring: inset 0 0 0 1px var(--accent-ring), 0 0 0 3px rgba(255, 26, 60, 0.16);
+
+  /* Neutral interaction fills */
+  --hover: rgba(0, 0, 0, 0.045);
+  --selected: rgba(0, 0, 0, 0.075);
+  --fill: rgba(0, 0, 0, 0.05);
+  --track: rgba(118, 118, 128, 0.12);
+  /* Grid range selection: low-chroma system-like grey-blue; the active cell carries the accent outline. */
+  --sel-fill: rgba(64, 92, 140, 0.1);
 
   /* Semantic colours: vermilion error, green success, amber warning. Errors never use the accent hue. */
   --danger: #b4350f;
-  --danger-soft: rgba(196, 64, 20, 0.12);
+  --danger-soft: rgba(196, 64, 20, 0.09);
   --ok: #157a42;
-  --ok-soft: rgba(21, 122, 66, 0.13);
-  --warn: #8f5800;
+  --ok-soft: rgba(21, 122, 66, 0.1);
+  --warn: #8a5600;
+  --warn-soft: rgba(230, 160, 20, 0.14);
 
-  --panel: rgba(255, 255, 255, 0.55);
-  --panel-strong: rgba(255, 255, 255, 0.8);
-  --border: rgba(255, 255, 255, 0.72);
-  --hair: rgba(20, 28, 52, 0.1);
-  --spec: rgba(255, 255, 255, 0.7);
-  --sheen: rgba(255, 255, 255, 0.42);
-  --inset: rgba(255, 255, 255, 0.4);
-  --inset-border: rgba(20, 28, 52, 0.08);
-  --menu-bg: rgba(250, 251, 255, 0.84);
-  --input-bg: rgba(255, 255, 255, 0.62);
-  --hover: rgba(20, 28, 52, 0.06);
-  --btn-top: rgba(255, 255, 255, 0.82);
-  --btn-bottom: rgba(255, 255, 255, 0.4);
-  --btn-border: rgba(20, 28, 52, 0.12);
-  --shadow: 0 1px 1px rgba(24, 36, 70, 0.05), 0 8px 24px rgba(24, 36, 70, 0.1), 0 28px 60px rgba(24, 36, 70, 0.1);
-  --shadow-pop: 0 2px 4px rgba(24, 36, 70, 0.08), 0 12px 32px rgba(24, 36, 70, 0.18);
-  --shadow-btn: 0 1px 2px rgba(24, 36, 70, 0.14);
+  /* Glass: neutral translucent white over a neutral backdrop. Luminance (not hue) separates layers:
+     window backdrop < panel glass < content surfaces (editor / grid / inputs). */
+  --panel: rgba(255, 255, 255, 0.52);
+  --panel-strong: rgba(248, 248, 250, 0.86);
+  --border: rgba(255, 255, 255, 0.7);
+  --hair: rgba(0, 0, 0, 0.075);
+  --spec: rgba(255, 255, 255, 0.75);
+  --sheen: rgba(255, 255, 255, 0.36);
+  --inset: rgba(255, 255, 255, 0.5);
+  --inset-border: rgba(0, 0, 0, 0.06);
+  --menu-bg: rgba(248, 248, 250, 0.86);
+  --input-bg: rgba(255, 255, 255, 0.72);
+  --btn-top: rgba(255, 255, 255, 0.94);
+  --btn-bottom: rgba(255, 255, 255, 0.7);
+  --btn-border: rgba(0, 0, 0, 0.085);
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 6px 18px rgba(0, 0, 0, 0.045), 0 22px 56px rgba(0, 0, 0, 0.07);
+  --shadow-pop: 0 2px 6px rgba(0, 0, 0, 0.06), 0 14px 34px rgba(0, 0, 0, 0.1), 0 44px 96px rgba(0, 0, 0, 0.16);
+  --shadow-btn: 0 0.5px 1px rgba(0, 0, 0, 0.1), 0 2px 6px rgba(0, 0, 0, 0.05);
+  --shadow-btn-hover: 0 1px 2px rgba(0, 0, 0, 0.08), 0 6px 14px rgba(0, 0, 0, 0.09);
+  --shadow-inset: inset 0 1px 2px rgba(0, 0, 0, 0.06);
+  --overlay: rgba(0, 0, 0, 0.14);
 
-  --rn-bg: #eef1f8;
-  --head-bg: rgba(244, 246, 252, 0.9);
-  --grid-line: rgba(20, 28, 52, 0.07);
-  --row-odd: rgba(20, 28, 52, 0.028);
-  --dirty-bg: rgba(255, 176, 32, 0.3);
-  --new-bg: rgba(52, 199, 89, 0.2);
-  --del-bg: rgba(255, 77, 109, 0.18);
-  --editor-active-line: rgba(255, 26, 60, 0.045);
+  --rn-bg: #f5f5f6;
+  --head-bg: rgba(248, 248, 249, 0.94);
+  --grid-line: rgba(0, 0, 0, 0.055);
+  --row-odd: rgba(0, 0, 0, 0.022);
+  /* Pending edits: quiet amber wash + a 2px amber edge marker. */
+  --dirty-bg: rgba(255, 186, 0, 0.11);
+  --dirty-mark: #e0a000;
+  --new-bg: rgba(52, 199, 89, 0.1);
+  --del-bg: rgba(196, 64, 20, 0.07);
+  --editor-active-line: rgba(0, 0, 0, 0.025);
 
   --syn-keyword: #7a37d0;
   --syn-type: #1f5fbf;
   --syn-string: #a8420a;
   --syn-number: #0a7470;
-  --syn-comment: #667085;
-  --syn-punct: #596074;
+  --syn-comment: #6e6e73;
+  --syn-punct: #5e5e63;
 
   --r-panel: 20px;
   --r-inner: 14px;
@@ -75,16 +92,16 @@
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
   --dur: 220ms;
   --rim-top: rgba(255, 255, 255, 0.95);
-  --rim-mid: rgba(255, 255, 255, 0.28);
+  --rim-mid: rgba(255, 255, 255, 0.3);
   --rim-bot: rgba(255, 255, 255, 0.55);
-  --blur: blur(36px) saturate(190%);
+  --blur: blur(36px) saturate(140%);
 }
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --text: rgba(246, 248, 255, 0.94);
-    --text-2: rgba(226, 232, 248, 0.72);
-    --text-3: rgba(226, 232, 248, 0.5);
+    --text: rgba(255, 255, 255, 0.92);
+    --text-2: rgba(255, 255, 255, 0.64);
+    --text-3: rgba(255, 255, 255, 0.47);
 
     --accent: #ff2d4d;
     --accent-hover: #ff5470;
@@ -92,54 +109,66 @@
     --accent-text: #ff7d92;
     --accent-grad-a: #f01238;
     --accent-grad-b: #d4002a;
-    --accent-soft: rgba(255, 45, 77, 0.15);
-    --accent-soft-2: rgba(255, 45, 77, 0.26);
-    --accent-sel: rgba(255, 45, 77, 0.24);
-    --accent-ring: rgba(255, 80, 106, 0.6);
-    --accent-glow: rgba(255, 45, 77, 0.4);
+    --accent-soft: rgba(255, 45, 77, 0.1);
+    --accent-soft-2: rgba(255, 45, 77, 0.2);
+    --accent-sel: rgba(255, 45, 77, 0.14);
+    --accent-ring: rgba(255, 80, 106, 0.62);
+    --accent-glow: rgba(240, 18, 56, 0.26);
+    --focus-ring: inset 0 0 0 1px var(--accent-ring), 0 0 0 3px rgba(255, 45, 77, 0.18);
+
+    --hover: rgba(255, 255, 255, 0.06);
+    --selected: rgba(255, 255, 255, 0.1);
+    --fill: rgba(255, 255, 255, 0.07);
+    --track: rgba(118, 118, 128, 0.24);
+    --sel-fill: rgba(150, 175, 220, 0.14);
 
     --danger: #ff9566;
-    --danger-soft: rgba(255, 140, 90, 0.16);
+    --danger-soft: rgba(255, 140, 90, 0.12);
     --ok: #5fdc93;
-    --ok-soft: rgba(95, 220, 147, 0.15);
+    --ok-soft: rgba(95, 220, 147, 0.12);
     --warn: #ffc76b;
+    --warn-soft: rgba(255, 190, 70, 0.13);
 
-    --panel: rgba(30, 32, 44, 0.55);
-    --panel-strong: rgba(34, 36, 50, 0.82);
-    --border: rgba(255, 255, 255, 0.13);
-    --hair: rgba(255, 255, 255, 0.09);
-    --spec: rgba(255, 255, 255, 0.2);
-    --sheen: rgba(255, 255, 255, 0.09);
-    --inset: rgba(8, 10, 20, 0.3);
+    /* graphite glass */
+    --panel: rgba(54, 54, 58, 0.5);
+    --panel-strong: rgba(44, 44, 47, 0.88);
+    --border: rgba(255, 255, 255, 0.12);
+    --hair: rgba(255, 255, 255, 0.08);
+    --spec: rgba(255, 255, 255, 0.16);
+    --sheen: rgba(255, 255, 255, 0.06);
+    --inset: rgba(0, 0, 0, 0.16);
     --inset-border: rgba(255, 255, 255, 0.07);
-    --menu-bg: rgba(36, 38, 54, 0.88);
-    --input-bg: rgba(8, 10, 20, 0.34);
-    --hover: rgba(255, 255, 255, 0.07);
-    --btn-top: rgba(255, 255, 255, 0.17);
-    --btn-bottom: rgba(255, 255, 255, 0.06);
-    --btn-border: rgba(255, 255, 255, 0.14);
-    --shadow: 0 1px 1px rgba(0, 0, 0, 0.2), 0 10px 28px rgba(0, 0, 0, 0.32), 0 30px 70px rgba(0, 0, 0, 0.3);
-    --shadow-pop: 0 2px 4px rgba(0, 0, 0, 0.3), 0 14px 36px rgba(0, 0, 0, 0.5);
-    --shadow-btn: 0 1px 2px rgba(0, 0, 0, 0.35);
+    --menu-bg: rgba(46, 46, 50, 0.9);
+    --input-bg: rgba(0, 0, 0, 0.2);
+    --btn-top: rgba(255, 255, 255, 0.16);
+    --btn-bottom: rgba(255, 255, 255, 0.08);
+    --btn-border: rgba(255, 255, 255, 0.1);
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.18), 0 8px 22px rgba(0, 0, 0, 0.22), 0 28px 64px rgba(0, 0, 0, 0.28);
+    --shadow-pop: 0 2px 6px rgba(0, 0, 0, 0.3), 0 16px 40px rgba(0, 0, 0, 0.4), 0 48px 110px rgba(0, 0, 0, 0.45);
+    --shadow-btn: 0 1px 2px rgba(0, 0, 0, 0.3), 0 3px 8px rgba(0, 0, 0, 0.16);
+    --shadow-btn-hover: 0 2px 4px rgba(0, 0, 0, 0.3), 0 8px 18px rgba(0, 0, 0, 0.28);
+    --shadow-inset: inset 0 1px 2px rgba(0, 0, 0, 0.2);
+    --overlay: rgba(0, 0, 0, 0.34);
 
-    --rn-bg: #25283a;
-    --head-bg: rgba(34, 37, 54, 0.92);
-    --grid-line: rgba(255, 255, 255, 0.07);
-    --row-odd: rgba(255, 255, 255, 0.03);
-    --dirty-bg: rgba(255, 176, 32, 0.28);
-    --new-bg: rgba(52, 199, 89, 0.22);
-    --del-bg: rgba(255, 77, 109, 0.22);
-    --editor-active-line: rgba(255, 70, 100, 0.07);
-    --rim-top: rgba(255, 255, 255, 0.26);
+    --rn-bg: #232325;
+    --head-bg: rgba(40, 40, 43, 0.95);
+    --grid-line: rgba(255, 255, 255, 0.055);
+    --row-odd: rgba(255, 255, 255, 0.022);
+    --dirty-bg: rgba(255, 196, 80, 0.1);
+    --dirty-mark: #f0b43c;
+    --new-bg: rgba(52, 199, 89, 0.12);
+    --del-bg: rgba(255, 140, 90, 0.09);
+    --editor-active-line: rgba(255, 255, 255, 0.03);
+    --rim-top: rgba(255, 255, 255, 0.22);
     --rim-mid: rgba(255, 255, 255, 0.04);
-    --rim-bot: rgba(255, 255, 255, 0.09);
+    --rim-bot: rgba(255, 255, 255, 0.08);
 
     --syn-keyword: #c79bff;
     --syn-type: #86b8ff;
     --syn-string: #ffb787;
     --syn-number: #6fe3d3;
-    --syn-comment: #8f98b0;
-    --syn-punct: #a0a9c0;
+    --syn-comment: #8e8e93;
+    --syn-punct: #a1a1a6;
   }
 }
 
@@ -161,25 +190,21 @@ body {
   user-select: none;
   -webkit-user-select: none;
 }
+/* Linux fallback backdrop: a quiet neutral, like a desktop seen through heavy blur.
+   Only the faintest cool (top-left) / warm (bottom-right) variation; no coloured blobs. */
 html.no-vibrancy body {
   background:
-    radial-gradient(900px 640px at 6% 2%, rgba(140, 184, 255, 0.62) 0, transparent 62%),
-    radial-gradient(820px 620px at 98% 6%, rgba(255, 164, 146, 0.62) 0, transparent 60%),
-    radial-gradient(900px 700px at 80% 108%, rgba(255, 140, 180, 0.5) 0, transparent 60%),
-    radial-gradient(760px 600px at 0% 100%, rgba(168, 226, 222, 0.5) 0, transparent 60%),
-    radial-gradient(600px 500px at 48% 46%, rgba(255, 236, 214, 0.55) 0, transparent 70%),
-    linear-gradient(160deg, #eef1fa 0%, #f6eff3 55%, #eef2f8 100%);
+    radial-gradient(1400px 900px at 12% -10%, rgba(220, 224, 232, 0.8) 0, transparent 70%),
+    radial-gradient(1300px 900px at 100% 110%, rgba(226, 222, 216, 0.7) 0, transparent 70%),
+    linear-gradient(180deg, #e2e2e5 0%, #dadadd 100%);
   background-attachment: fixed;
 }
 @media (prefers-color-scheme: dark) {
   html.no-vibrancy body {
     background:
-      radial-gradient(900px 640px at 6% 2%, rgba(52, 84, 170, 0.62) 0, transparent 62%),
-      radial-gradient(820px 620px at 98% 6%, rgba(130, 44, 76, 0.42) 0, transparent 60%),
-      radial-gradient(900px 700px at 80% 108%, rgba(96, 40, 110, 0.5) 0, transparent 60%),
-      radial-gradient(760px 600px at 0% 100%, rgba(24, 100, 118, 0.48) 0, transparent 60%),
-      radial-gradient(600px 500px at 50% 48%, rgba(70, 40, 80, 0.4) 0, transparent 70%),
-      linear-gradient(160deg, #0d1020 0%, #14101e 55%, #0b0f1a 100%);
+      radial-gradient(1400px 900px at 12% -10%, rgba(52, 55, 62, 0.55) 0, transparent 70%),
+      radial-gradient(1300px 900px at 100% 110%, rgba(44, 42, 40, 0.45) 0, transparent 70%),
+      linear-gradient(180deg, #1c1c1e 0%, #151516 100%);
     background-attachment: fixed;
   }
 }
@@ -215,13 +240,13 @@ textarea,
   height: 12px;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(128, 134, 156, 0.42);
+  background: rgba(128, 128, 134, 0.42);
   border-radius: 8px;
   border: 3px solid transparent;
   background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(128, 134, 156, 0.7);
+  background: rgba(128, 128, 134, 0.7);
   background-clip: content-box;
   border: 3px solid transparent;
 }
@@ -302,7 +327,7 @@ html.mac .toolbar {
   font-size: 13.5px;
 }
 .brand-mark {
-  filter: drop-shadow(0 2px 4px rgba(80, 90, 220, 0.35));
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.12));
 }
 .tool-btn {
   display: inline-flex;
@@ -357,7 +382,7 @@ html.mac .toolbar {
 }
 .btn:hover:not(:disabled) {
   filter: brightness(1.04) saturate(1.1);
-  box-shadow: inset 0 1px 0 var(--spec), 0 3px 10px rgba(24, 36, 70, 0.16);
+  box-shadow: inset 0 1px 0 var(--spec), 0 3px 10px rgba(0, 0, 0, 0.16);
 }
 .btn:active:not(:disabled) {
   transform: translateY(0.5px) scale(0.985);
@@ -435,7 +460,7 @@ html.mac .toolbar {
   border: 1px solid var(--inset-border);
   border-radius: 10px;
   background: var(--input-bg);
-  box-shadow: inset 0 1px 2px rgba(20, 28, 52, 0.08);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.08);
   transition: border-color 0.15s, box-shadow 0.15s;
   outline: none;
 }
@@ -468,7 +493,7 @@ input[type="checkbox"] {
   border-radius: 999px;
   background: var(--inset);
   border: 1px solid var(--inset-border);
-  box-shadow: inset 0 1px 2px rgba(20, 28, 52, 0.08);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.08);
 }
 .seg-btn {
   height: 26px;
@@ -652,7 +677,7 @@ kbd {
   background: var(--hover);
 }
 .node-row.selected {
-  background: var(--accent-soft);
+  background: var(--selected);
 }
 .node-row .label {
   flex: 0 1 auto;
@@ -715,7 +740,7 @@ kbd {
   flex: none;
   padding: 0 5px;
   border-radius: 6px;
-  background: rgba(255, 176, 32, 0.22);
+  background: var(--warn-soft);
   color: var(--warn);
   font-size: 9.5px;
   font-weight: 800;
@@ -941,7 +966,7 @@ kbd {
   background: var(--inset);
   border: 1px solid var(--inset-border);
   border-radius: var(--r-inner);
-  box-shadow: inset 0 1px 2px rgba(20, 28, 52, 0.06);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.06);
 }
 .c-editor {
   flex: none;
@@ -980,9 +1005,7 @@ kbd {
   flex-direction: column;
   overflow: hidden;
 }
-.console.running .c-editor {
-  box-shadow: inset 0 1px 2px rgba(20, 28, 52, 0.06), 0 0 0 2px var(--accent-soft);
-}
+
 .r-tabs {
   flex: none;
   display: flex;
@@ -1144,13 +1167,25 @@ kbd {
   border-left: 1px solid var(--hair);
 }
 .g-pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: 12px;
   font-weight: 650;
   color: var(--warn);
   margin-left: 4px;
+  white-space: nowrap;
+}
+.g-pending:not(:empty)::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--dirty-mark);
 }
 .g-note {
   min-width: 0;
+  overflow: hidden;
   white-space: nowrap;
   display: flex;
   align-items: center;
@@ -1209,7 +1244,7 @@ kbd {
   background: var(--hover);
 }
 .g-hc.sorted {
-  background: var(--accent-soft);
+  background: transparent;
 }
 .g-hc-main {
   display: flex;
@@ -1280,7 +1315,7 @@ kbd {
   cursor: default;
 }
 .g-row.rowsel .g-rn {
-  color: var(--accent);
+  color: var(--accent-text);
   font-weight: 700;
 }
 .g-cell {
@@ -1308,14 +1343,18 @@ kbd {
   opacity: 0.85;
 }
 .g-row .g-cell.sel {
-  background: var(--accent-soft);
+  background: var(--sel-fill);
 }
 .g-row .g-cell.cur {
-  background: var(--accent-sel);
+  background: var(--sel-fill);
   box-shadow: inset 0 0 0 1.5px var(--accent);
 }
 .g-row .g-cell.dirty {
   background: var(--dirty-bg);
+  box-shadow: inset 2px 0 0 var(--dirty-mark);
+}
+.g-row .g-cell.sel.dirty {
+  background: linear-gradient(var(--sel-fill), var(--sel-fill)), var(--dirty-bg);
 }
 .g-row.new .g-cell {
   background: var(--new-bg);
@@ -1402,8 +1441,8 @@ kbd {
   transition: background 0.14s, border-color 0.14s, transform 0.14s var(--ease);
 }
 .hist-item:hover {
-  background: var(--accent-soft);
-  border-color: var(--accent-soft);
+  background: var(--panel-strong);
+  border-color: var(--hair);
 }
 .hist-meta {
   display: flex;
@@ -1460,7 +1499,7 @@ kbd {
 }
 .empty-art {
   margin-bottom: 8px;
-  filter: drop-shadow(0 12px 22px rgba(90, 80, 230, 0.35));
+  filter: drop-shadow(0 10px 20px rgba(0, 0, 0, 0.12));
 }
 .empty-card h2 {
   margin: 0;
@@ -1495,7 +1534,7 @@ kbd {
   z-index: 50;
   display: grid;
   place-items: center;
-  background: rgba(12, 16, 32, 0.28);
+  background: var(--overlay);
   -webkit-backdrop-filter: blur(6px);
   backdrop-filter: blur(6px);
   animation: fade 0.18s var(--ease);
@@ -1521,7 +1560,7 @@ kbd {
   -webkit-backdrop-filter: blur(40px) saturate(190%);
   backdrop-filter: blur(40px) saturate(190%);
   border: 1px solid var(--border);
-  box-shadow: inset 0 1px 0 var(--spec), var(--shadow-pop), 0 40px 90px rgba(10, 16, 40, 0.3);
+  box-shadow: inset 0 1px 0 var(--spec), var(--shadow-pop);
   animation: pop 0.22s var(--ease);
   overflow: hidden;
 }
@@ -1548,7 +1587,7 @@ kbd {
   font-weight: 700;
 }
 .dialog-title .ico {
-  color: var(--accent);
+  color: var(--text-2);
 }
 .dialog-body {
   display: flex;
@@ -1697,7 +1736,7 @@ kbd {
   cursor: default;
 }
 .ctx-item:hover:not(:disabled) {
-  background: var(--accent);
+  background: var(--accent-grad-a);
   color: #fff;
 }
 .ctx-item:disabled {
@@ -1707,7 +1746,7 @@ kbd {
   color: var(--danger);
 }
 .ctx-item.danger:hover:not(:disabled) {
-  background: #c9254b;
+  background: var(--danger);
   color: #fff;
 }
 .ctx-sep {
@@ -1749,7 +1788,7 @@ kbd {
 }
 .toast > .ico {
   margin-top: 1px;
-  color: var(--accent);
+  color: var(--text-2);
 }
 .toast.error > .ico {
   color: var(--danger);
@@ -1829,40 +1868,6 @@ kbd {
 /* ================================================================== refinement layer: soft liquid glass
    Overrides earlier rules with: larger radii, gradient specular rims, layered soft shadows,
    fewer divider lines and buttery 220ms motion. Everything is token driven (light + dark). */
-:root {
-  --shadow: 0 1px 2px rgba(34, 24, 48, 0.04), 0 6px 18px rgba(34, 24, 48, 0.05), 0 22px 56px rgba(34, 24, 48, 0.09);
-  --shadow-pop: 0 2px 6px rgba(34, 24, 48, 0.06), 0 14px 34px rgba(34, 24, 48, 0.12), 0 44px 96px rgba(34, 24, 48, 0.2);
-  --shadow-btn: 0 1px 1.5px rgba(34, 24, 48, 0.1), 0 3px 8px rgba(34, 24, 48, 0.06);
-  --shadow-btn-hover: 0 2px 3px rgba(34, 24, 48, 0.08), 0 8px 18px rgba(34, 24, 48, 0.12);
-  --panel: rgba(255, 255, 255, 0.46);
-  --panel-strong: rgba(252, 251, 253, 0.72);
-  --grid-line: rgba(30, 24, 52, 0.055);
-  --hair: rgba(30, 24, 52, 0.07);
-  --inset: rgba(255, 255, 255, 0.34);
-  --inset-border: rgba(30, 24, 52, 0.06);
-  --btn-top: rgba(255, 255, 255, 0.9);
-  --btn-bottom: rgba(255, 255, 255, 0.52);
-  --btn-border: rgba(30, 24, 52, 0.08);
-  --menu-bg: rgba(252, 251, 254, 0.78);
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --shadow: 0 1px 2px rgba(0, 0, 0, 0.18), 0 8px 22px rgba(0, 0, 0, 0.22), 0 28px 64px rgba(0, 0, 0, 0.3);
-    --shadow-pop: 0 2px 6px rgba(0, 0, 0, 0.3), 0 16px 40px rgba(0, 0, 0, 0.42), 0 48px 110px rgba(0, 0, 0, 0.5);
-    --shadow-btn: 0 1px 2px rgba(0, 0, 0, 0.3), 0 3px 8px rgba(0, 0, 0, 0.18);
-    --shadow-btn-hover: 0 2px 4px rgba(0, 0, 0, 0.3), 0 8px 18px rgba(0, 0, 0, 0.3);
-    --panel: rgba(34, 32, 48, 0.5);
-    --panel-strong: rgba(38, 36, 54, 0.74);
-    --grid-line: rgba(255, 255, 255, 0.055);
-    --hair: rgba(255, 255, 255, 0.07);
-    --inset: rgba(255, 255, 255, 0.05);
-    --inset-border: rgba(255, 255, 255, 0.07);
-    --btn-top: rgba(255, 255, 255, 0.2);
-    --btn-bottom: rgba(255, 255, 255, 0.07);
-    --btn-border: rgba(255, 255, 255, 0.1);
-    --menu-bg: rgba(40, 38, 56, 0.8);
-  }
-}
 html,
 body {
   font: 13px/1.5 var(--font-ui);
@@ -1943,7 +1948,7 @@ html.mac .toolbar {
   font-weight: 650;
 }
 .brand-mark {
-  filter: drop-shadow(0 3px 7px var(--accent-glow));
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.14));
 }
 .brand-mark img,
 .empty-art img {
@@ -1963,12 +1968,29 @@ html.mac .toolbar {
 .tool-btn:active {
   transform: scale(0.97);
 }
-.tool-btn.on,
-.tool-btn.accent {
-  color: var(--accent-text);
-  background: var(--accent-soft);
+/* toolbar: neutral glyph buttons. "on" = neutral pressed fill; "accent" = accent glyph only. */
+.tool-btn.on {
+  color: var(--text);
+  background: var(--selected);
   border-color: transparent;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), inset 0 0 0 0.5px var(--accent-soft-2);
+  font-weight: 560;
+  box-shadow: inset 0 0 0 0.5px var(--hair);
+}
+.tool-btn.on:hover {
+  background: var(--selected);
+}
+.tool-btn.accent {
+  color: var(--text);
+  background: transparent;
+  border-color: transparent;
+  font-weight: 560;
+  box-shadow: none;
+}
+.tool-btn.accent .ico {
+  color: var(--accent);
+}
+.tool-btn.accent:hover {
+  background: var(--hover);
 }
 
 /* buttons: capsules with rim + gentle lift, compress on press */
@@ -1996,7 +2018,7 @@ html.mac .toolbar {
 }
 .btn:active:not(:disabled) {
   transform: translateY(0) scale(0.97);
-  box-shadow: inset 0 1px 2px rgba(34, 24, 48, 0.12), inset 0 0 0 0.5px var(--btn-border);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.1), inset 0 0 0 0.5px var(--btn-border);
 }
 .btn.sm {
   height: 28px;
@@ -2012,11 +2034,19 @@ html.mac .toolbar {
   font-weight: 620;
   text-shadow: 0 1px 1px rgba(120, 0, 20, 0.25);
   background: linear-gradient(180deg, var(--accent-grad-a), var(--accent-grad-b));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5), inset 0 -1px 0 rgba(120, 0, 20, 0.2), inset 0 0 0 0.5px rgba(255, 255, 255, 0.18), 0 1px 2px rgba(180, 0, 30, 0.3), 0 6px 16px var(--accent-glow);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.4), inset 0 -1px 0 rgba(120, 0, 20, 0.16), inset 0 0 0 0.5px rgba(255, 255, 255, 0.16), 0 1px 2px rgba(150, 0, 30, 0.22), 0 4px 12px var(--accent-glow);
+}
+/* a disabled primary turns neutral instead of a washed-out pink pill */
+.btn.primary:disabled {
+  color: var(--text-3);
+  text-shadow: none;
+  background: linear-gradient(180deg, var(--btn-top), var(--btn-bottom));
+  box-shadow: inset 0 0 0 0.5px var(--btn-border);
+  opacity: 0.7;
 }
 .btn.primary:hover:not(:disabled) {
   background: linear-gradient(180deg, var(--accent-hover), var(--accent-grad-a));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55), inset 0 -1px 0 rgba(120, 0, 20, 0.2), 0 2px 4px rgba(180, 0, 30, 0.3), 0 10px 24px var(--accent-glow);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), inset 0 -1px 0 rgba(120, 0, 20, 0.16), 0 2px 4px rgba(150, 0, 30, 0.24), 0 8px 18px var(--accent-glow);
 }
 .btn.primary:active:not(:disabled) {
   background: linear-gradient(180deg, var(--accent-grad-b), var(--accent-press));
@@ -2047,12 +2077,12 @@ html.mac .toolbar {
   border: 0;
   border-radius: var(--r-ctl);
   background: var(--input-bg);
-  box-shadow: inset 0 1px 2.5px rgba(34, 24, 48, 0.1), inset 0 0 0 0.5px var(--inset-border);
+  box-shadow: var(--shadow-inset), inset 0 0 0 0.5px var(--inset-border);
   transition: box-shadow var(--dur) var(--ease), background var(--dur) var(--ease);
 }
 .input:focus {
-  background: var(--panel-strong);
-  box-shadow: inset 0 0 0 1px var(--accent-ring), 0 0 0 3.5px var(--accent-soft), 0 4px 16px var(--accent-soft);
+  background: var(--input-bg);
+  box-shadow: var(--focus-ring);
 }
 .panel-search .input,
 .g-filter {
@@ -2066,8 +2096,8 @@ html.mac .toolbar {
 .seg {
   padding: 3px;
   border: 0;
-  background: var(--inset);
-  box-shadow: inset 0 1px 3px rgba(34, 24, 48, 0.1), inset 0 0 0 0.5px var(--inset-border);
+  background: var(--track);
+  box-shadow: inset 0 0 0 0.5px var(--inset-border);
 }
 .seg-btn {
   height: 28px;
@@ -2081,7 +2111,7 @@ html.mac .toolbar {
 .seg-btn.on {
   border: 0;
   background: linear-gradient(180deg, var(--btn-top), var(--btn-bottom));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(34, 24, 48, 0.14), 0 3px 8px rgba(34, 24, 48, 0.08);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(0, 0, 0, 0.14), 0 3px 8px rgba(0, 0, 0, 0.08);
 }
 .seg.small .seg-btn {
   height: 24px;
@@ -2096,7 +2126,7 @@ html.mac .toolbar {
 kbd {
   border: 0;
   border-radius: 7px;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8), inset 0 0 0 0.5px var(--btn-border), 0 1px 1.5px rgba(34, 24, 48, 0.1);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8), inset 0 0 0 0.5px var(--btn-border), 0 1px 1.5px rgba(0, 0, 0, 0.1);
 }
 
 /* sidebar: macOS source list */
@@ -2118,8 +2148,8 @@ kbd {
   height: 32px;
 }
 .node-row.selected {
-  background: var(--accent-soft);
-  box-shadow: inset 0 0 0 0.5px var(--accent-soft-2), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+  background: var(--selected);
+  box-shadow: none;
   font-weight: 560;
 }
 .node-row.selected > .ico {
@@ -2155,7 +2185,7 @@ kbd {
 .tab.active {
   border: 0;
   background: linear-gradient(180deg, var(--btn-top), var(--btn-bottom));
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(34, 24, 48, 0.12), 0 6px 16px rgba(34, 24, 48, 0.08);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(0, 0, 0, 0.12), 0 6px 16px rgba(0, 0, 0, 0.08);
 }
 .tab.active::after {
   content: "";
@@ -2167,7 +2197,7 @@ kbd {
   margin-left: -9px;
   border-radius: 3px;
   background: var(--accent);
-  box-shadow: 0 0 8px var(--accent-glow);
+  box-shadow: none;
 }
 .tab-close {
   transition: opacity var(--dur) var(--ease), background var(--dur) var(--ease);
@@ -2186,10 +2216,10 @@ kbd {
   border: 0;
   border-radius: var(--r-inner);
   background: var(--inset);
-  box-shadow: inset 0 1px 3px rgba(34, 24, 48, 0.07), inset 0 0 0 0.5px var(--inset-border);
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.07), inset 0 0 0 0.5px var(--inset-border);
 }
 .console.running .c-editor {
-  box-shadow: inset 0 0 0 1px var(--accent-ring), 0 0 0 4px var(--accent-soft), 0 0 24px var(--accent-soft-2);
+  box-shadow: inset 0 0 0 1px var(--accent-ring), 0 0 0 3px var(--accent-soft);
 }
 .r-tab {
   border: 0;
@@ -2198,12 +2228,13 @@ kbd {
 }
 .r-tab.on {
   border: 0;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(34, 24, 48, 0.12), 0 3px 8px rgba(34, 24, 48, 0.06);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(0, 0, 0, 0.12), 0 3px 8px rgba(0, 0, 0, 0.06);
 }
 .conn-pill {
   border: 0;
   height: 28px;
-  box-shadow: inset 0 0 0 0.5px color-mix(in srgb, var(--c) 40%, transparent);
+  background: var(--fill);
+  box-shadow: inset 0 0 0 0.5px var(--hair);
 }
 .r-error-text {
   border-radius: 14px;
@@ -2227,15 +2258,15 @@ kbd {
   font-variant-numeric: tabular-nums;
 }
 .g-row .g-cell.sel {
-  background: var(--accent-sel);
+  background: var(--sel-fill);
 }
 .g-row .g-cell.cur {
-  box-shadow: inset 0 0 0 2px var(--accent);
+  box-shadow: inset 0 0 0 1.5px var(--accent);
   outline-color: var(--accent);
 }
-.g-hc.sorted,
-.g-hc.sorted .g-name {
-  color: var(--accent-text);
+.g-row .g-cell.sel.dirty,
+.g-row .g-cell.cur.dirty {
+  background: linear-gradient(var(--sel-fill), var(--sel-fill)), var(--dirty-bg);
 }
 
 /* status bar */
@@ -2249,7 +2280,7 @@ kbd {
 .empty-art {
   position: relative;
   margin-bottom: 14px;
-  filter: drop-shadow(0 14px 26px var(--accent-glow));
+  filter: drop-shadow(0 10px 18px var(--accent-glow));
 }
 .empty-art::before {
   content: "";
@@ -2257,8 +2288,8 @@ kbd {
   inset: -70px;
   z-index: -1;
   border-radius: 50%;
-  background: radial-gradient(closest-side, var(--accent-glow), rgba(255, 150, 120, 0.12) 60%, transparent 75%);
-  opacity: 0.85;
+  background: radial-gradient(closest-side, var(--sheen), transparent 75%);
+  opacity: 0.9;
   filter: blur(10px);
 }
 .empty-card h2 {
@@ -2268,17 +2299,17 @@ kbd {
 
 /* dialogs, menus, toasts */
 .overlay {
-  background: rgba(40, 28, 60, 0.18);
-  -webkit-backdrop-filter: blur(10px) saturate(130%);
-  backdrop-filter: blur(10px) saturate(130%);
+  background: var(--overlay);
+  -webkit-backdrop-filter: blur(10px) saturate(110%);
+  backdrop-filter: blur(10px) saturate(110%);
 }
 .dialog {
   border: 0;
   border-radius: 26px;
   background: var(--panel-strong);
-  -webkit-backdrop-filter: blur(40px) saturate(200%);
-  backdrop-filter: blur(40px) saturate(200%);
-  box-shadow: inset 0 0 30px rgba(255, 255, 255, 0.08), var(--shadow-pop);
+  -webkit-backdrop-filter: var(--blur);
+  backdrop-filter: var(--blur);
+  box-shadow: inset 0 0 30px rgba(255, 255, 255, 0.06), var(--shadow-pop);
 }
 .dialog-head,
 .dialog-foot {
@@ -2290,8 +2321,8 @@ kbd {
   border: 0;
   border-radius: 16px;
   box-shadow: inset 0 0 0 0.5px var(--btn-border), var(--shadow-pop);
-  -webkit-backdrop-filter: blur(36px) saturate(190%);
-  backdrop-filter: blur(36px) saturate(190%);
+  -webkit-backdrop-filter: var(--blur);
+  backdrop-filter: var(--blur);
 }
 .toast {
   border: 0;
@@ -2384,7 +2415,8 @@ kbd {
   cursor: pointer;
 }
 .import-row:hover:not(.disabled) {
-  border-color: var(--accent-ring);
+  background: var(--input-bg);
+  border-color: var(--hair);
 }
 .import-row.disabled {
   opacity: 0.6;
@@ -2399,8 +2431,8 @@ kbd {
   border-radius: 7px;
   font: 700 10.5px var(--font-ui);
   letter-spacing: 0.04em;
-  color: var(--accent);
-  background: var(--accent-soft);
+  color: var(--text-2);
+  background: var(--fill);
 }
 .import-badge.none {
   color: var(--text-3);
@@ -2452,12 +2484,12 @@ kbd {
   background: var(--ok-soft);
 }
 .import-chip.update {
-  color: var(--accent);
-  background: var(--accent-soft);
+  color: var(--text-2);
+  background: var(--fill);
 }
 .import-chip.warning {
   color: var(--warn);
-  background: rgba(214, 150, 20, 0.16);
+  background: var(--warn-soft);
 }
 .import-chip.unsupported {
   color: var(--text-3);
@@ -2503,11 +2535,11 @@ kbd {
   color: var(--text-2);
   padding: 8px 12px;
   border-radius: var(--r-ctl);
-  background: var(--inset);
+  background: var(--fill);
 }
 .vault-adv {
   border-radius: var(--r-ctl);
-  background: var(--inset);
+  background: var(--fill);
   padding: 0 12px;
 }
 .vault-adv > summary {
@@ -2560,4 +2592,35 @@ kbd {
 .vault-test .vault-result {
   flex: 1;
   min-width: 0;
+}
+
+/* ── Consistency: buttons that sit beside a 34px input match its height ── */
+.row2.tight > .btn,
+.vault-test > .btn {
+  height: 34px;
+}
+
+/* disabled destructive buttons read as plain disabled, not as a faded orange/pink */
+.btn.danger:disabled {
+  color: var(--text-2);
+}
+/* truncation note: the prefix shrinks with an ellipsis, the "Load more" link always stays visible */
+.g-trunc {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.g-trunc-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.g-trunc .linkbtn {
+  flex: none;
+}
+@container (max-width: 980px) {
+  .g-trunc-text {
+    display: none;
+  }
 }

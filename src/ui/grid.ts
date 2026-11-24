@@ -896,7 +896,7 @@ export class ResultGrid {
         h(
           "span",
           { class: "g-trunc" },
-          `First ${this.maxRows.toLocaleString()} rows — `,
+          h("span", { class: "g-trunc-text" }, `First ${this.maxRows.toLocaleString()} rows —`),
           h("button", { class: "linkbtn", type: "button", onclick: () => this.cb.onLoadMore() }, "Load more"),
         ),
       );
