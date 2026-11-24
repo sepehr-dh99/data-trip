@@ -1,6 +1,6 @@
 // ALL CodeMirror usage lives here, behind the small SqlEditor interface.
 import { Compartment, EditorState, Prec } from "@codemirror/state";
-import type { Extension } from "@codemirror/state";
+import type { Extension, Transaction, TransactionSpec } from "@codemirror/state";
 import {
   EditorView,
   drawSelection,
@@ -13,7 +13,7 @@ import {
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
 import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
-import type { CompletionContext } from "@codemirror/autocomplete";
+import type { Completion, CompletionContext, CompletionResult } from "@codemirror/autocomplete";
 import { HighlightStyle, StreamLanguage, bracketMatching, indentOnInput, syntaxHighlighting } from "@codemirror/language";
 import { MSSQL, MySQL, PostgreSQL, SQLite, sql } from "@codemirror/lang-sql";
 import { tags as t } from "@lezer/highlight";
@@ -579,7 +579,7 @@ export class FilterInput {
           syntaxHighlighting(highlight),
           this.lang.of(this.langExtension()),
           // Single line: pasted line breaks become spaces.
-          EditorState.transactionFilter.of((tr: { docChanged: boolean; newDoc: { lines: number; toString(): string }; startState: { doc: { length: number } } }) => {
+          EditorState.transactionFilter.of((tr: Transaction): TransactionSpec | readonly TransactionSpec[] => {
             if (!tr.docChanged || tr.newDoc.lines <= 1) return tr;
             const text = tr.newDoc.toString().replace(/\s*\n\s*/g, " ");
             return [{ changes: { from: 0, to: tr.startState.doc.length, insert: text }, selection: { anchor: text.length } }];
@@ -623,7 +623,7 @@ export class FilterInput {
     ];
   }
 
-  private complete(ctx: CompletionContext): { from: number; options: unknown[]; validFor: RegExp } | null {
+  private complete(ctx: CompletionContext): CompletionResult | null {
     const line = ctx.state.doc.lineAt(ctx.pos);
     const before = line.text.slice(0, ctx.pos - line.from);
     // no completion inside a string literal
@@ -634,7 +634,7 @@ export class FilterInput {
     const quoted = /^["`\[]/.test(word);
     const options = filterCompletions(this.opts.kind, this.driver, this.columns, quoted)
       .filter((c) => !quoted || c.kind === "column")
-      .map((c) => ({
+      .map((c): Completion => ({
         label: c.label,
         apply: c.apply,
         type: c.kind === "column" ? "property" : "keyword",
