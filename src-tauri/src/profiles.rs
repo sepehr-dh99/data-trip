@@ -98,6 +98,7 @@ pub struct Profiles {
     store: Arc<Store>,
     vault_path: PathBuf,
     ssh_path: PathBuf,
+    layout_path: PathBuf,
     file_lock: tokio::sync::Mutex<()>,
     vault_tokens: SecretStore,
     ssh_secrets: SecretStore,
@@ -109,10 +110,34 @@ impl Profiles {
             store,
             vault_path: config_dir.join("vault_profiles.json"),
             ssh_path: config_dir.join("ssh_profiles.json"),
+            layout_path: config_dir.join("explorer_layout.json"),
             file_lock: tokio::sync::Mutex::new(()),
             vault_tokens: SecretStore::new(VAULT_PROFILE_SERVICE),
             ssh_secrets: SecretStore::new(SSH_SERVICE),
         }
+    }
+
+    // ----- Explorer layout -----
+
+    pub async fn get_layout(&self) -> AppResult<crate::model::ExplorerLayout> {
+        let _g = self.file_lock.lock().await;
+        match std::fs::read_to_string(&self.layout_path) {
+            Ok(text) if !text.trim().is_empty() => serde_json::from_str(&text).map_err(|e| {
+                AppError::new(format!(
+                    "Could not read {}: {}",
+                    self.layout_path.display(),
+                    e
+                ))
+            }),
+            Ok(_) => Ok(Default::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub async fn save_layout(&self, layout: &crate::model::ExplorerLayout) -> AppResult<()> {
+        let _g = self.file_lock.lock().await;
+        write_json_atomic(&self.layout_path, layout)
     }
 
     // ----- Vault profiles -----

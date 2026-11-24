@@ -16,11 +16,11 @@ import {
   userDatabases,
 } from "./scope";
 import { store } from "./state";
-import { connColor } from "./sqlutil";
+import { dataBadge } from "./icons";
 import { humanSize } from "./format";
 import { dbLabel, redisDbMeta } from "./redis";
 
-export const DRIVER_ABBR: Record<string, string> = { postgres: "PG", mysql: "MY", sqlite: "SQ", mssql: "MS", redis: "RD", kafka: "KF" };
+export { DRIVER_ABBR } from "./icons";
 
 export interface PickerAnchor {
   /** Preferred top-left corner (viewport px); the popover is clamped inside the window. */
@@ -195,7 +195,7 @@ export function openScopePicker(connId: string, anchor: PickerAnchor, onClose?: 
     h(
       "div",
       { class: "sp-head" },
-      h("span", { class: "sp-badge", style: `--c:${connColor(e0.config)}`, title: DRIVER_LABELS[e0.config.driver] }, DRIVER_ABBR[e0.config.driver]),
+      dataBadge(e0.config, "sp-badge", 12, DRIVER_LABELS[e0.config.driver]),
       h("span", { class: "sp-title" }, e0.config.name),
       h("span", { class: "sp-sub" }, "· visible databases"),
       h("div", { class: "spacer" }),

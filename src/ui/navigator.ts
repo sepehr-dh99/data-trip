@@ -14,7 +14,8 @@ import { humanSize } from "./format";
 import type { ObjKind } from "./prefs";
 import { getRecent, pushRecent } from "./prefs";
 import { dbVisible, userDatabases } from "./scope";
-import { DRIVER_ABBR } from "./scopePicker";
+import { DRIVER_ABBR, dataBadge, hasIcon, svgMarkup } from "./icons";
+import { topItems } from "./layout";
 import type { ConnEntry } from "./state";
 import { store } from "./state";
 import { connColor, qualifiedName } from "./sqlutil";
@@ -41,6 +42,8 @@ interface NavItem {
   label: string;
   meta?: string;
   badgeText?: string;
+  /** Inline SVG markup replacing the text (custom data-source icon). */
+  badgeSvg?: string;
   badgeIcon?: string;
   badgeColor?: string;
   /** Extra class on the badge (Redis key type colors). */
@@ -127,7 +130,7 @@ export class Navigator {
         this.seg(
           "source",
           `Data source: ${e.config.name}`,
-          [h("span", { class: "crumb-badge", style: `--c:${connColor(e.config)}` }, DRIVER_ABBR[driver]), h("span", { class: "crumb-label" }, e.config.name), caret()],
+          [dataBadge(e.config, "crumb-badge", 10), h("span", { class: "crumb-label" }, e.config.name), caret()],
           `Data source: ${e.config.name}`,
         ),
         h("span", { class: "crumb-sep", "aria-hidden": "true" }, "›"),
@@ -147,7 +150,7 @@ export class Navigator {
       this.seg(
         "source",
         `Data source: ${e.config.name}`,
-        [h("span", { class: "crumb-badge", style: `--c:${connColor(e.config)}` }, DRIVER_ABBR[driver]), h("span", { class: "crumb-label" }, e.config.name), caret()],
+        [dataBadge(e.config, "crumb-badge", 10), h("span", { class: "crumb-label" }, e.config.name), caret()],
         `Data source: ${e.config.name}`,
       ),
       h("span", { class: "crumb-sep", "aria-hidden": "true" }, "›"),
@@ -381,6 +384,10 @@ export class Navigator {
         { class: "nav-badge" + (it.badgeColor ? " solid" : "") + (it.badgeCls ? " " + it.badgeCls : ""), style: it.badgeColor ? `--c:${it.badgeColor}` : undefined, "aria-hidden": "true" },
         it.badgeIcon ? icon(it.badgeIcon, 12) : (it.badgeText ?? ""),
       );
+      if (it.badgeSvg) {
+        badge.innerHTML = it.badgeSvg;
+        badge.classList.add("has-icon");
+      }
       const el = h(
         "button",
         {
@@ -435,12 +442,12 @@ export class Navigator {
 
   private sourceItems(): NavItem[] {
     const pane = this.pane;
+    // Same order as the explorer: folders (and their members) as arranged there, loose sources last.
     const groups = new Map<string, ConnEntry[]>();
     const loose: ConnEntry[] = [];
-    for (const e of store.list()) {
-      const f = e.config.folder?.trim();
-      if (f) groups.set(f, [...(groups.get(f) ?? []), e]);
-      else loose.push(e);
+    for (const it of topItems()) {
+      if (it.kind === "folder") groups.set(it.name, it.members);
+      else loose.push(it.entry);
     }
     const out: NavItem[] = [];
     const add = (name: string, list: ConnEntry[]): void => {
@@ -453,6 +460,7 @@ export class Navigator {
           meta: e.status === "connected" ? "connected" : e.status === "error" ? "failed" : "",
           badgeText: DRIVER_ABBR[e.config.driver],
           badgeColor: connColor(e.config),
+          badgeSvg: hasIcon(e.config.icon) ? svgMarkup(e.config.icon, 12, "#fff", 2.2) : undefined,
           current: pane?.connId === e.config.id,
           run: (nc) => {
             const id = e.config.id;

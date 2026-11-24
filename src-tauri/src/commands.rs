@@ -440,6 +440,21 @@ pub async fn kafka_delete_topic(
 // ----- shared Vault profiles -----
 
 #[tauri::command]
+pub async fn get_explorer_layout(
+    state: State<'_, AppState>,
+) -> AppResult<crate::model::ExplorerLayout> {
+    state.profiles.get_layout().await
+}
+
+#[tauri::command]
+pub async fn save_explorer_layout(
+    state: State<'_, AppState>,
+    layout: crate::model::ExplorerLayout,
+) -> AppResult<()> {
+    state.profiles.save_layout(&layout).await
+}
+
+#[tauri::command]
 pub async fn list_vault_profiles(state: State<'_, AppState>) -> AppResult<Vec<VaultProfile>> {
     state.profiles.list_vault().await
 }

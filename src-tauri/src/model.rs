@@ -52,6 +52,9 @@ pub struct ConnectionConfig {
     /// Accent colour shown in the UI, e.g. "#ff5f57".
     #[serde(default)]
     pub color: Option<String>,
+    /// Built-in explorer icon name (e.g. "globe", "shield"); None = driver badge.
+    #[serde(default)]
+    pub icon: Option<String>,
     #[serde(default)]
     pub read_only: bool,
     /// How credentials are obtained. Default: stored password (OS keychain).
@@ -685,4 +688,32 @@ pub struct KafkaGroupDetail {
     pub members: Vec<KafkaGroupMember>,
     pub offsets: Vec<KafkaGroupOffset>,
     pub total_lag: i64,
+}
+
+// ── Explorer layout (order + folder appearance) ──────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderMeta {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<String>,
+    /// Built-in icon name; None = folder icon.
+    #[serde(default)]
+    pub icon: Option<String>,
+}
+
+/// UI-only layout, stored in `<config>/explorer_layout.json`. Unknown ids/folders are ignored by the UI and
+/// items missing from the lists are appended in their default (alphabetical) order.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExplorerLayout {
+    /// Top-level order: entries "folder:<name>" and "conn:<connection id>".
+    #[serde(default)]
+    pub order: Vec<String>,
+    /// Folder name -> connection ids in display order.
+    #[serde(default)]
+    pub folder_order: std::collections::BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub folders: Vec<FolderMeta>,
 }

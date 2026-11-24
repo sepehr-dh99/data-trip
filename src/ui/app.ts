@@ -22,6 +22,7 @@ import { Navigator } from "./navigator";
 import { openScopePicker } from "./scopePicker";
 import { store } from "./state";
 import { connColor } from "./sqlutil";
+import { loadLayout, onLookChange } from "./layout";
 import { toast } from "./toast";
 import { VAULT_TOKEN_RE, vaults } from "./vault";
 import { showTokenPastePrompt } from "./vaultChips";
@@ -106,6 +107,10 @@ export class App {
     });
     this.build();
     store.subscribe(() => this.onStoreChange());
+    onLookChange(() => {
+      this.renderTabs();
+      this.navigator.update(this.active);
+    });
     store.onSchema((id) => this.tabs.filter((t) => t.connId === id).forEach((t) => t.updateSchema()));
     window.addEventListener("keydown", (e) => this.onKey(e));
     window.addEventListener("paste", (e) => this.onPaste(e));
@@ -143,7 +148,7 @@ export class App {
 
   async start(): Promise<void> {
     try {
-      await store.load();
+      await Promise.all([store.load(), loadLayout()]);
     } catch (e) {
       toast(`Could not load connections: ${errMsg(e)}`, "error");
     }

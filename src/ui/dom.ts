@@ -103,6 +103,9 @@ const ICONS: Record<string, string> = {
   topic: '<path d="M4 8c2-2 3-2 5 0s3 2 5 0 3-2 6 0M4 12.500c2-2 3-2 5 0s3 2 5 0 3-2 6 0M4 17c2-2 3-2 5 0s3 2 5 0 3-2 6 0"/>',
   group: '<circle cx="12" cy="12" r="8.500"/><circle cx="12" cy="12" r="3.600"/>',
   send: '<path d="M4 12l16-7-6 15-2.500-6.200z"/><path d="M11.500 13.800L20 5"/>',
+  palette: '<circle cx="12" cy="12" r="8.5"/><path d="M12 3.5a8.5 8.5 0 010 17z" fill="currentColor"/>',
+  up: '<path d="M12 19V5M6 11l6-6 6 6"/>',
+  down: '<path d="M12 5v14M6 13l6 6 6-6"/>',
   copyCheck: '<path d="M5 12.500l4.500 4.500L19 7.500"/>',
 };
 

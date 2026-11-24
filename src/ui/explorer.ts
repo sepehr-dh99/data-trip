@@ -8,13 +8,17 @@ import { brandMark, clear, errMsg, h, icon } from "./dom";
 import { showMenu } from "./menu";
 import type { ConnEntry } from "./state";
 import { store } from "./state";
-import { connColor, qualifiedName } from "./sqlutil";
+import { qualifiedName } from "./sqlutil";
 import { toast } from "./toast";
 import { humanSize } from "./format";
 import type { Density } from "./prefs";
 import { ROW_HEIGHT, getCollapsedFolders, getDensity, pushRecent, renameCollapsedFolder, setDensity, setFolderCollapsed } from "./prefs";
 import { dbVisible, folderNames, onScopeChange, schemaVisible, scopeLabel, scopeSummary, setFolder, setFolderForMany } from "./scope";
-import { DRIVER_ABBR, openScopePicker } from "./scopePicker";
+import { openScopePicker } from "./scopePicker";
+import { DRIVER_ABBR, dataBadge, hasIcon, svgIcon } from "./icons";
+import type { DropZone } from "./layout";
+import { canDrop, canShift, connFolder, connKey, dropOn, folderKey, folderMeta, onLayoutChange, renameFolderLayout, setConnLook, setFolderLook, shift, sortFolder, topItems, ungroupFolderLayout } from "./layout";
+import { closeLookPicker, openLookPicker } from "./lookPicker";
 import { promptDialog } from "./prompt";
 import { confirmDialog } from "./confirm";
 import type { TNode } from "./redis";
@@ -32,6 +36,10 @@ const OVERSCAN = 8;
 /** Indent (px) per tree depth: compact = 12 per level (spec); comfortable keeps 0 / 16 / 30, then +14. */
 const indentOf = (d: number, density: Density): number => (density === "compact" ? d * 12 : d <= 0 ? 0 : 16 + (d - 1) * 14);
 const DRAG_MIME = "application/x-datatrip-conn";
+const IS_MAC = /Mac/.test(navigator.userAgent);
+const ALT_UP = IS_MAC ? "⌥↑" : "Alt+↑";
+const ALT_DOWN = IS_MAC ? "⌥↓" : "Alt+↓";
+const EDGE_ZONE = 36;
 const STATUS_TEXT: Record<string, string> = { idle: "not connected", connecting: "connecting…", connected: "connected", error: "connection failed" };
 
 export interface OpenConsoleOpts {
@@ -120,6 +128,21 @@ interface RowSpec {
   dragConn?: string;
   /** Folder name this row accepts dropped connections for. */
   dropFolder?: string;
+  /** Layout key ("conn:<id>" / "folder:<name>") of a row that can be dragged and reordered. */
+  dragKey?: string;
+  /** Folder appearance: icon stroked and name tinted in the folder's color. */
+  look?: { color: string | null; icon: string | null };
+}
+
+interface DragState {
+  key: string;
+  isFolder: boolean;
+  cancelled: boolean;
+}
+interface DropState {
+  idx: number;
+  zone: DropZone;
+  key: string;
 }
 
 interface Flat {
@@ -144,6 +167,12 @@ export class Explorer {
   private flat: Flat[] = [];
   private rendered = new Map<number, HTMLElement>();
   private scrollQueued = false;
+  private drag: DragState | null = null;
+  private drop: DropState | null = null;
+  private lastY = 0;
+  private scrollRaf = 0;
+  private pendingRender = false;
+  private dropLine: HTMLElement = h("div", { class: "drop-line", "aria-hidden": "true", hidden: true });
   private density: Density = getDensity();
   private rowH = ROW_HEIGHT[getDensity()];
 
@@ -165,6 +194,22 @@ export class Explorer {
     this.inner = h("div", { class: "tree-inner" });
     this.tree = h("div", { class: "tree", role: "tree", tabindex: "0", "aria-label": "Connections" }, this.inner);
     this.tree.addEventListener("keydown", (ev) => this.onTreeKey(ev));
+    this.tree.addEventListener("dragover", (ev) => this.onDragOver(ev));
+    this.tree.addEventListener("dragleave", (ev) => {
+      if (!ev.relatedTarget || !this.tree.contains(ev.relatedTarget as Node)) this.clearDrop();
+    });
+    this.tree.addEventListener("drop", (ev) => this.onDrop(ev));
+    window.addEventListener("dragend", () => this.endDrag());
+    window.addEventListener(
+      "keydown",
+      (ev) => {
+        if (ev.key === "Escape" && this.drag) {
+          this.drag.cancelled = true;
+          this.clearDrop();
+        }
+      },
+      true,
+    );
     this.tree.addEventListener("scroll", () => {
       if (this.scrollQueued) return;
       this.scrollQueued = true;
@@ -223,6 +268,7 @@ export class Explorer {
     this.el.setAttribute("aria-label", "Explorer");
     this.applyDensity();
     onScopeChange(() => this.render());
+    onLayoutChange(() => this.render());
     store.subscribe(() => this.render());
     onOverview(() => this.render());
     new ResizeObserver(() => this.paintWindow(false)).observe(this.tree);
@@ -244,6 +290,13 @@ export class Explorer {
 
   /** ↑ ↓ move the selection, → / ← expand / collapse, ↵ activates (opens a key, toggles a folder). */
   private onTreeKey(ev: KeyboardEvent): void {
+    if (ev.altKey && !ev.metaKey && !ev.ctrlKey && !ev.shiftKey && (ev.key === "ArrowUp" || ev.key === "ArrowDown")) {
+      const key = this.selectedMoveKey();
+      if (!key) return;
+      ev.preventDefault();
+      this.moveSelected(key, ev.key === "ArrowUp" ? -1 : 1);
+      return;
+    }
     if (ev.target !== this.tree || ev.metaKey || ev.ctrlKey || ev.altKey) return;
     if (!["ArrowDown", "ArrowUp", "ArrowRight", "ArrowLeft", "Enter"].includes(ev.key)) return;
     if (this.flat.length === 0) return;
@@ -349,11 +402,9 @@ export class Explorer {
     const id = e.config.id;
     const ckey = "c:" + id;
     const connected = e.status === "connected";
-    const badge = h(
-      "span",
-      { class: "conn-badge " + e.status, style: `--c:${connColor(e.config)}`, title: `${DRIVER_LABELS[e.config.driver]} · ${STATUS_TEXT[e.status]}` },
-      DRIVER_ABBR[e.config.driver],
-    );
+    const badge = dataBadge(e.config, "conn-badge " + e.status, this.density === "compact" ? 11 : 14, `${DRIVER_LABELS[e.config.driver]} · ${STATUS_TEXT[e.status]}`);
+    const custom = hasIcon(e.config.icon);
+    const metaParts = [e.status === "connecting" ? "connecting…" : e.config.readOnly ? "read-only" : "", custom ? DRIVER_ABBR[e.config.driver] : ""].filter(Boolean);
     const actions: HTMLElement[] = [];
     if (connected) {
       actions.push(h("button", { class: "icon-btn xs", type: "button", title: "New console", "aria-label": "New console", onclick: (ev: Event) => (ev.stopPropagation(), this.host.openConsole(id)) }, icon("terminal", 13)));
@@ -365,7 +416,8 @@ export class Explorer {
       key: ckey,
       label: e.config.name,
       badge,
-      meta: e.status === "connecting" ? "connecting…" : e.config.readOnly ? "read-only" : undefined,
+      meta: metaParts.length ? metaParts.reverse().join(" · ") : undefined,
+      metaCls: custom ? "drv" : undefined,
       // Every connection shows a disclosure triangle: on an idle one it connects first.
       expandable: e.status !== "error" || connected,
       cls: "conn " + e.status,
@@ -373,6 +425,7 @@ export class Explorer {
       actions,
       chip: connected && e.config.driver !== "sqlite" && e.config.driver !== "kafka" && scopeSummary(e).total > 0 ? this.chipEl(e) : undefined,
       dragConn: id,
+      dragKey: connKey(id),
       children: () => {
         if (!connected) return e.status === "error" && e.error ? [this.note(`err:${id}`, e.error, "err")] : [];
         return this.connChildren(e);
@@ -1007,23 +1060,18 @@ export class Explorer {
 
   private flatten(): Flat[] {
     const out: Flat[] = [];
-    const entries = store.list();
     const collapsed = getCollapsedFolders();
-    const folders = new Map<string, ConnEntry[]>();
-    const loose: ConnEntry[] = [];
-    for (const e of entries) {
-      const f = e.config.folder?.trim();
-      if (f) {
-        const list = folders.get(f);
-        if (list) list.push(e);
-        else folders.set(f, [e]);
-      } else loose.push(e);
-    }
     const top: RowSpec[] = [];
-    for (const [name, list] of folders) {
+    for (const it of topItems()) {
+      if (it.kind === "conn") {
+        top.push(this.connSpec(it.entry));
+        continue;
+      }
+      const { name, members: list } = it;
       const key = "fo:" + name;
       if (collapsed.has(name)) this.expanded.delete(key);
       else this.expanded.add(key);
+      const meta = folderMeta(name);
       top.push({
         key,
         label: name,
@@ -1036,9 +1084,10 @@ export class Explorer {
         onToggle: (open) => setFolderCollapsed(name, !open),
         onContext: (ev) => this.folderMenu(ev, name, list),
         dropFolder: name,
+        dragKey: folderKey(name),
+        look: { color: meta?.color ?? null, icon: meta?.icon ?? null },
       });
     }
-    for (const e of loose) top.push(this.connSpec(e));
     for (const spec of top) {
       if (!this.filter) this.walk(spec, 0, out);
       else this.walkFiltered(spec, 0, out);
@@ -1077,6 +1126,11 @@ export class Explorer {
   // ------------------------------------------------------------------ rendering
 
   render(): void {
+    if (this.drag) {
+      // Never rebuild the rows under an active drag (the dragged element must stay alive until dragend).
+      this.pendingRender = true;
+      return;
+    }
     this.flat = this.flatten();
     const entries = store.list();
     const n = this.flat.length;
@@ -1116,12 +1170,14 @@ export class Explorer {
     const vh = this.tree.clientHeight || 600;
     const start = Math.max(0, Math.floor(top / this.rowH) - OVERSCAN);
     const end = Math.min(n, Math.ceil((top + vh) / this.rowH) + OVERSCAN);
+    const keep = this.drag ? this.flat.findIndex((f) => f.spec.dragKey === this.drag?.key) : -1;
     for (const [i, el] of this.rendered) {
-      if (i < start || i >= end) {
+      if ((i < start || i >= end) && i !== keep) {
         el.remove();
         this.rendered.delete(i);
       }
     }
+    if (this.dropLine.parentNode !== this.inner) this.inner.appendChild(this.dropLine);
     for (let i = start; i < end; i++) {
       if (this.rendered.has(i)) continue;
       const el = this.rowEl(this.flat[i], i);
@@ -1136,14 +1192,17 @@ export class Explorer {
     const compact = this.density === "compact";
     const caret = h("span", { class: "twisty" + (expandable ? (fr.open ? " open" : "") : " none"), "aria-hidden": "true" }, expandable ? icon("caret", compact ? 8 : 10) : null);
     let lead: HTMLElement | null = s.badge ?? null;
-    if (!lead && s.icon) {
+    if (!lead && s.look) {
+      lead = svgIcon(hasIcon(s.look.icon) ? s.look.icon : "folder", compact ? 14 : 16, s.look.color ?? "currentColor", 2);
+    } else if (!lead && s.icon) {
       lead = icon(s.icon, compact ? 13 : 15);
       if (s.iconCls) lead.classList.add(s.iconCls);
     }
+    const dragging = this.drag !== null && s.dragKey === this.drag.key;
     const r = h(
       "div",
       {
-        class: "node-row " + (s.cls ?? "") + (this.selected === s.key ? " selected" : "") + (s.actions && s.actions.length ? " has-actions" : ""),
+        class: "node-row " + (s.cls ?? "") + (this.selected === s.key ? " selected" : "") + (s.actions && s.actions.length ? " has-actions" : "") + (dragging ? " dragging" : ""),
         role: "treeitem",
         "aria-level": String(fr.depth + 1),
         "aria-expanded": expandable ? String(fr.open) : undefined,
@@ -1154,38 +1213,27 @@ export class Explorer {
       h("span", { class: "indent", style: `width:${indentOf(fr.depth, this.density)}px` }),
       caret,
       lead,
-      h("span", { class: "label" }, s.label),
+      h("span", { class: "label", style: s.look?.color ? `color:${s.look.color}` : undefined }, s.label),
       s.tag ? h("span", { class: "badge-tag" + (s.tagCls ? " " + s.tagCls : "") }, s.tag) : null,
       s.meta ? h("span", { class: "meta" + (s.metaMono ? " mono" : "") + (s.metaCls ? " " + s.metaCls : "") }, s.meta) : null,
       s.actions && s.actions.length ? h("span", { class: "node-actions" }, s.actions) : null,
       s.chip ?? null,
     );
-    if (s.dragConn) {
-      const cid = s.dragConn;
+    if (s.dragKey && !this.filter) {
+      const dk = s.dragKey;
       r.draggable = true;
       r.addEventListener("dragstart", (ev) => {
-        ev.dataTransfer?.setData(DRAG_MIME, cid);
-        ev.dataTransfer?.setData("text/plain", store.conns.get(cid)?.config.name ?? cid);
+        if (s.dragConn) {
+          ev.dataTransfer?.setData(DRAG_MIME, s.dragConn);
+          ev.dataTransfer?.setData("text/plain", store.conns.get(s.dragConn)?.config.name ?? s.dragConn);
+        } else ev.dataTransfer?.setData("text/plain", s.label);
         if (ev.dataTransfer) ev.dataTransfer.effectAllowed = "move";
+        this.drag = { key: dk, isFolder: dk.startsWith("folder:"), cancelled: false };
+        this.drop = null;
+        closeLookPicker();
+        window.setTimeout(() => r.classList.add("dragging"), 0);
       });
-    }
-    if (s.dropFolder !== undefined) {
-      const folder = s.dropFolder;
-      const accepts = (ev: DragEvent): boolean => ev.dataTransfer?.types.includes(DRAG_MIME) === true;
-      r.addEventListener("dragover", (ev) => {
-        if (!accepts(ev)) return;
-        ev.preventDefault();
-        if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
-        r.classList.add("drop-target");
-      });
-      r.addEventListener("dragleave", () => r.classList.remove("drop-target"));
-      r.addEventListener("drop", (ev) => {
-        r.classList.remove("drop-target");
-        const cid = ev.dataTransfer?.getData(DRAG_MIME);
-        if (!cid) return;
-        ev.preventDefault();
-        void setFolder(cid, folder);
-      });
+      r.addEventListener("dragend", () => this.endDrag());
     }
     r.addEventListener("click", (e) => {
       this.selected = s.key;
@@ -1205,6 +1253,196 @@ export class Explorer {
     return r;
   }
 
+  // ------------------------------------------------------------------ drag & drop reordering
+
+  private folderOpen = (name: string): boolean => this.expanded.has("fo:" + name);
+
+  /** Row under a viewport Y (and the fraction down that row), or null past the last row. */
+  private hit(clientY: number): { idx: number; frac: number } | null {
+    const top = this.inner.getBoundingClientRect().top;
+    const y = clientY - top;
+    const idx = Math.floor(y / this.rowH);
+    if (idx < 0 || idx >= this.flat.length) return null;
+    return { idx, frac: (y - idx * this.rowH) / this.rowH };
+  }
+
+  /** End (inclusive flat index) of the row's block: the row plus all of its open descendants. */
+  private blockEnd(idx: number): number {
+    const d = this.flat[idx].depth;
+    let j = idx;
+    while (j + 1 < this.flat.length && this.flat[j + 1].depth > d) j++;
+    return j;
+  }
+
+  private onDragOver(ev: DragEvent): void {
+    const d = this.drag;
+    if (!d || d.cancelled) return;
+    this.lastY = ev.clientY;
+    const ok = this.updateDrop(ev.clientY);
+    if (ok) {
+      ev.preventDefault();
+      if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
+    }
+    // Auto-scroll near the top / bottom edge of the tree.
+    const r = this.tree.getBoundingClientRect();
+    const near = ev.clientY < r.top + EDGE_ZONE || ev.clientY > r.bottom - EDGE_ZONE;
+    if (near && !this.scrollRaf) this.scrollRaf = requestAnimationFrame(() => this.autoScrollTick());
+  }
+
+  private autoScrollTick(): void {
+    this.scrollRaf = 0;
+    if (!this.drag) return;
+    const r = this.tree.getBoundingClientRect();
+    let dy = 0;
+    if (this.lastY < r.top + EDGE_ZONE) dy = -Math.ceil(((r.top + EDGE_ZONE - this.lastY) / EDGE_ZONE) * 14);
+    else if (this.lastY > r.bottom - EDGE_ZONE) dy = Math.ceil(((this.lastY - (r.bottom - EDGE_ZONE)) / EDGE_ZONE) * 14);
+    if (dy === 0) return;
+    const before = this.tree.scrollTop;
+    this.tree.scrollTop = before + dy;
+    if (this.tree.scrollTop !== before) {
+      this.paintWindow(false);
+      this.updateDrop(this.lastY);
+    }
+    this.scrollRaf = requestAnimationFrame(() => this.autoScrollTick());
+  }
+
+  /** Works out the drop zone under the pointer and draws the insertion line / folder highlight. */
+  private updateDrop(clientY: number): boolean {
+    const d = this.drag;
+    const h0 = this.hit(clientY);
+    const row = h0 ? this.flat[h0.idx] : null;
+    const key = row?.spec.dragKey;
+    if (!d || !h0 || !row || !key) {
+      this.clearDrop();
+      return false;
+    }
+    const isFolderRow = row.spec.dropFolder !== undefined;
+    let zone: DropZone = h0.frac < 0.5 ? "before" : "after";
+    if (isFolderRow && !d.isFolder && h0.frac > 0.28 && h0.frac < 0.72) zone = "into";
+    if (!canDrop(d.key, key, zone, this.folderOpen)) {
+      this.clearDrop();
+      return false;
+    }
+    this.drop = { idx: h0.idx, zone, key };
+    this.paintDrop();
+    return true;
+  }
+
+  private paintDrop(): void {
+    for (const el of this.inner.querySelectorAll(".drop-target")) el.classList.remove("drop-target");
+    const dr = this.drop;
+    const d = this.drag;
+    if (!dr || !d) {
+      this.dropLine.hidden = true;
+      return;
+    }
+    const row = this.flat[dr.idx];
+    if (dr.zone === "into") {
+      this.dropLine.hidden = true;
+      this.rendered.get(dr.idx)?.classList.add("drop-target");
+      return;
+    }
+    // "after" sits below the row's whole open block, except onto an open folder (then it becomes its first member).
+    const firstMember = dr.zone === "after" && !d.isFolder && row.spec.dropFolder !== undefined && row.open && this.flat[dr.idx + 1]?.depth === row.depth + 1;
+    const lineIdx = dr.zone === "before" ? dr.idx : (firstMember ? dr.idx : this.blockEnd(dr.idx)) + 1;
+    const depth = firstMember ? row.depth + 1 : row.depth;
+    const pad = this.density === "compact" ? 6 : 10;
+    this.dropLine.style.top = lineIdx * this.rowH + "px";
+    this.dropLine.style.left = pad + 8 + indentOf(depth, this.density) + "px";
+    this.dropLine.style.right = pad + "px";
+    this.dropLine.hidden = false;
+  }
+
+  private clearDrop(): void {
+    this.drop = null;
+    this.paintDrop();
+  }
+
+  private onDrop(ev: DragEvent): void {
+    const d = this.drag;
+    if (!d) return;
+    ev.preventDefault();
+    const ok = !d.cancelled && this.updateDrop(ev.clientY);
+    const dr = this.drop;
+    this.endDrag();
+    if (!ok || !dr) return;
+    if (dropOn(d.key, dr.key, dr.zone, this.folderOpen)) this.revealMoved(d.key);
+  }
+
+  /** After a move: make sure the destination folder is open and the moved row is visible. */
+  private revealMoved(key: string): void {
+    if (key.startsWith("conn:")) {
+      const f = connFolder(store.conns.get(key.slice(5))!);
+      if (f && !this.folderOpen(f)) {
+        setFolderCollapsed(f, false);
+        this.expanded.add("fo:" + f);
+        this.render();
+      }
+    }
+    this.scrollToKey(key);
+  }
+
+  private endDrag(): void {
+    if (!this.drag && !this.drop) return;
+    this.drag = null;
+    this.drop = null;
+    this.dropLine.hidden = true;
+    for (const el of this.inner.querySelectorAll(".drop-target, .dragging")) el.classList.remove("drop-target", "dragging");
+    if (this.scrollRaf) cancelAnimationFrame(this.scrollRaf);
+    this.scrollRaf = 0;
+    if (this.pendingRender) {
+      this.pendingRender = false;
+      this.render();
+    }
+  }
+
+  private selectedMoveKey(): string | null {
+    if (this.filter) return null;
+    return this.flat.find((f) => f.spec.key === this.selected)?.spec.dragKey ?? null;
+  }
+
+  private moveSelected(key: string, d: number): void {
+    if (!shift(key, d)) return;
+    this.scrollToKey(key);
+  }
+
+  private scrollToKey(dragKey: string): void {
+    const i = this.flat.findIndex((f) => f.spec.dragKey === dragKey);
+    if (i < 0) return;
+    const top = i * this.rowH;
+    if (top < this.tree.scrollTop) this.tree.scrollTop = top;
+    else if (top + this.rowH > this.tree.scrollTop + this.tree.clientHeight) this.tree.scrollTop = top + this.rowH - this.tree.clientHeight;
+    this.paintWindow(false);
+  }
+
+  /** Opens the Color & icon popover next to the sidebar, level with the given point. */
+  private openLook(ev: { clientY: number }, t: Parameters<typeof openLookPicker>[0]): void {
+    const sb = this.el.getBoundingClientRect();
+    openLookPicker(t, { x: sb.right + 8, y: ev.clientY - 20 });
+  }
+
+  private connLookTarget(e: ConnEntry): Parameters<typeof openLookPicker>[0] {
+    const id = e.config.id;
+    return {
+      folder: false,
+      driver: e.config.driver,
+      name: () => store.conns.get(id)?.config.name ?? e.config.name,
+      color: () => store.conns.get(id)?.config.color ?? null,
+      icon: () => store.conns.get(id)?.config.icon ?? null,
+      set: (p) => setConnLook(id, p),
+    };
+  }
+
+  private folderLookTarget(name: string): Parameters<typeof openLookPicker>[0] {
+    return {
+      folder: true,
+      name: () => name,
+      color: () => folderMeta(name)?.color ?? null,
+      icon: () => folderMeta(name)?.icon ?? null,
+      set: (p) => setFolderLook(name, p),
+    };
+  }
+
   // ------------------------------------------------------------------ actions
 
   private connMenu(ev: MouseEvent, e: ConnEntry): void {
@@ -1218,6 +1456,10 @@ export class Explorer {
       { label: "Refresh", icon: "refresh", disabled: !connected, onClick: () => void this.refresh(id) },
       { sep: true },
       { label: "Edit…", icon: "pencil", onClick: () => this.host.editConnection(id) },
+      { label: "Color & icon…", icon: "palette", onClick: () => this.openLook(ev, this.connLookTarget(e)) },
+      { sep: true },
+      { label: "Move up", icon: "up", hint: ALT_UP, disabled: !canShift(connKey(id), -1), onClick: () => this.moveSelected(connKey(id), -1) },
+      { label: "Move down", icon: "down", hint: ALT_DOWN, disabled: !canShift(connKey(id), 1), onClick: () => this.moveSelected(connKey(id), 1) },
       { label: "Move to folder", icon: "folder", hint: "▸", onClick: () => this.moveMenu(ev.clientX, ev.clientY, e) },
       { label: "Copy name", icon: "copy", onClick: () => this.host.copy(e.config.name) },
       { sep: true },
@@ -1277,7 +1519,14 @@ export class Explorer {
 
   private folderMenu(ev: MouseEvent, name: string, members: ConnEntry[]): void {
     const ids = members.map((m) => m.config.id);
+    const fk = folderKey(name);
     showMenu(ev.clientX, ev.clientY, [
+      { label: "Color & icon…", icon: "palette", onClick: () => this.openLook(ev, this.folderLookTarget(name)) },
+      { sep: true },
+      { label: "Move up", icon: "up", hint: ALT_UP, disabled: !canShift(fk, -1), onClick: () => this.moveSelected(fk, -1) },
+      { label: "Move down", icon: "down", hint: ALT_DOWN, disabled: !canShift(fk, 1), onClick: () => this.moveSelected(fk, 1) },
+      { label: "Sort folder A–Z", icon: "sort", disabled: members.length < 2, onClick: () => sortFolder(name) },
+      { sep: true },
       {
         label: "Rename…",
         icon: "pencil",
@@ -1285,13 +1534,21 @@ export class Explorer {
           const next = await promptDialog("Rename folder", "Folder name", name, "Rename", folderNames());
           if (next && next !== name) {
             renameCollapsedFolder(name, next);
+            renameFolderLayout(name, next);
             await setFolderForMany(ids, next);
           }
         },
       },
       { label: "Use Vault profile", icon: "key", hint: "▸", onClick: () => window.setTimeout(() => this.vaultProfileMenu(ev.clientX, ev.clientY, members), 0) },
       { sep: true },
-      { label: "Ungroup", icon: "x", onClick: () => void setFolderForMany(ids, null) },
+      {
+        label: "Ungroup",
+        icon: "x",
+        onClick: () => {
+          ungroupFolderLayout(name);
+          void setFolderForMany(ids, null);
+        },
+      },
     ]);
   }
 

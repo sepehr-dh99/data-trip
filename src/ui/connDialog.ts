@@ -10,7 +10,8 @@ import { openTokenPopover } from "./vaultChips";
 import { openVaultProfilesDialog } from "./vaultDialog";
 import { clear, errMsg, h, icon } from "./dom";
 import { CONN_COLORS, DRIVER_COLORS } from "./sqlutil";
-import { DRIVER_ABBR } from "./scopePicker";
+import { DRIVER_ABBR, fillBadge, hasIcon } from "./icons";
+import { closeLookPicker, openLookPicker } from "./lookPicker";
 import { folderNames } from "./scope";
 
 function fmtLease(secs: number): string {
@@ -33,7 +34,8 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     ? { ...existing }
     : { id: "", name: "", driver: "postgres", host: "localhost", port: 5432, database: "", username: "", sslMode: "prefer", color: CONN_COLORS[0], readOnly: false };
   let driver: Driver = cfg.driver;
-  let color = cfg.color ?? CONN_COLORS[0];
+  let color: string | null = cfg.color ?? CONN_COLORS[0];
+  let iconName: string | null = hasIcon(cfg.icon) ? cfg.icon : null;
   let nameTouched = editing;
   let colorTouched = editing;
 
@@ -298,11 +300,53 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     b.dataset.c = c;
     return b;
   });
-  const pick = (c: string, user = true): void => {
+  // Live badge (dialog header + Icon button): the data source's icon on its color.
+  const headBadge = h("span", { class: "dlg-badge", "aria-hidden": "true" });
+  const lookMini = h("span", { class: "look-mini", "aria-hidden": "true" });
+  const lookLabel = h("span", null, "Choose icon…");
+  const syncLook = (): void => {
+    for (const b of [headBadge, lookMini]) {
+      b.style.setProperty("--c", color ?? DRIVER_COLORS[driver] ?? CONN_COLORS[0]);
+      fillBadge(b, { driver, icon: iconName }, b === headBadge ? 16 : 13);
+    }
+    lookLabel.textContent = iconName ?? "Choose icon…";
+  };
+  const pick = (c: string | null, user = true): void => {
     if (user) colorTouched = true;
     color = c;
     for (const s of swatches) s.classList.toggle("on", s.dataset.c === c);
+    syncLook();
   };
+  const btnIcon = h(
+    "button",
+    {
+      type: "button",
+      class: "look-btn",
+      title: "Color & icon…",
+      "aria-label": "Choose icon",
+      "aria-haspopup": "dialog",
+      onclick: () => {
+        const r = btnIcon.getBoundingClientRect();
+        openLookPicker(
+          {
+            folder: false,
+            driver,
+            name: () => inName.value.trim() || "New connection",
+            color: () => color,
+            icon: () => iconName,
+            set: (p) => {
+              if (p.icon !== undefined) iconName = p.icon;
+              if (p.color !== undefined) pick(p.color);
+              else syncLook();
+            },
+          },
+          { x: r.left, y: r.bottom + 8 },
+        );
+      },
+    },
+    lookMini,
+    lookLabel,
+  );
 
   const passField = field("Password", inPass);
   const userLabel = h("span", { class: "field-label" }, "User");
@@ -382,6 +426,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     const oldDefault = DEFAULT_PORTS[driver];
     const cur = inPort.value === "" ? null : Number(inPort.value);
     driver = d;
+    syncLook();
     for (const b of driverBtns) {
       const on = b.dataset.d === d;
       b.classList.toggle("on", on);
@@ -543,6 +588,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       sshProfileId: sqlite || kafka || !chkSsh.checked ? null : sshId,
       trustServerCertificate: driver === "mssql" ? chkTrust.checked : false,
       color,
+      icon: iconName,
       readOnly: chkRo.checked,
       authMethod: vault ? "vault" : "password",
       vault: vault ? collectVault() : null,
@@ -613,6 +659,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
 
   const overlay = h("div", { class: "overlay" });
   const close = (): void => {
+    closeLookPicker();
     overlay.classList.add("leaving");
     window.removeEventListener("keydown", onKey, true);
     unsubVaults();
@@ -622,6 +669,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     // A dialog opened on top (SSH / Vault manager, confirm…) owns the keyboard.
     const open = document.querySelectorAll(".overlay:not(.leaving)");
     if (open[open.length - 1] !== overlay) return;
+    if (e.key === "Escape" && document.querySelector(".look-pop")) return; // the picker closes first
     if (e.key === "Escape") {
       e.stopPropagation();
       close();
@@ -703,7 +751,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     h(
       "div",
       { class: "dialog-head" },
-      h("div", { class: "dialog-title" }, icon("database", 18), editing ? "Edit connection" : "New connection"),
+      h("div", { class: "dialog-title" }, headBadge, editing ? "Edit connection" : "New connection"),
       h("button", { class: "icon-btn", type: "button", title: "Close", "aria-label": "Close", onclick: close }, icon("x", 16)),
     ),
     h(
@@ -719,6 +767,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       optionRow,
       sslFiles,
       field("Color", h("div", { class: "swatches" }, swatches)),
+      field("Icon", btnIcon),
       result,
     ),
     h("div", { class: "dialog-foot" }, btnTest, h("div", { class: "spacer" }), btnCancel, btnSave),

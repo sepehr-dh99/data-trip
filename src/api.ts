@@ -23,6 +23,7 @@ import type {
   VaultCheck,
   VaultProfile,
   VaultTokenInfo,
+  ExplorerLayout,
   SshProfile,
   SshCheck,
 } from "./types";
@@ -100,6 +101,10 @@ export const api = {
   kafkaCreateTopic: (sessionId: string, topic: string, partitions: number, replicationFactor: number) =>
     call<null>("kafka_create_topic", { sessionId, topic, partitions, replicationFactor }),
   kafkaDeleteTopic: (sessionId: string, topic: string) => call<null>("kafka_delete_topic", { sessionId, topic }),
+
+  // ── Explorer layout (order, folder color/icon) ──
+  getExplorerLayout: () => call<ExplorerLayout>("get_explorer_layout"),
+  saveExplorerLayout: (layout: ExplorerLayout) => call<null>("save_explorer_layout", { layout }),
 
   // ── Shared Vault profiles ──
   listVaultProfiles: () => call<VaultProfile[]>("list_vault_profiles"),

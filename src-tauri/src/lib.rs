@@ -75,6 +75,8 @@ pub fn run() {
             commands::read_text_file,
             commands::test_vault,
             commands::set_vault_token,
+            commands::get_explorer_layout,
+            commands::save_explorer_layout,
             commands::list_vault_profiles,
             commands::save_vault_profile,
             commands::delete_vault_profile,

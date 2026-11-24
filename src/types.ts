@@ -21,6 +21,8 @@ export interface ConnectionConfig {
   /** Connect through this shared SSH tunnel (SshProfile.id). */
   sshProfileId?: string | null;
   color?: string | null;
+  /** Built-in explorer icon name (e.g. "globe"); null = driver badge. */
+  icon?: string | null;
   readOnly?: boolean;
   /** How credentials are obtained. Default "password" (OS keychain). */
   authMethod?: AuthMethod;
@@ -330,3 +332,21 @@ export interface KafkaProduceResult { partition: number; offset: number; }
 export interface KafkaGroupMember { memberId: string; clientId: string; host: string; assignments: string[]; }
 export interface KafkaGroupOffset { topic: string; partition: number; committed: number | null; end: number; lag: number | null; }
 export interface KafkaGroupDetail { groupId: string; state: string; protocol: string; members: KafkaGroupMember[]; offsets: KafkaGroupOffset[]; totalLag: number; }
+
+// ── Explorer layout ─────────────────────────────────────────────────────────
+
+export interface FolderMeta {
+  name: string;
+  color?: string | null;
+  /** Built-in icon name; null = folder icon. */
+  icon?: string | null;
+}
+
+/** Stored in <config>/explorer_layout.json. Items missing from the lists are appended alphabetically. */
+export interface ExplorerLayout {
+  /** Top-level order: "folder:<name>" and "conn:<id>" entries. */
+  order: string[];
+  /** Folder name -> connection ids in display order. */
+  folderOrder: Record<string, string[]>;
+  folders: FolderMeta[];
+}

@@ -226,3 +226,15 @@ SASL mechanism, CA / client cert paths, skip TLS verify, show internal topics. K
 - SSL: sslMode "verify-ca"/"verify-full" + sslCaPath, sslCertPath, sslKeyPath for PostgreSQL and MySQL.
 - DataGrip import: `<ssh-properties><enabled>true</enabled>` → warning "uses an SSH tunnel — choose an SSH
   configuration after import"; `<ssl-config>` (ca-cert, client-cert, client-key, mode) mapped when present.
+
+## v0.8 additions — explorer order + appearance
+
+| command | args | returns |
+|---|---|---|
+| get_explorer_layout | – | ExplorerLayout |
+| save_explorer_layout | layout | null |
+
+- `ConnectionConfig.icon` (built-in icon name) + existing `color` style a data source's badge.
+- `ExplorerLayout` (`<config>/explorer_layout.json`): top-level order (`folder:<name>`, `conn:<id>`), per-folder
+  connection order, folder color/icon. Items missing from the layout are appended alphabetically; stale entries
+  are dropped on the next save. Renaming a folder must rename its keys; ungrouping removes them.

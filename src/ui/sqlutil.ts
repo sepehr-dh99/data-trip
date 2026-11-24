@@ -33,17 +33,20 @@ export function buildCompletionSchema(
   return out;
 }
 
+/** Same 12-color palette as the explorer's color & icon picker (src/ui/icons.ts COLORS), blue first. */
 export const CONN_COLORS = [
-  "#0a84ff",
-  "#30b0c7",
-  "#34c759",
-  "#ffb020",
-  "#ff7a45",
-  "#ff4d6d",
-  "#bf5af2",
-  "#8e8e93",
-  "#d82c20",
-  "#5b5bd6",
+  "#0A84FF",
+  "#40C8E0",
+  "#63E6BE",
+  "#30D158",
+  "#FFD60A",
+  "#FF9F0A",
+  "#FF453A",
+  "#FF375F",
+  "#BF5AF2",
+  "#5E5CE6",
+  "#AC8E68",
+  "#8E8E93",
 ];
 
 /** Per-driver badge colors used when a connection has no color of its own. */
