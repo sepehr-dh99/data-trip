@@ -44,11 +44,13 @@ export const CONN_COLORS = [
   "#8e8e93",
 ];
 
+/** Per-driver badge colors used when a connection has no color of its own. */
+export const DRIVER_COLORS: Record<string, string> = { postgres: "#3b6fd8", mysql: "#c4701f", sqlite: "#2a9d4a", mssql: "#8e44c4" };
+
+/** A connection's color: its own, else its driver's default (explorer badge, tab dot). */
 export function connColor(cfg: ConnectionConfig): string {
   if (cfg.color) return cfg.color;
-  let hsh = 0;
-  for (let i = 0; i < cfg.id.length; i++) hsh = (hsh * 31 + cfg.id.charCodeAt(i)) >>> 0;
-  return CONN_COLORS[hsh % CONN_COLORS.length];
+  return DRIVER_COLORS[cfg.driver] ?? CONN_COLORS[0];
 }
 
 /** Everything the grid needs to turn cell edits into RowEdit[]. */

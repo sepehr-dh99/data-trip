@@ -1,7 +1,8 @@
-// Application shell: toolbar, explorer, console tabs, history, status bar, shortcuts.
+// Application shell: ambient backdrop, sidebar card (explorer), content sheet with the floating
+// capsule (console tabs + run controls + history), consoles, history drawer, shortcuts.
 import { api } from "../api";
-import { DRIVER_LABELS } from "../types";
 import type { ConnectionConfig } from "../types";
+import { DRIVER_LABELS } from "../types";
 import { confirmDialog } from "./confirm";
 import { ConsolePane } from "./console";
 import type { ConsoleHost } from "./console";
@@ -22,16 +23,19 @@ export class App {
   private active: ConsolePane | null = null;
   private explorer: Explorer;
   private history: HistoryPanel;
-  private tabsEl = h("div", { class: "tabs", role: "tablist" });
+  private tabsEl = h("div", { class: "cap-tabs", role: "tablist", "aria-label": "Consoles" });
+  private tabEls = new Map<ConsolePane, HTMLElement>();
+  private capSep = h("span", { class: "cap-sep", "aria-hidden": "true" });
+  private capActions = h("div", { class: "cap-actions" });
+  private btnAdd!: HTMLButtonElement;
   private stack = h("div", { class: "stack" });
   private empty = h("div", { class: "empty-state" });
-  private statusEl = h("footer", { class: "statusbar glass-panel" });
-  private sidebarW = Number(localStorage.getItem("dt.sidebarW")) || 280;
+  private sidebarW = Number(localStorage.getItem("dt.sidebarW")) || 244;
   private selectedConn: string | null = null;
   private counts = new Map<string, number>();
   private prevStatus = new Map<string, string>();
   private btnHistory!: HTMLButtonElement;
-  private main!: HTMLElement;
+  private shell!: HTMLElement;
   private sidebarHidden = false;
 
   constructor(private root: HTMLElement) {
@@ -55,6 +59,9 @@ export class App {
         if (!this.active) return toast("Open a console first", "info");
         // The first click of the double-click already inserted the SQL.
         void this.active.runSqlText(sql);
+      },
+      close: () => {
+        if (this.history.isOpen()) this.toggleHistory();
       },
     });
     this.build();
@@ -91,34 +98,62 @@ export class App {
       toast(`Could not load connections: ${errMsg(e)}`, "error");
     }
     this.renderEmpty();
-    this.updateStatus();
+    this.renderTabs();
   }
 
   // ------------------------------------------------------------------ layout
 
   private build(): void {
-    const drag = { "data-tauri-drag-region": "" };
-    this.btnHistory = h("button", { class: "tool-btn", type: "button", title: `Query history (${MOD}Shift+H)`, "aria-label": "Toggle history", onclick: () => this.toggleHistory() }, icon("clock", 16), h("span", null, "History"));
-    const toolbar = h(
-      "header",
-      { class: "toolbar glass-panel", ...drag },
-      h("div", { class: "brand", ...drag }, brandMark(22), h("span", { class: "brand-name", ...drag }, "DataTrip")),
-      h("button", { class: "tool-btn icon-only", type: "button", title: `Toggle sidebar (${MOD}B)`, "aria-label": "Toggle sidebar", onclick: () => this.toggleSidebar() }, icon("sidebar", 17)),
-      h("div", { class: "spacer", ...drag }),
-      h("button", { class: "tool-btn", type: "button", title: "New connection", onclick: () => this.addConnection() }, icon("plus", 16), h("span", null, "Connection")),
-      h("button", { class: "tool-btn accent", type: "button", title: `New console (${MOD}N)`, onclick: () => void this.newConsole() }, icon("terminal", 16), h("span", null, "New console")),
+    // Ambient color: six static, pre-blurred radial blobs behind everything (never animated).
+    const ambient = h(
+      "div",
+      { class: "ambient", "aria-hidden": "true" },
+      ["b1", "b2", "b3", "b4", "b5", "b6"].map((b) => h("div", { class: "blob " + b })),
+    );
+
+    this.btnAdd = h("button", { class: "cap-icon cap-add", type: "button", title: `New console (${MOD}N)`, "aria-label": "New console", onclick: () => void this.newConsole() }, icon("plus", 15));
+    this.btnHistory = h(
+      "button",
+      { class: "cap-icon", type: "button", title: `Query history (${MOD}Shift+H)`, "aria-label": "Query history", "aria-pressed": "false", onclick: () => this.toggleHistory() },
+      icon("clock", 16),
+    );
+    const capsule = h(
+      "div",
+      { class: "capsule", role: "toolbar", "aria-label": "Console" },
+      h("div", { class: "cap-tabs-wrap" }, this.tabsEl, this.btnAdd),
+      this.capSep,
+      this.capActions,
       this.btnHistory,
     );
-
-    const tabbar = h(
-      "div",
-      { class: "tabbar" },
-      this.tabsEl,
-      h("button", { class: "icon-btn tab-add", type: "button", title: `New console (${MOD}N)`, "aria-label": "New console", onclick: () => void this.newConsole() }, icon("plus", 16)),
+    // Translate vertical wheel into horizontal scrolling for the overflowing tab strip.
+    this.tabsEl.addEventListener(
+      "wheel",
+      (e) => {
+        if (Math.abs(e.deltaY) > Math.abs(e.deltaX) && this.tabsEl.scrollWidth > this.tabsEl.clientWidth) {
+          this.tabsEl.scrollLeft += e.deltaY;
+          e.preventDefault();
+        }
+      },
+      { passive: false },
     );
-    const workspace = h("section", { class: "panel workspace", "aria-label": "Workspace" }, tabbar, h("div", { class: "ws-body" }, this.stack, this.empty));
 
-    const resizer = h("div", { class: "resizer", role: "separator", "aria-orientation": "vertical", title: "Drag to resize" });
+    // macOS: the strip above the content can move the window (there is no native title bar).
+    const dragStrip = h("div", { class: "sheet-drag", "aria-hidden": "true", ...(IS_MAC ? { "data-tauri-drag-region": "" } : {}) });
+    const sheet = h(
+      "section",
+      { class: "sheet", "aria-label": "Workspace" },
+      // The sheet's glass is a layer of its own, not the container: a backdrop-filter on the container
+      // would make it a backdrop root, and the floating pills/drawer inside could no longer blur the
+      // rows beneath them (Chromium/WebView2).
+      h("div", { class: "sheet-glass", "aria-hidden": "true" }),
+      dragStrip,
+      h("div", { class: "cap-wrap" }, capsule),
+      this.stack,
+      this.empty,
+      this.history.el,
+    );
+
+    const resizer = h("div", { class: "resizer", role: "separator", "aria-orientation": "vertical", "aria-label": "Resize sidebar", title: "Drag to resize" });
     resizer.addEventListener("pointerdown", (e) => {
       e.preventDefault();
       const startX = e.clientX;
@@ -137,17 +172,18 @@ export class App {
       window.addEventListener("pointermove", move);
       window.addEventListener("pointerup", up);
     });
+    this.explorer.el.appendChild(resizer);
 
-    this.main = h("main", { class: "main" }, this.explorer.el, resizer, workspace, this.history.el);
+    this.shell = h("div", { class: "shell" }, this.explorer.el, sheet);
     this.applySidebar();
     clear(this.root);
-    this.root.append(toolbar, this.main, this.statusEl);
+    this.root.append(ambient, this.shell);
     this.explorer.render();
   }
 
   private applySidebar(): void {
-    this.main.style.setProperty("--sidebar-w", this.sidebarW + "px");
-    this.main.classList.toggle("no-sidebar", this.sidebarHidden);
+    this.shell.style.setProperty("--sidebar-w", this.sidebarW + "px");
+    this.shell.classList.toggle("no-sidebar", this.sidebarHidden);
   }
 
   private toggleSidebar(): void {
@@ -158,7 +194,9 @@ export class App {
   private toggleHistory(): void {
     const open = this.history.toggle();
     this.btnHistory.classList.toggle("on", open);
+    this.btnHistory.setAttribute("aria-pressed", String(open));
     this.syncHistoryConn();
+    if (!open) this.active?.focus();
   }
 
   private syncHistoryConn(): void {
@@ -172,7 +210,7 @@ export class App {
   private host: ConsoleHost = {
     onExecuted: () => void this.history.refresh(),
     onStatus: (c) => {
-      if (c === this.active) this.updateStatus();
+      this.tabEls.get(c)?.classList.toggle("running", c.isRunning);
     },
     onSchemaChanged: (id) => void store.refresh(id).catch(() => undefined),
   };
@@ -214,9 +252,10 @@ export class App {
   private activate(pane: ConsolePane | null): void {
     this.active = pane;
     for (const t of this.tabs) t.el.classList.toggle("hidden", t !== pane);
+    clear(this.capActions);
+    if (pane) this.capActions.appendChild(pane.controls);
     this.renderTabs();
     this.renderEmpty();
-    this.updateStatus();
     if (pane) {
       this.selectedConn = pane.connId;
       pane.focus();
@@ -226,23 +265,71 @@ export class App {
 
   private renderTabs(): void {
     clear(this.tabsEl);
+    this.tabEls.clear();
     for (const t of this.tabs) {
       const e = store.conns.get(t.connId);
       const color = e ? connColor(e.config) : "var(--accent)";
-      const close = h("button", { class: "tab-close", type: "button", title: `Close (${MOD}W)`, "aria-label": "Close tab", onclick: (ev: Event) => (ev.stopPropagation(), void this.closeTab(t)) }, icon("x", 12));
+      const isActive = t === this.active;
+      const server = e ? `${DRIVER_LABELS[e.config.driver].split(" / ")[0]}${e.session?.serverVersion ? " " + e.session.serverVersion : ""}` : "";
+      const close = h(
+        "button",
+        { class: "tab-close", type: "button", tabindex: "-1", title: `Close (${MOD}W)`, "aria-label": `Close ${t.title}`, onclick: (ev: Event) => (ev.stopPropagation(), void this.closeTab(t)) },
+        icon("x", 11),
+      );
       const tab = h(
         "div",
-        { class: "tab" + (t === this.active ? " active" : ""), role: "tab", style: `--c:${color}`, title: `${t.title} — ${e?.config.name ?? ""}`, "aria-selected": String(t === this.active) },
-        h("span", { class: "tab-dot" }),
+        {
+          class: "tab" + (isActive ? " active" : "") + (t.isRunning ? " running" : ""),
+          role: "tab",
+          tabindex: isActive ? "0" : "-1",
+          style: `--c:${color}`,
+          title: `${t.title} — ${e?.config.name ?? ""}${server ? " (" + server + ")" : ""}`,
+          "aria-selected": String(isActive),
+        },
+        h("span", { class: "tab-dot", "aria-hidden": "true" }),
         h("span", { class: "tab-title" }, t.title),
-        h("span", { class: "tab-sub" }, e?.config.name ?? ""),
         close,
       );
-      tab.addEventListener("click", () => this.activate(t));
+      tab.addEventListener("click", () => {
+        if (t !== this.active) this.activate(t);
+      });
       tab.addEventListener("auxclick", (ev) => {
         if (ev.button === 1) void this.closeTab(t);
       });
+      tab.addEventListener("keydown", (ev) => {
+        const i = this.tabs.indexOf(t);
+        if (ev.key === "ArrowRight" || ev.key === "ArrowLeft") {
+          ev.preventDefault();
+          const next = this.tabs[(i + (ev.key === "ArrowRight" ? 1 : -1) + this.tabs.length) % this.tabs.length];
+          this.activate(next);
+          this.tabEls.get(next)?.focus();
+        } else if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          this.activate(t);
+        } else if (ev.key === "Delete") {
+          ev.preventDefault();
+          void this.closeTab(t);
+        }
+      });
+      this.tabEls.set(t, tab);
       this.tabsEl.appendChild(tab);
+    }
+    const has = this.tabs.length > 0;
+    this.capSep.hidden = !this.active;
+    this.btnAdd.classList.toggle("labeled", !has);
+    clear(this.btnAdd);
+    this.btnAdd.append(icon("plus", 15), has ? "" : h("span", null, "New console"));
+    // Keep the active tab visible inside the horizontally scrolling strip (without scrollIntoView,
+    // which would also scroll the overflow-hidden sheet).
+    const at = this.active ? this.tabEls.get(this.active) : undefined;
+    if (at) {
+      requestAnimationFrame(() => {
+        const strip = this.tabsEl;
+        const l = at.offsetLeft;
+        const r = l + at.offsetWidth;
+        if (l < strip.scrollLeft) strip.scrollLeft = l - 4;
+        else if (r > strip.scrollLeft + strip.clientWidth) strip.scrollLeft = r - strip.clientWidth + 4;
+      });
     }
   }
 
@@ -307,10 +394,9 @@ export class App {
     }
     this.renderTabs();
     this.renderEmpty();
-    this.updateStatus();
   }
 
-  // ------------------------------------------------------------------ empty state & status
+  // ------------------------------------------------------------------ empty state
 
   private renderEmpty(): void {
     const show = this.tabs.length === 0;
@@ -323,7 +409,7 @@ export class App {
       h(
         "div",
         { class: "empty-card" },
-        h("div", { class: "empty-art" }, brandMark(84)),
+        h("div", { class: "empty-art" }, brandMark(72)),
         h("h2", null, hasConns ? "Pick a table or open a console" : "Add your first connection"),
         h(
           "p",
@@ -350,31 +436,6 @@ export class App {
         ),
       ),
     );
-  }
-
-  private updateStatus(): void {
-    clear(this.statusEl);
-    const c = this.active;
-    const e = c ? store.conns.get(c.connId) : undefined;
-    const item = (label: string, value: string, cls = ""): HTMLElement =>
-      h("span", { class: "st-item " + cls }, h("span", { class: "st-label" }, label), h("span", { class: "st-value" }, value));
-    if (!c || !e) {
-      const n = store.list().filter((x) => x.status === "connected").length;
-      this.statusEl.append(h("span", { class: "st-item" }, h("span", { class: "st-dot" }), `${n} connected`), h("div", { class: "spacer" }), h("span", { class: "st-item muted" }, "DataTrip"));
-      return;
-    }
-    const s = c.status;
-    const nodes: Array<HTMLElement | null> = [
-      h("span", { class: "st-item", style: `--c:${connColor(e.config)}` }, h("span", { class: "conn-dot connected", style: `--c:${connColor(e.config)}` }), e.config.name),
-      h("span", { class: "st-item muted" }, `${DRIVER_LABELS[e.config.driver]}${s.serverVersion ? " " + s.serverVersion : ""}`),
-      h("div", { class: "spacer" }),
-      s.rows !== null ? item("Rows", s.rows.toLocaleString()) : null,
-      s.affected !== null ? item("Affected", s.affected.toLocaleString()) : null,
-      s.elapsedMs !== null ? item("Time", `${s.elapsedMs} ms`) : null,
-      h("span", { class: "st-item tx " + (s.autoCommit ? "" : "manual") }, h("span", { class: "st-label" }, "Tx"), h("span", { class: "st-value" }, s.autoCommit ? "Auto" : "Manual")),
-      h("span", { class: "st-item state" + (s.running ? " busy" : s.text === "Error" ? " bad" : "") }, h("span", { class: "st-dot" }), s.text),
-    ];
-    for (const n of nodes) if (n) this.statusEl.appendChild(n);
   }
 
   // ------------------------------------------------------------------ shortcuts

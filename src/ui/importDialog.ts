@@ -11,7 +11,7 @@ import { toast } from "./toast";
 
 type Mode = "paste" | "file";
 
-const SHORT: Record<string, string> = { postgres: "PG", mysql: "MY", sqlite: "SL", mssql: "MS" };
+const SHORT: Record<string, string> = { postgres: "PG", mysql: "MY", sqlite: "SQ", mssql: "MS" };
 
 export function describeTarget(c: ConnectionConfig): string {
   if (c.driver === "sqlite") return c.filePath ?? "";

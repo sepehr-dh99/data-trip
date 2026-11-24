@@ -47,67 +47,76 @@ function splitOptsFor(driver: Driver): SplitOptions {
   }
 }
 
+// Syntax colors from the spec (C3): keywords #ff7088, strings #8fd9a8, comments #6e6e76.
 const highlight = HighlightStyle.define([
-  { tag: [t.keyword, t.operatorKeyword], color: "var(--syn-keyword)", fontWeight: "600" },
+  { tag: [t.keyword, t.operatorKeyword], color: "var(--syn-keyword)", fontWeight: "500" },
   { tag: [t.typeName, t.standard(t.name)], color: "var(--syn-type)" },
   { tag: [t.string, t.special(t.string)], color: "var(--syn-string)" },
   { tag: [t.number, t.bool, t.null], color: "var(--syn-number)" },
-  { tag: [t.comment, t.lineComment, t.blockComment], color: "var(--syn-comment)", fontStyle: "italic" },
+  { tag: [t.comment, t.lineComment, t.blockComment], color: "var(--syn-comment)" },
   { tag: [t.punctuation, t.operator, t.paren, t.bracket], color: "var(--syn-punct)" },
   { tag: t.special(t.name), color: "var(--syn-number)" },
 ]);
 
-const theme = EditorView.theme({
-  "&": { height: "100%", backgroundColor: "transparent", color: "var(--text)", fontSize: "13px" },
-  "&.cm-focused": { outline: "none" },
-  ".cm-scroller": {
-    fontFamily: "var(--font-mono)",
-    lineHeight: "1.6",
-    overflow: "auto",
+const theme = EditorView.theme(
+  {
+    "&": { height: "100%", backgroundColor: "transparent", color: "var(--text-code)", fontSize: "13.5px" },
+    "&.cm-focused": { outline: "none" },
+    ".cm-scroller": {
+      fontFamily: "var(--font-mono)",
+      lineHeight: "23px",
+      overflow: "auto",
+    },
+    ".cm-content": { caretColor: "var(--accent)", padding: "8px 0" },
+    ".cm-line": { padding: "0 20px 0 0" },
+    ".cm-cursor, .cm-dropCursor": { borderLeftColor: "var(--accent)", borderLeftWidth: "2px" },
+    ".cm-gutters": {
+      backgroundColor: "transparent",
+      color: "var(--text-gutter)",
+      border: "none",
+    },
+    // 58px gutter, numbers right-aligned with 20px before the code (spec)
+    ".cm-lineNumbers .cm-gutterElement": { boxSizing: "border-box", minWidth: "58px", padding: "0 20px 0 8px", textAlign: "right" },
+    ".cm-activeLine": { backgroundColor: "var(--editor-active-line)" },
+    ".cm-activeLineGutter": { backgroundColor: "var(--editor-active-line)", color: "var(--text-3)" },
+    ".cm-selectionBackground": { backgroundColor: "var(--accent-sel-blur) !important" },
+    "&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground": {
+      backgroundColor: "var(--accent-sel) !important",
+    },
+    ".cm-selectionMatch": { backgroundColor: "rgba(255, 255, 255, 0.07)" },
+    ".cm-matchingBracket": { backgroundColor: "rgba(255, 255, 255, 0.08)", outline: "1px solid rgba(255, 112, 136, 0.55)" },
+    ".cm-placeholder": { color: "var(--text-4)" },
+    ".cm-tooltip": {
+      border: "none",
+      borderRadius: "12px",
+      background: "var(--menu-bg)",
+      backdropFilter: "var(--float-blur)",
+      boxShadow: "var(--float-shadow), 0 16px 40px rgba(0, 0, 0, 0.35)",
+      overflow: "hidden",
+      color: "var(--text)",
+    },
+    ".cm-tooltip.cm-tooltip-autocomplete > ul": {
+      fontFamily: "var(--font-mono)",
+      fontSize: "12.5px",
+      maxHeight: "260px",
+      padding: "4px",
+    },
+    ".cm-tooltip.cm-tooltip-autocomplete > ul > li": { borderRadius: "8px", padding: "3px 10px" },
+    ".cm-tooltip-autocomplete ul li[aria-selected]": {
+      background: "var(--raised)",
+      color: "var(--text)",
+    },
+    ".cm-completionDetail": { color: "var(--text-3)", fontStyle: "normal", marginLeft: "10px" },
+    ".cm-completionMatchedText": { textDecoration: "none", color: "var(--accent-text)" },
+    ".cm-panels": { background: "var(--solid-pop)", color: "var(--text)", borderColor: "var(--hair)" },
+    ".cm-panels input, .cm-panels button": { fontFamily: "var(--font-ui)" },
+    ".cm-panels input": { background: "var(--fill)", border: "none", borderRadius: "999px", padding: "3px 10px", color: "var(--text)" },
+    ".cm-panels button": { background: "var(--fill)", backgroundImage: "none", border: "none", borderRadius: "999px", padding: "3px 10px", color: "var(--text)" },
+    ".cm-searchMatch": { backgroundColor: "rgba(255, 197, 107, 0.18)", outline: "1px solid rgba(255, 197, 107, 0.4)" },
+    ".cm-searchMatch.cm-searchMatch-selected": { backgroundColor: "rgba(255, 26, 60, 0.3)" },
   },
-  ".cm-content": { caretColor: "var(--accent)", padding: "8px 0" },
-  ".cm-line": { padding: "0 14px 0 6px" },
-  ".cm-cursor, .cm-dropCursor": { borderLeftColor: "var(--accent)", borderLeftWidth: "2px" },
-  ".cm-gutters": {
-    backgroundColor: "transparent",
-    color: "var(--text-3)",
-    border: "none",
-    paddingLeft: "6px",
-  },
-  ".cm-lineNumbers .cm-gutterElement": { padding: "0 8px 0 4px", minWidth: "26px", fontSize: "11.5px" },
-  ".cm-activeLine": { backgroundColor: "var(--editor-active-line)" },
-  ".cm-activeLineGutter": { backgroundColor: "transparent", color: "var(--text-2)" },
-  ".cm-selectionBackground": { backgroundColor: "var(--accent-soft) !important" },
-  "&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground": {
-    backgroundColor: "var(--accent-sel) !important",
-  },
-  ".cm-selectionMatch": { backgroundColor: "var(--accent-soft)" },
-  ".cm-matchingBracket": { backgroundColor: "var(--accent-soft)", outline: "1px solid var(--accent)" },
-  ".cm-placeholder": { color: "var(--text-3)" },
-  ".cm-tooltip": {
-    border: "1px solid var(--border)",
-    borderRadius: "12px",
-    background: "var(--menu-bg)",
-    backdropFilter: "blur(24px) saturate(180%)",
-    boxShadow: "var(--shadow-pop)",
-    overflow: "hidden",
-    color: "var(--text)",
-  },
-  ".cm-tooltip.cm-tooltip-autocomplete > ul": {
-    fontFamily: "var(--font-mono)",
-    fontSize: "12.5px",
-    maxHeight: "260px",
-    padding: "4px",
-  },
-  ".cm-tooltip.cm-tooltip-autocomplete > ul > li": { borderRadius: "8px", padding: "2px 8px" },
-  ".cm-tooltip-autocomplete ul li[aria-selected]": {
-    background: "var(--accent)",
-    color: "#fff",
-  },
-  ".cm-completionDetail": { color: "var(--text-3)", fontStyle: "normal", marginLeft: "10px" },
-  ".cm-panels": { background: "var(--menu-bg)", color: "var(--text)", borderColor: "var(--border)" },
-  ".cm-panels input, .cm-panels button": { fontFamily: "var(--font-ui)" },
-});
+  { dark: true },
+);
 
 export class SqlEditor {
   private view: EditorView;
@@ -130,7 +139,7 @@ export class SqlEditor {
       autocompletion({ icons: false }),
       highlightSelectionMatches(),
       syntaxHighlighting(highlight),
-      placeholder("Write SQL here. Ctrl/Cmd+Enter runs the statement at the cursor."),
+      placeholder("Write SQL here — Ctrl/Cmd+Enter runs the statement at the cursor."),
       this.lang.of(this.langExtension()),
       keymap.of([
         ...closeBracketsKeymap,

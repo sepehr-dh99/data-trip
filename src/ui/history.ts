@@ -5,6 +5,8 @@ import { clear, debounce, errMsg, h, icon } from "./dom";
 export interface HistoryHost {
   insert(sql: string): void;
   run(sql: string): void;
+  /** The drawer's own close button / Escape. */
+  close(): void;
 }
 
 function when(iso: string): string {
@@ -29,20 +31,32 @@ export class HistoryPanel {
   private seq = 0;
 
   constructor(private host: HistoryHost) {
-    this.search = h("input", { class: "input", type: "search", placeholder: "Search history…", "aria-label": "Search history", oninput: debounce(() => void this.refresh(), 180) });
-    this.scopeBtn = h("button", { class: "chip btn-chip", type: "button", title: "Toggle between this connection and all connections", onclick: () => {
+    this.search = h("input", { type: "search", placeholder: "Search history", "aria-label": "Search history", spellcheck: false, oninput: debounce(() => void this.refresh(), 180) });
+    this.scopeBtn = h("button", { class: "scope-chip", type: "button", title: "Toggle between this connection and all connections", onclick: () => {
       this.allScope = !this.allScope;
       this.updateScope();
       void this.refresh();
     } });
-    this.list = h("div", { class: "hist-list" });
+    this.list = h("div", { class: "hist-list", role: "list" });
     this.el = h(
       "aside",
-      { class: "panel history hidden", "aria-label": "Query history" },
-      h("div", { class: "panel-head" }, h("div", { class: "panel-title" }, icon("clock", 15), "History"), this.scopeBtn),
-      h("div", { class: "panel-search" }, icon("search", 13), this.search),
+      { class: "history-drawer", "aria-label": "Query history", "aria-hidden": "true", inert: true },
+      h(
+        "div",
+        { class: "drawer-head" },
+        h("div", { class: "drawer-title" }, icon("clock", 15), "History"),
+        this.scopeBtn,
+        h("button", { class: "icon-btn", type: "button", title: "Close history", "aria-label": "Close history", onclick: () => this.host.close() }, icon("x", 14)),
+      ),
+      h("label", { class: "side-search drawer-search" }, icon("search", 13), this.search),
       this.list,
     );
+    this.el.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        this.host.close();
+      }
+    });
     this.updateScope();
   }
 
@@ -60,10 +74,13 @@ export class HistoryPanel {
 
   toggle(): boolean {
     this.visible = !this.visible;
-    this.el.classList.toggle("hidden", !this.visible);
+    this.el.classList.toggle("open", this.visible);
+    this.el.setAttribute("aria-hidden", String(!this.visible));
+    if (this.visible) this.el.removeAttribute("inert");
+    else this.el.setAttribute("inert", "");
     if (this.visible) {
       void this.refresh();
-      this.search.focus();
+      this.search.focus({ preventScroll: true });
     }
     return this.visible;
   }
@@ -96,15 +113,14 @@ export class HistoryPanel {
     for (const it of items) {
       const row = h(
         "div",
-        { class: "hist-item" + (it.ok ? "" : " bad"), tabindex: "0", title: it.error ?? "Click to insert, double-click to run" },
+        { class: "hist-item" + (it.ok ? "" : " bad"), tabindex: "0", role: "listitem", title: it.error ?? "Click to insert, double-click to run" },
         h(
           "div",
           { class: "hist-meta" },
           h("span", { class: "hist-dot " + (it.ok ? "ok" : "err") }),
-          h("span", null, when(it.executedAt)),
+          h("span", { class: "hist-when" }, when(it.executedAt)),
           h("span", { class: "spacer" }),
-          h("span", null, it.ok && it.rows !== null ? `${it.rows.toLocaleString()} rows · ` : ""),
-          h("span", null, `${it.elapsedMs} ms`),
+          h("span", { class: "hist-stats" }, (it.ok && it.rows !== null ? `${it.rows.toLocaleString()} rows · ` : "") + `${it.elapsedMs} ms`),
         ),
         h("div", { class: "hist-sql" }, it.sql.trim()),
         it.ok ? null : h("div", { class: "hist-err" }, it.error ?? "Error"),

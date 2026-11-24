@@ -3,12 +3,17 @@
 import type { Cell, ColumnMeta, QueryResult, RowEdit } from "../types";
 import type { EditContext } from "./sqlutil";
 import { clear, copyText, debounce, h, icon } from "./dom";
+import { showMenu } from "./menu";
 
-const ROW_H = 26;
-const HEAD_H = 36;
-const RN_MIN = 46;
+const ROW_H = 34;
+const RN_MIN = 44;
+/** Empty space under the last row so it can scroll clear of the floating result pill. */
+const BOTTOM_PAD = 68;
 const OVERSCAN = 8;
 const NUMERIC_TYPE = /int|serial|numeric|decimal|float|double|real|number|money|bit\b/i;
+const TEMPORAL_TYPE = /date|time|interval/i;
+const IS_MAC = /Mac/.test(navigator.userAgent);
+const MODK = IS_MAC ? "⌘" : "Ctrl+";
 const BOOL_TYPE = /^(bool|boolean)$/i;
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
@@ -60,11 +65,16 @@ export class ResultGrid {
   private submitting = false;
 
   // dom
-  private bar: HTMLElement;
+  private pill: HTMLElement;
   private filterInput: HTMLInputElement;
+  private filterWrap: HTMLElement;
   private countEl: HTMLElement;
-  private noteEl: HTMLElement;
-  private editBtns: HTMLElement;
+  private metaEl: HTMLElement;
+  private meta = "";
+  private btnLoadMore: HTMLButtonElement;
+  private roChip: HTMLElement;
+  private btnAdd: HTMLButtonElement;
+  private pendGroup: HTMLElement;
   private btnSubmit: HTMLButtonElement;
   private btnRevert: HTMLButtonElement;
   private btnDelete: HTMLButtonElement;
@@ -72,6 +82,8 @@ export class ResultGrid {
   private pendingEl: HTMLElement;
   private scroller: HTMLElement;
   private headEl: HTMLElement;
+  private cornerEl: HTMLElement;
+  private colCls: string[] = [];
   private body: HTMLElement;
   private active = new Map<number, RowEl>();
   private pool: RowEl[] = [];
@@ -83,52 +95,100 @@ export class ResultGrid {
   constructor(cb: GridCallbacks) {
     this.cb = cb;
     this.filterInput = h("input", {
-      class: "input g-filter",
+      class: "pill-input",
       type: "search",
-      placeholder: "Filter rows…",
+      placeholder: "Filter rows",
       "aria-label": "Filter rows",
+      spellcheck: false,
       oninput: debounce(() => {
         this.filter = this.filterInput.value.trim().toLowerCase();
         this.rebuildOrder();
       }, 140),
+      onkeydown: (e: KeyboardEvent) => {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          this.filterInput.value = "";
+          this.filter = "";
+          this.rebuildOrder();
+          this.filterWrap.classList.remove("open");
+          this.focus();
+        } else if (e.key === "Enter" || e.key === "ArrowDown") {
+          e.preventDefault();
+          this.focus();
+        }
+      },
+      onblur: () => {
+        if (!this.filterInput.value) this.filterWrap.classList.remove("open");
+      },
     });
-    this.countEl = h("span", { class: "g-count" });
-    this.noteEl = h("span", { class: "g-note" });
-    this.pendingEl = h("span", { class: "g-pending" });
-    const mkBtn = (ic: string, label: string, fn: () => void, cls = ""): HTMLButtonElement =>
-      h("button", { class: "btn sm " + cls, type: "button", title: label, onclick: fn }, icon(ic, 14), h("span", null, label));
-    this.btnSubmit = mkBtn("check", "Submit", () => void this.submit(), "primary");
-    this.btnRevert = mkBtn("undo", "Revert", () => this.revert());
-    this.btnDelete = mkBtn("minus", "Delete row", () => this.deleteSelected());
-    this.btnNull = mkBtn("x", "Set NULL", () => this.nullSelected());
-    const btnAdd = mkBtn("plus", "Add row", () => this.addRow());
-    this.editBtns = h("div", { class: "g-edit-btns" }, btnAdd, this.btnDelete, this.btnNull, this.btnRevert, this.btnSubmit, this.pendingEl);
-    const btnExport = h(
+    const filterBtn = h(
       "button",
-      { class: "btn sm", type: "button", title: "Export result to CSV or JSON", onclick: () => this.cb.onExport() },
-      icon("download", 14),
-      h("span", null, "Export"),
+      {
+        class: "pill-icon",
+        type: "button",
+        title: "Filter rows",
+        "aria-label": "Filter rows",
+        onclick: () => {
+          const open = !this.filterWrap.classList.contains("open") || !this.filterInput.value;
+          this.filterWrap.classList.add("open");
+          if (open) this.filterInput.focus();
+        },
+      },
+      icon("search", 14),
     );
-    this.bar = h(
+    this.filterWrap = h("div", { class: "pill-filter" }, filterBtn, this.filterInput);
+    this.countEl = h("span", { class: "pill-count" });
+    this.metaEl = h("span", { class: "pill-meta", "aria-live": "polite" });
+    this.btnLoadMore = h("button", { class: "pill-link", type: "button", onclick: () => this.cb.onLoadMore() }, "Load more");
+    this.roChip = h("span", { class: "pill-chip" }, "read-only");
+    const btn = (label: string, fn: () => void, cls = "", title = label): HTMLButtonElement => h("button", { class: "pill-btn " + cls, type: "button", title, onclick: fn }, label);
+    const btnExport = btn("Export", () => this.cb.onExport(), "", "Export result to CSV or JSON");
+    this.btnAdd = btn("+ Row", () => this.addRow(), "", "Add a row");
+    this.pendingEl = h("span", { class: "pill-pending" });
+    this.btnRevert = btn("Revert", () => this.revert(), "", "Discard pending changes");
+    this.btnDelete = btn("Delete row", () => this.deleteSelected(), "", "Mark selected rows for deletion (again to undo)");
+    this.btnNull = btn("Set NULL", () => this.nullSelected(), "", "Set selected cells to NULL");
+    this.btnSubmit = btn("Submit", () => void this.submit(), "accent", `Write pending changes to the database (${MODK}S)`);
+    this.pendGroup = h("div", { class: "pill-group pending" }, h("span", { class: "pill-sep", "aria-hidden": "true" }), this.pendingEl, this.btnRevert, this.btnDelete, this.btnNull, this.btnSubmit);
+    this.pill = h(
       "div",
-      { class: "g-bar" },
-      h("div", { class: "g-filter-wrap" }, icon("search", 13), this.filterInput),
-      this.countEl,
-      this.editBtns,
-      h("div", { class: "spacer" }),
-      this.noteEl,
-      btnExport,
+      { class: "float-pill g-pill", role: "toolbar", "aria-label": "Result" },
+      h("span", { class: "pill-stat" }, h("span", { class: "pill-dot", "aria-hidden": "true" }), this.countEl),
+      this.metaEl,
+      this.btnLoadMore,
+      this.roChip,
+      this.filterWrap,
+      h("div", { class: "pill-group" }, btnExport, this.btnAdd),
+      this.pendGroup,
     );
-    this.headEl = h("div", { class: "g-head" });
+    this.cornerEl = h("div", { class: "g-corner" });
+    this.headEl = h("div", { class: "g-head", role: "row" });
+    const headBar = h("div", { class: "g-headbar" }, this.cornerEl, h("div", { class: "g-headclip" }, this.headEl));
     this.body = h("div", { class: "g-body" });
-    this.scroller = h("div", { class: "g-scroll", tabindex: "0", role: "grid" }, this.headEl, this.body);
-    this.el = h("div", { class: "grid" }, this.bar, this.scroller);
+    this.scroller = h("div", { class: "g-scroll", tabindex: "0", role: "grid", "aria-label": "Result rows" }, this.body);
+    this.el = h("div", { class: "grid" }, headBar, this.scroller, h("div", { class: "pill-wrap" }, this.pill));
 
-    this.scroller.addEventListener("scroll", () => this.schedule(), { passive: true });
+    this.scroller.addEventListener(
+      "scroll",
+      () => {
+        const x = this.scroller.scrollLeft;
+        this.headEl.style.transform = x ? `translate3d(${-x}px,0,0)` : "";
+        this.scroller.classList.toggle("hs", x > 0);
+        this.schedule();
+      },
+      { passive: true },
+    );
     this.scroller.addEventListener("pointerdown", (e) => this.onPointerDown(e));
     this.scroller.addEventListener("dblclick", (e) => this.onDblClick(e));
     this.scroller.addEventListener("keydown", (e) => this.onKey(e));
+    this.scroller.addEventListener("contextmenu", (e) => this.onContextMenu(e));
     new ResizeObserver(() => this.schedule()).observe(this.scroller);
+  }
+
+  /** Timing / server text shown next to the row count, e.g. "15 ms · PostgreSQL 16.2". */
+  setMeta(text: string): void {
+    this.meta = text;
+    if (!this.flashTimer) this.metaEl.textContent = text;
   }
 
   // ---------------------------------------------------------------- data in
@@ -147,7 +207,8 @@ export class ResultGrid {
     this.cancelEdit();
     this.submitting = false;
     this.numeric = this.cols.map((c) => NUMERIC_TYPE.test(c.typeName));
-    this.rnW = Math.max(RN_MIN, String(this.rows.length).length * 8 + 26);
+    this.colCls = this.cols.map((c, i) => (this.numeric[i] ? " num" : TEMPORAL_TYPE.test(c.typeName) ? " t" : ""));
+    this.rnW = Math.max(RN_MIN, String(this.rows.length).length * 7 + 22);
     const keep = this.widths.length === this.cols.length && this.sortCol >= 0 ? this.sortCol : -1;
     this.widths = this.cols.map((c, i) => this.autoWidth(c, i));
     this.sortCol = keep;
@@ -157,6 +218,8 @@ export class ResultGrid {
     this.rebuildOrder();
     this.scroller.scrollTop = 0;
     this.scroller.scrollLeft = 0;
+    this.headEl.style.transform = "";
+    this.scroller.classList.remove("hs");
     this.updateBar();
   }
 
@@ -176,7 +239,7 @@ export class ResultGrid {
       const l = v === null ? 4 : String(v).length;
       if (l > len) len = l;
     }
-    return Math.max(72, Math.min(360, Math.round(len * 7.4 + 26)));
+    return Math.max(72, Math.min(360, Math.round(len * (this.numeric[i] ? 7.6 : 7.9) + (this.numeric[i] ? 34 : 26))));
   }
 
   private totalW(): number {
@@ -200,7 +263,7 @@ export class ResultGrid {
   }
 
   private fmt(v: Cell): string {
-    if (v === null) return "null";
+    if (v === null) return "NULL";
     if (typeof v === "string") return v.length > 400 ? v.slice(0, 400) + "…" : v;
     return String(v);
   }
@@ -261,9 +324,9 @@ export class ResultGrid {
     }
     for (let k = 0; k < this.inserts.length; k++) idx.push(n + k);
     this.order = idx;
-    this.body.style.height = idx.length * ROW_H + "px";
+    this.body.style.height = idx.length * ROW_H + BOTTOM_PAD + "px";
     this.body.style.width = this.totalW() + "px";
-    this.headEl.style.width = this.totalW() + "px";
+    this.headEl.style.width = this.totalW() - this.rnW + "px";
     this.clampSelection();
     this.fullRefill = true;
     this.updateBar();
@@ -284,16 +347,14 @@ export class ResultGrid {
 
   private buildHeader(): void {
     clear(this.headEl);
-    const corner = h("div", { class: "g-corner", style: `width:${this.rnW}px` }, "#");
-    this.headEl.appendChild(corner);
+    this.cornerEl.style.width = this.rnW + "px";
     this.cols.forEach((col, i) => {
       const isPk = !!this.ctx && this.ctx.colMap[i] !== null && this.ctx.pk.includes(this.ctx.colMap[i] as string);
       const sortMark = h("span", { class: "g-sort" });
       const hc = h(
         "div",
-        { class: "g-hc" + (this.numeric[i] ? " num" : ""), style: `width:${this.widths[i]}px`, title: `${col.name} — ${col.typeName}` },
+        { class: "g-hc" + (this.numeric[i] ? " num" : ""), role: "columnheader", style: `width:${this.widths[i]}px`, title: `${col.name} — ${col.typeName}${isPk ? " · primary key" : ""}\nClick to sort` },
         h("div", { class: "g-hc-main" }, isPk ? icon("key", 11) : null, h("span", { class: "g-hc-name" }, col.name), sortMark),
-        h("div", { class: "g-hc-type" }, col.typeName),
       );
       (hc as HTMLElement & { _sort?: HTMLElement })._sort = sortMark;
       hc.addEventListener("click", (e) => {
@@ -337,7 +398,8 @@ export class ResultGrid {
       this.widths[i] = Math.max(48, Math.min(1200, startW + ev.clientX - startX));
       hc.style.width = this.widths[i] + "px";
       this.widthVersion++;
-      this.body.style.width = this.headEl.style.width = this.totalW() + "px";
+      this.body.style.width = this.totalW() + "px";
+      this.headEl.style.width = this.totalW() - this.rnW + "px";
       this.schedule();
     };
     const up = (): void => {
@@ -386,7 +448,7 @@ export class ResultGrid {
 
   private render(): void {
     const total = this.order.length;
-    const viewH = this.scroller.clientHeight - HEAD_H;
+    const viewH = this.scroller.clientHeight;
     const top = this.scroller.scrollTop;
     const first = Math.max(0, Math.floor(top / ROW_H) - OVERSCAN);
     const last = Math.min(total - 1, Math.ceil((top + viewH) / ROW_H) + OVERSCAN);
@@ -414,6 +476,7 @@ export class ResultGrid {
       }
     }
     const sel = this.selRect();
+    const multi = !!sel && (sel.r0 !== sel.r1 || sel.c0 !== sel.c1);
     const cur = this.head;
     const n = this.n();
     const ncol = this.cols.length;
@@ -435,7 +498,11 @@ export class ResultGrid {
       const isNew = ri >= n;
       const isDel = this.deleted.has(ri);
       const rowSel = !!sel && i >= sel.r0 && i <= sel.r1;
-      row.className = "g-row" + (i % 2 ? " odd" : "") + (isNew ? " new" : "") + (isDel ? " del" : "") + (rowSel ? " rowsel" : "");
+      row.className =
+        "g-row" +
+        (isNew ? " new" : "") +
+        (isDel ? " del" : "") +
+        (rowSel ? " rowsel" + (i === sel.r0 ? " r0" : "") + (i === sel.r1 ? " r1" : "") : "");
       const rn = row._rn as HTMLDivElement;
       rn.style.width = this.rnW + "px";
       rn.textContent = isNew ? "+" : String(ri + 1);
@@ -444,14 +511,12 @@ export class ResultGrid {
       for (let c = 0; c < ncol; c++) {
         const cell = cells[c];
         const v = this.getCell(ri, c);
-        let cls = "g-cell";
+        let cls = "g-cell" + this.colCls[c];
         if (v === null) cls += " null";
-        else if (this.numeric[c] && typeof v === "number") cls += " num";
-        else if (this.numeric[c]) cls += " num";
         if (ov && ov.has(c)) cls += " dirty";
         else if (isNew && this.inserts[ri - n].touched.has(c)) cls += " dirty";
         if (sel && rowSel && c >= sel.c0 && c <= sel.c1) {
-          cls += " sel";
+          if (multi) cls += " sel";
           if (cur && cur.r === i && cur.c === c) cls += " cur";
         }
         cell.className = cls;
@@ -559,7 +624,7 @@ export class ResultGrid {
     const s = this.scroller;
     const top = p.r * ROW_H;
     if (top < s.scrollTop) s.scrollTop = top;
-    else if (top + ROW_H > s.scrollTop + s.clientHeight - HEAD_H) s.scrollTop = top + ROW_H - (s.clientHeight - HEAD_H);
+    else if (top + ROW_H > s.scrollTop + s.clientHeight - BOTTOM_PAD) s.scrollTop = top + ROW_H - (s.clientHeight - BOTTOM_PAD);
     let left = this.rnW;
     for (let c = 0; c < p.c; c++) left += this.widths[c];
     const right = left + this.widths[p.c];
@@ -623,9 +688,56 @@ export class ResultGrid {
 
   private flashTimer = 0;
   private flash(msg: string): void {
-    this.noteEl.textContent = msg;
+    this.metaEl.textContent = msg;
+    this.metaEl.classList.add("flash");
     window.clearTimeout(this.flashTimer);
-    this.flashTimer = window.setTimeout(() => this.updateBar(), 1600);
+    this.flashTimer = window.setTimeout(() => {
+      this.flashTimer = 0;
+      this.metaEl.classList.remove("flash");
+      this.metaEl.textContent = this.meta;
+    }, 1600);
+  }
+
+  // ---------------------------------------------------------------- context menu
+
+  private onContextMenu(e: MouseEvent): void {
+    const t = e.target as HTMLElement;
+    if (!t.closest(".g-body") || t.closest(".g-edit")) return;
+    e.preventDefault();
+    this.commitEdit();
+    const p = this.hit(e);
+    if (!p) return;
+    const sel = this.selRect();
+    const inside = !!sel && p.r >= sel.r0 && p.r <= sel.r1 && (p.c < 0 || (p.c >= sel.c0 && p.c <= sel.c1));
+    if (!inside) {
+      const last = this.cols.length - 1;
+      if (p.c < 0) {
+        this.anchor = { r: p.r, c: 0 };
+        this.head = { r: p.r, c: last };
+      } else this.anchor = this.head = p;
+      this.fullRefill = true;
+      this.schedule();
+      this.updateBar();
+    }
+    const editable = this.editable();
+    const cell = this.head;
+    const ri = cell ? this.order[cell.r] : undefined;
+    const canEditCell = editable && !!cell && ri !== undefined && this.cellEditable(ri, cell.c);
+    const anyDeleted = (() => {
+      const s2 = this.selRect();
+      if (!s2) return false;
+      for (let r = s2.r0; r <= s2.r1; r++) if (this.deleted.has(this.order[r])) return true;
+      return false;
+    })();
+    showMenu(e.clientX, e.clientY, [
+      { label: "Copy", icon: "copy", hint: MODK + "C", onClick: () => void this.copySelection(false) },
+      { label: "Copy with header", icon: "copy", hint: MODK + "⇧C", onClick: () => void this.copySelection(true) },
+      { sep: true },
+      { label: "Edit cell", icon: "pencil", hint: "↵", disabled: !canEditCell, onClick: () => cell && this.startEdit(cell) },
+      { label: "Set NULL", icon: "x", disabled: !editable, onClick: () => this.nullSelected() },
+      { label: anyDeleted ? "Restore row" : "Delete row", icon: anyDeleted ? "undo" : "minus", danger: !anyDeleted, disabled: !editable, onClick: () => this.deleteSelected() },
+      { label: "Add row", icon: "plus", disabled: !editable, onClick: () => this.addRow() },
+    ]);
   }
 
   // ---------------------------------------------------------------- editing
@@ -651,7 +763,7 @@ export class ResultGrid {
     const v = this.getCell(ri, p.c);
     const input = h("input", { class: "g-edit", type: "text", spellcheck: false });
     input.value = v === null ? "" : String(v);
-    input.placeholder = v === null ? "null" : "";
+    input.placeholder = v === null ? "NULL" : "";
     input.dataset.r = String(p.r);
     input.dataset.c = String(p.c);
     input.addEventListener("keydown", (ev) => {
@@ -880,26 +992,19 @@ export class ResultGrid {
     this.countEl.textContent =
       shown === total ? `${total.toLocaleString()} row${total === 1 ? "" : "s"}` : `${shown.toLocaleString()} of ${total.toLocaleString()} rows`;
     const editable = this.editable();
-    this.editBtns.style.display = editable ? "" : "none";
     const pending = this.pendingCount();
+    this.btnAdd.hidden = !editable;
+    this.roChip.hidden = editable;
+    this.roChip.title = this.reason || "This result can't be edited";
+    this.btnLoadMore.hidden = !this.truncated;
+    this.btnLoadMore.title = `Showing the first ${this.maxRows.toLocaleString()} rows — load ${(this.maxRows * 2).toLocaleString()}`;
+    this.pendGroup.hidden = !editable || pending === 0;
+    this.pill.classList.toggle("has-pending", editable && pending > 0);
     this.btnSubmit.disabled = pending === 0 || this.submitting;
     this.btnRevert.disabled = pending === 0 || this.submitting;
     this.btnDelete.disabled = !this.selRect();
     this.btnNull.disabled = !this.selRect();
     this.pendingEl.textContent = pending ? `${pending} pending` : "";
-    clear(this.noteEl);
-    if (!editable) {
-      this.noteEl.appendChild(h("span", { class: "chip", title: this.reason }, icon("view", 12), "Read-only result"));
-    }
-    if (this.truncated) {
-      this.noteEl.appendChild(
-        h(
-          "span",
-          { class: "g-trunc" },
-          h("span", { class: "g-trunc-text" }, `First ${this.maxRows.toLocaleString()} rows —`),
-          h("button", { class: "linkbtn", type: "button", onclick: () => this.cb.onLoadMore() }, "Load more"),
-        ),
-      );
-    }
+    if (this.filter) this.filterWrap.classList.add("open");
   }
 }

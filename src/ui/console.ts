@@ -1,15 +1,20 @@
-// A console tab: SQL editor on top, result sub-tabs (grid / message / error) below.
+// A console tab: SQL editor on top, results below (grid / message / error).
+// Its run controls (Run / Cancel, Run all, transaction pill) are mounted by the shell into the
+// floating capsule while this console is active.
 import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import type { QueryResult, RowEdit, SessionInfo } from "../types";
 import { clear, errMsg, h, icon } from "./dom";
+import { DRIVER_LABELS } from "../types";
+import { showMenu } from "./menu";
 import { SqlEditor } from "./editor";
 import { ResultGrid } from "./grid";
 import { store } from "./state";
-import { buildCompletionSchema, connColor, detectEditContext } from "./sqlutil";
+import { buildCompletionSchema, detectEditContext } from "./sqlutil";
 import { toast } from "./toast";
 
 const DEFAULT_MAX_ROWS = 500;
+const MOD = /Mac/.test(navigator.userAgent) ? "⌘" : "Ctrl+";
 
 export interface StatusInfo {
   rows: number | null;
@@ -40,6 +45,8 @@ let counter = 0;
 
 export class ConsolePane {
   readonly el: HTMLElement;
+  /** Run controls shown in the shell's floating capsule while this console is active. */
+  readonly controls: HTMLElement;
   readonly id = "console-" + ++counter;
   title: string;
   status: StatusInfo;
@@ -56,10 +63,10 @@ export class ConsolePane {
   private btnRun: HTMLButtonElement;
   private btnRunAll: HTMLButtonElement;
   private btnStop: HTMLButtonElement;
-  private btnCommit: HTMLButtonElement;
-  private btnRollback: HTMLButtonElement;
-  private segAuto: HTMLButtonElement;
-  private segManual: HTMLButtonElement;
+  private btnTx: HTMLButtonElement;
+  private waitEl: HTMLElement;
+  private waitText: HTMLElement;
+  private txMenuClosedAt = 0;
   private alive = true;
 
   constructor(
@@ -73,36 +80,17 @@ export class ConsolePane {
     const driver = entry?.config.driver ?? "postgres";
     this.status = { rows: null, elapsedMs: null, affected: null, serverVersion: entry?.session?.serverVersion ?? "", autoCommit: true, running: false, text: "Ready" };
 
-    const mk = (ic: string, label: string, tip: string, fn: () => void, cls = ""): HTMLButtonElement =>
-      h("button", { class: "btn " + cls, type: "button", title: tip, onclick: fn }, icon(ic, 15), h("span", null, label));
     const isMac = /Mac/.test(navigator.userAgent);
     const mod = isMac ? "⌘" : "Ctrl+";
-    this.btnRun = mk("play", "Run", `Run selection or statement at cursor (${mod}Enter)`, () => void this.runCurrent(), "primary");
-    this.btnRunAll = mk("playAll", "Run all", `Run all statements (${mod}Shift+Enter)`, () => void this.runAll());
-    this.btnStop = mk("stop", "Cancel", "Cancel running statement", () => void this.cancel(), "danger");
+    this.btnRun = h("button", { class: "cap-btn run", type: "button", title: `Run selection or statement at cursor (${mod}Enter)`, onclick: () => void this.runCurrent() }, icon("run", 10), "Run");
+    this.btnStop = h("button", { class: "cap-btn stop", type: "button", title: "Cancel running statement", onclick: () => void this.cancel() }, icon("stop", 13), "Cancel");
     this.btnStop.disabled = true;
-    this.segAuto = h("button", { class: "seg-btn on", type: "button", onclick: () => void this.setAuto(true) }, "Auto");
-    this.segManual = h("button", { class: "seg-btn", type: "button", onclick: () => void this.setAuto(false) }, "Manual");
-    this.btnCommit = mk("check", "Commit", "Commit transaction", () => void this.endTx(true));
-    this.btnRollback = mk("undo", "Rollback", "Roll back transaction", () => void this.endTx(false));
-    this.btnCommit.disabled = this.btnRollback.disabled = true;
-
-    const cfg = entry?.config;
-    const toolbar = h(
-      "div",
-      { class: "c-toolbar" },
-      this.btnRun,
-      this.btnRunAll,
-      this.btnStop,
-      h("span", { class: "vsep" }),
-      h("div", { class: "seg small", role: "radiogroup", "aria-label": "Transaction mode", title: "Transaction mode" }, this.segAuto, this.segManual),
-      this.btnCommit,
-      this.btnRollback,
-      h("div", { class: "spacer" }),
-      cfg
-        ? h("span", { class: "conn-pill", style: `--c:${connColor(cfg)}` }, h("span", { class: "conn-dot connected", style: `--c:${connColor(cfg)}` }), cfg.name)
-        : null,
-    );
+    this.btnRunAll = h("button", { class: "cap-btn ghost", type: "button", title: `Run all statements (${mod}Shift+Enter)`, onclick: () => void this.runAll() }, "Run all");
+    this.btnTx = h("button", { class: "cap-btn fill tx", type: "button", title: "Transaction mode", "aria-haspopup": "menu", onclick: () => this.openTxMenu() });
+    this.controls = h("div", { class: "cap-controls" }, this.btnRun, this.btnStop, this.btnRunAll, this.btnTx);
+    this.syncTxLabel();
+    this.waitText = h("span", null, "Running…");
+    this.waitEl = h("div", { class: "r-wait", role: "status" }, h("span", { class: "spinner", "aria-hidden": "true" }), this.waitText);
 
     this.editorWrap = h("div", { class: "c-editor" });
     this.editor = new SqlEditor(this.editorWrap, {
@@ -111,12 +99,12 @@ export class ConsolePane {
       onRun: () => void this.runCurrent(),
       onRunAll: () => void this.runAll(),
     });
-    this.tabsEl = h("div", { class: "r-tabs", role: "tablist" });
+    this.tabsEl = h("div", { class: "r-tabs", role: "tablist", "aria-label": "Results" });
     this.bodyEl = h("div", { class: "r-body" });
-    const splitter = h("div", { class: "c-split", role: "separator", "aria-orientation": "horizontal", title: "Drag to resize" });
+    const splitter = h("div", { class: "c-split", role: "separator", "aria-orientation": "horizontal", "aria-label": "Resize editor", title: "Drag to resize" });
     this.bindSplitter(splitter);
     const results = h("div", { class: "c-results" }, this.tabsEl, this.bodyEl);
-    this.el = h("div", { class: "console" }, toolbar, this.editorWrap, splitter, results);
+    this.el = h("div", { class: "console" }, this.editorWrap, splitter, results);
     this.showEmptyResults();
     this.updateSchema();
   }
@@ -222,11 +210,43 @@ export class ConsolePane {
   }
 
   private syncTxUi(): void {
-    this.segAuto.classList.toggle("on", this.autoCommit);
-    this.segManual.classList.toggle("on", !this.autoCommit);
-    this.btnCommit.disabled = this.btnRollback.disabled = this.autoCommit || this.running;
+    this.syncTxLabel();
     this.status.autoCommit = this.autoCommit;
     this.host.onStatus(this);
+  }
+
+  private syncTxLabel(): void {
+    clear(this.btnTx);
+    this.btnTx.append(this.autoCommit ? "Auto" : "Manual", h("span", { class: "tx-caret", "aria-hidden": "true" }, "▾"));
+    this.btnTx.classList.toggle("manual", !this.autoCommit);
+    this.btnTx.setAttribute("aria-label", `Transaction mode: ${this.autoCommit ? "auto-commit" : "manual"}`);
+  }
+
+  /** Small glass menu under the transaction pill: mode + Commit / Rollback (manual mode only). */
+  private openTxMenu(): void {
+    // A click on the pill while its menu is open closes the menu (pointerdown) — don't reopen it.
+    if (performance.now() - this.txMenuClosedAt < 250) return;
+    const r = this.btnTx.getBoundingClientRect();
+    const manualIdle = !this.autoCommit && !this.running;
+    this.btnTx.classList.add("open");
+    showMenu(
+      r.left,
+      r.bottom + 8,
+      [
+        { label: "Auto-commit", checked: this.autoCommit, onClick: () => void this.setAuto(true) },
+        { label: "Manual", checked: !this.autoCommit, onClick: () => void this.setAuto(false) },
+        { sep: true },
+        { label: "Commit", icon: "commit", disabled: !manualIdle, onClick: () => void this.endTx(true) },
+        { label: "Rollback", icon: "undo", disabled: !manualIdle, onClick: () => void this.endTx(false) },
+      ],
+      {
+        minWidth: 180,
+        onClose: () => {
+          this.txMenuClosedAt = performance.now();
+          this.btnTx.classList.remove("open");
+        },
+      },
+    );
   }
 
   // ---------------------------------------------------------------- running
@@ -262,8 +282,9 @@ export class ConsolePane {
     this.status.text = text;
     this.btnRun.disabled = this.btnRunAll.disabled = on;
     this.btnStop.disabled = !on;
-    this.btnCommit.disabled = this.btnRollback.disabled = this.autoCommit || on;
+    this.waitText.textContent = text;
     this.el.classList.toggle("running", on);
+    this.controls.classList.toggle("running", on);
     this.host.onStatus(this);
   }
 
@@ -271,6 +292,7 @@ export class ConsolePane {
     if (this.running || stmts.length === 0) return;
     this.setRunning(true, "Connecting…");
     this.clearResults();
+    this.bodyEl.appendChild(this.waitEl);
     let schemaTouched = false;
     try {
       const sess = await this.ensureSession();
@@ -314,11 +336,17 @@ export class ConsolePane {
     this.activeItem = -1;
     clear(this.tabsEl);
     clear(this.bodyEl);
+    this.tabsEl.classList.remove("multi");
   }
 
   private showEmptyResults(): void {
     this.bodyEl.appendChild(
-      h("div", { class: "r-empty" }, icon("sparkle", 22), h("div", null, "Run a statement to see results here."), h("div", { class: "hint" }, "Ctrl/Cmd+Enter runs the statement at the cursor · Ctrl/Cmd+Shift+Enter runs everything")),
+      h(
+        "div",
+        { class: "r-empty" },
+        h("div", { class: "r-empty-title" }, "Run a statement to see results here"),
+        h("div", { class: "hint" }, h("kbd", null, MOD + "↵"), " runs the statement at the cursor  ·  ", h("kbd", null, MOD + "⇧↵"), " runs everything"),
+      ),
     );
   }
 
@@ -332,7 +360,10 @@ export class ConsolePane {
     );
     const item: ResultItem = { tab, view, sql, maxRows: DEFAULT_MAX_ROWS };
     this.items.push(item);
+    this.waitEl.remove();
     this.tabsEl.appendChild(tab);
+    // Result tabs only appear once a script produced more than one result.
+    this.tabsEl.classList.toggle("multi", this.items.length > 1);
     this.bodyEl.appendChild(view);
     this.activate(idx);
     return item;
@@ -412,6 +443,16 @@ export class ConsolePane {
     // Prefer the statement we sent when the backend echoes nothing useful.
     const det2 = det.ctx || !e ? det : detectEditContext(this.lastSql(grid), res.columns, e.schemas, def, e.config.readOnly === true);
     grid.setResult(res, det2.ctx, det2.reason, maxRows);
+    grid.setMeta(`${res.elapsedMs.toLocaleString()} ms${this.serverLabel() ? " · " + this.serverLabel() : ""}`);
+  }
+
+  /** "PostgreSQL 16.2" — shown in the result pill. */
+  private serverLabel(): string {
+    const e = store.conns.get(this.connId);
+    if (!e) return "";
+    const name = DRIVER_LABELS[e.config.driver].split(" / ")[0];
+    const ver = this.status.serverVersion || e.session?.serverVersion || "";
+    return ver ? `${name} ${ver}` : name;
   }
 
   private lastSql(grid: ResultGrid): string {
@@ -492,7 +533,7 @@ export class ConsolePane {
 
   private bindSplitter(sp: HTMLElement): void {
     const saved = Number(localStorage.getItem("dt.editorH"));
-    this.editorWrap.style.height = (saved >= 80 ? saved : 190) + "px";
+    this.editorWrap.style.height = (saved >= 80 ? saved : 236) + "px";
     sp.addEventListener("pointerdown", (e) => {
       e.preventDefault();
       const startY = e.clientY;

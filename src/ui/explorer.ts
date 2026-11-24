@@ -1,12 +1,17 @@
-// Left sidebar: connections -> schemas -> Tables/Views -> columns.
+// Left sidebar card: brand, filter, connections -> schemas -> tables (+ Views group) -> columns.
 import type { SchemaNode, TableNode } from "../types";
 import { DRIVER_LABELS } from "../types";
-import { clear, errMsg, h, icon } from "./dom";
+import { brandMark, clear, errMsg, h, icon } from "./dom";
 import { showMenu } from "./menu";
 import type { ConnEntry } from "./state";
 import { store } from "./state";
 import { connColor, qualifiedName } from "./sqlutil";
 import { toast } from "./toast";
+
+/** Indent (px) per tree depth, from the spec: 0 / 16 / 30, then +14 per level. */
+const INDENT = [0, 16, 30, 44, 58, 72];
+const DRIVER_ABBR: Record<string, string> = { postgres: "PG", mysql: "MY", sqlite: "SQ", mssql: "MS" };
+const STATUS_TEXT: Record<string, string> = { idle: "not connected", connecting: "connecting…", connected: "connected", error: "connection failed" };
 
 export interface ExplorerHost {
   openConsole(connId: string, opts?: { sql?: string; run?: boolean; title?: string }): void;
@@ -22,6 +27,7 @@ interface RowSpec {
   key: string;
   depth: number;
   icon?: HTMLElement;
+  badge?: HTMLElement;
   label: string;
   meta?: string;
   pk?: boolean;
@@ -45,44 +51,51 @@ export class Explorer {
 
   constructor(private host: ExplorerHost) {
     this.filterInput = h("input", {
-      class: "input",
       type: "search",
-      placeholder: "Filter tables…",
-      "aria-label": "Filter explorer",
+      placeholder: "Search",
+      "aria-label": "Filter connections and tables",
+      spellcheck: false,
       oninput: () => {
         this.filter = this.filterInput.value.trim().toLowerCase();
         this.render();
       },
+      onkeydown: (e: KeyboardEvent) => {
+        if (e.key === "Escape" && this.filterInput.value) {
+          e.stopPropagation();
+          this.filterInput.value = "";
+          this.filter = "";
+          this.render();
+        }
+      },
     });
-    this.tree = h("div", { class: "tree", role: "tree" });
+    this.tree = h("div", { class: "tree", role: "tree", "aria-label": "Connections" });
+    const addBtn = h(
+      "button",
+      {
+        class: "pill-btn wide side-add",
+        type: "button",
+        "aria-haspopup": "menu",
+        onclick: (ev: MouseEvent) => {
+          const r = (ev.currentTarget as HTMLElement).getBoundingClientRect();
+          showMenu(r.left, r.top - 6, [
+            { label: "New connection…", icon: "plus", onClick: () => host.addConnection() },
+            { label: "Import from DataGrip…", icon: "download", onClick: () => host.importDataGrip() },
+          ], { above: true, minWidth: r.width });
+        },
+      },
+      "+ New connection",
+    );
+    // macOS draws the traffic lights over this strip (titleBarStyle Overlay); it doubles as a drag handle.
+    // Windows/Linux have native title bars: the strip is hidden by CSS there.
+    const strip = h("div", { class: "traffic-strip", "data-tauri-drag-region": "", "aria-hidden": "true" });
     this.el = h(
       "aside",
-      { class: "panel sidebar", "aria-label": "Explorer" },
-      h(
-        "div",
-        { class: "panel-head" },
-        h("div", { class: "panel-title" }, icon("database", 15), "Explorer"),
-        h(
-          "button",
-          {
-            class: "icon-btn",
-            type: "button",
-            title: "Add",
-            "aria-label": "Add connection",
-            "aria-haspopup": "menu",
-            onclick: (ev: MouseEvent) => {
-              const r = (ev.currentTarget as HTMLElement).getBoundingClientRect();
-              showMenu(r.left, r.bottom + 4, [
-                { label: "New connection…", icon: "plus", onClick: () => host.addConnection() },
-                { label: "Import from DataGrip…", icon: "download", onClick: () => host.importDataGrip() },
-              ]);
-            },
-          },
-          icon("plus", 16),
-        ),
-      ),
-      h("div", { class: "panel-search" }, icon("search", 13), this.filterInput),
+      { class: "sidebar", "aria-label": "Explorer" },
+      strip,
+      h("div", { class: "brand-row", "data-tauri-drag-region": "" }, brandMark(22), h("span", { class: "brand-name", "data-tauri-drag-region": "" }, "DataTrip")),
+      h("label", { class: "side-search" }, icon("search", 13), this.filterInput),
       this.tree,
+      h("div", { class: "side-foot" }, addBtn),
     );
     store.subscribe(() => this.render());
   }
@@ -117,11 +130,9 @@ export class Explorer {
         h(
           "div",
           { class: "side-empty" },
-          icon("plug", 28),
           h("div", { class: "side-empty-title" }, "No connections yet"),
           h("div", { class: "side-empty-text" }, "Add a PostgreSQL, MySQL, SQLite or SQL Server database to start exploring."),
-          h("button", { class: "btn primary", type: "button", onclick: () => this.host.addConnection() }, icon("plus", 14), "Add connection"),
-          h("button", { class: "btn ghost sm", type: "button", onclick: () => this.host.importDataGrip() }, icon("download", 14), "Import from DataGrip…"),
+          h("button", { class: "linkbtn", type: "button", onclick: () => this.host.importDataGrip() }, "Import from DataGrip…"),
         ),
       );
       return;
@@ -134,19 +145,21 @@ export class Explorer {
     this.tree.scrollTop = scrollTop;
   }
 
-  private row(parent: DocumentFragment, s: RowSpec): void {
-    const caret = h("span", { class: "twisty" + (s.expandable ? (s.expanded ? " open" : "") : " none") }, s.expandable ? icon("chevron", 12) : null);
+  private row(parent: DocumentFragment, s: RowSpec): HTMLElement {
+    const caret = h("span", { class: "twisty" + (s.expandable ? (s.expanded ? " open" : "") : " none"), "aria-hidden": "true" }, s.expandable ? icon("caret", 10) : null);
     const r = h(
       "div",
       {
         class: "node-row " + (s.cls ?? "") + (this.selected === s.key ? " selected" : ""),
-        style: `padding-left:${8 + s.depth * 14}px`,
         role: "treeitem",
+        "aria-level": String(s.depth + 1),
         "aria-expanded": s.expandable ? String(!!s.expanded) : undefined,
+        "aria-selected": this.selected === s.key ? "true" : undefined,
         title: s.title,
       },
+      h("span", { class: "indent", style: `width:${INDENT[Math.min(s.depth, INDENT.length - 1)]}px` }),
       caret,
-      s.icon ?? null,
+      s.badge ?? s.icon ?? null,
       h("span", { class: "label" }, s.label),
       s.pk ? h("span", { class: "badge-pk" }, "PK") : null,
       s.meta ? h("span", { class: "meta" }, s.meta) : null,
@@ -161,10 +174,12 @@ export class Explorer {
       r.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         this.selected = s.key;
+        this.render();
         s.onContext?.(e);
       });
     }
     parent.appendChild(r);
+    return r;
   }
 
   private renderConn(e: ConnEntry, frag: DocumentFragment): number {
@@ -187,9 +202,12 @@ export class Explorer {
     }
     if (f && !nameMatch && groups.length === 0) return 0;
 
-    const open = f ? true : this.expanded.has(ckey);
-    const color = connColor(e.config);
-    const dot = h("span", { class: "conn-dot " + e.status, style: `--c:${color}`, title: e.status });
+    const open = connected && (f ? true : this.expanded.has(ckey));
+    const badge = h(
+      "span",
+      { class: "conn-badge " + e.status, style: `--c:${connColor(e.config)}`, title: `${DRIVER_LABELS[e.config.driver]} · ${STATUS_TEXT[e.status]}` },
+      DRIVER_ABBR[e.config.driver],
+    );
     const actions: HTMLElement[] = [];
     if (connected) {
       actions.push(h("button", { class: "icon-btn xs", type: "button", title: "New console", "aria-label": "New console", onclick: (ev: Event) => (ev.stopPropagation(), this.host.openConsole(id)) }, icon("terminal", 13)));
@@ -200,17 +218,20 @@ export class Explorer {
     this.row(frag, {
       key: ckey,
       depth: 0,
-      icon: dot,
+      badge,
       label: e.config.name,
-      meta: e.status === "connecting" ? "connecting…" : DRIVER_LABELS[e.config.driver].split(" ")[0],
-      expandable: connected,
+      meta: e.status === "connecting" ? "connecting…" : e.config.readOnly ? "read-only" : undefined,
+      // Every connection shows a disclosure triangle: on an idle one it connects first.
+      expandable: e.status !== "error" || connected,
       expanded: open,
       cls: "conn " + e.status,
-      title: e.status === "error" && e.error ? e.error : `${DRIVER_LABELS[e.config.driver]}${e.session ? " · " + e.session.serverVersion : ""}`,
+      title: e.status === "error" && e.error ? e.error : `${e.config.name} — ${DRIVER_LABELS[e.config.driver]}${e.session ? " " + e.session.serverVersion : ""}`,
       actions,
-      onClick: () => {
+      onClick: (ev) => {
         this.host.onSelect(id);
+        const onTwisty = ev.target instanceof Element && ev.target.closest(".twisty") !== null;
         if (connected) this.toggle(ckey);
+        else if (onTwisty && e.status === "idle") void this.connect(id);
         else this.render();
       },
       onDbl: () => {
@@ -220,7 +241,7 @@ export class Explorer {
       onContext: (ev) => this.connMenu(ev, e),
     });
     if (e.status === "error" && e.error) {
-      frag.appendChild(h("div", { class: "node-error", style: "padding-left:36px" }, e.error));
+      frag.appendChild(h("div", { class: "node-error", title: e.error }, e.error));
     }
     if (!connected || !open) return 1;
 
@@ -234,11 +255,11 @@ export class Explorer {
         this.row(frag, {
           key: skey,
           depth: 1,
-          icon: icon("schema", 15),
           label: s.name,
           meta: s.name === e.session?.defaultSchema ? "default" : undefined,
           expandable: true,
           expanded: sopen,
+          cls: "schema",
           onClick: () => this.toggle(skey),
           onContext: (ev) => showMenu(ev.clientX, ev.clientY, [
             { label: "Copy name", icon: "copy", onClick: () => this.host.copy(s.name) },
@@ -248,27 +269,26 @@ export class Explorer {
         if (!sopen) continue;
         depth = 2;
       }
-      const kinds: Array<["tables" | "views", TableNode[], string]> = [
-        ["tables", g.tables, "Tables"],
-        ["views", g.views, "Views"],
-      ];
-      for (const [kind, list, label] of kinds) {
-        if (list.length === 0 && (f || kind === "views")) continue;
-        const gkey = `g:${id}:${s.name}:${kind}`;
+      // Tables sit directly under their schema; views get their own collapsible group after them.
+      for (const t of g.tables) this.renderTable(frag, e, s, t, depth);
+      if (g.tables.length === 0 && g.views.length === 0) {
+        frag.appendChild(h("div", { class: "empty-note tree-note", style: `padding-left:${INDENT[Math.min(depth, INDENT.length - 1)] + 40}px` }, "No tables"));
+      }
+      if (g.views.length) {
+        const gkey = `g:${id}:${s.name}:views`;
         const gopen = f ? true : this.expanded.has(gkey);
         this.row(frag, {
           key: gkey,
           depth,
-          icon: icon(kind === "tables" ? "table" : "view", 15),
-          label,
-          meta: String(list.length),
-          expandable: list.length > 0,
+          icon: icon("view", 14),
+          label: "Views",
+          meta: String(g.views.length),
+          expandable: true,
           expanded: gopen,
           cls: "group",
-          onClick: () => list.length && this.toggle(gkey),
+          onClick: () => this.toggle(gkey),
         });
-        if (!gopen) continue;
-        for (const t of list) this.renderTable(frag, e, s, t, depth + 1);
+        if (gopen) for (const t of g.views) this.renderTable(frag, e, s, t, depth + 1);
       }
     }
     return 1;
@@ -282,7 +302,6 @@ export class Explorer {
     this.row(frag, {
       key,
       depth,
-      icon: icon(t.kind === "view" ? "view" : "table", 15),
       label: t.name,
       meta: undefined,
       expandable: t.columns.length > 0,
@@ -295,6 +314,7 @@ export class Explorer {
       },
       onDbl: () => {
         this.expanded.delete(key);
+        this.render();
         this.host.openConsole(id, { sql: `SELECT * FROM ${q}`, run: true, title: t.name });
       },
       onContext: (ev) => showMenu(ev.clientX, ev.clientY, [
@@ -310,7 +330,6 @@ export class Explorer {
       this.row(frag, {
         key: `${key}:${c.name}`,
         depth: depth + 1,
-        icon: icon(t.primaryKey.includes(c.name) ? "key" : "dots", 13),
         label: c.name,
         meta: c.dataType,
         pk: t.primaryKey.includes(c.name),

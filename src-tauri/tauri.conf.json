@@ -19,12 +19,14 @@
         "height": 900,
         "minWidth": 900,
         "minHeight": 600,
-        "transparent": true,
+        "transparent": false,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "windowEffects": {
-          "effects": ["underWindowBackground", "mica"],
-          "state": "active"
+        "backgroundColor": "#111114",
+        "theme": "Dark",
+        "trafficLightPosition": {
+          "x": 28,
+          "y": 34
         }
       }
     ],
@@ -34,7 +36,14 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg", "msi", "nsis", "appimage", "deb"],
+    "targets": [
+      "app",
+      "dmg",
+      "msi",
+      "nsis",
+      "appimage",
+      "deb"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -45,6 +54,8 @@
     "category": "DeveloperTool",
     "shortDescription": "Fast, lightweight database IDE",
     "longDescription": "DataTrip is a fast, lightweight database IDE for PostgreSQL, MySQL/MariaDB, SQLite and SQL Server.",
-    "macOS": { "minimumSystemVersion": "11.0" }
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
   }
 }

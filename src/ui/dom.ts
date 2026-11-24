@@ -78,6 +78,11 @@ const ICONS: Record<string, string> = {
   dots: '<circle cx="6" cy="12" r="1.2" fill="currentColor"/><circle cx="12" cy="12" r="1.2" fill="currentColor"/><circle cx="18" cy="12" r="1.2" fill="currentColor"/>',
   filter: '<path d="M4 6h16l-6 7.5V19l-4 1.5v-7z"/>',
   link: '<path d="M10 14a4 4 0 005.7 0l3-3a4 4 0 00-5.7-5.7l-1 1M14 10a4 4 0 00-5.7 0l-3 3a4 4 0 005.7 5.7l1-1"/>',
+  run: '<path d="M6 4l14 8-14 8z" fill="currentColor" stroke="none"/>',
+  caret: '<path d="M8 4.8l10.8 7.2L8 19.2z" fill="currentColor" stroke="none"/>',
+  caretDown: '<path d="M7 10l5 5 5-5"/>',
+  commit: '<circle cx="12" cy="12" r="3.6"/><path d="M3.5 12h4.9M15.6 12h4.9"/>',
+  row: '<rect x="3.5" y="8" width="17" height="8" rx="2.5"/>',
 };
 
 export function icon(name: string, size = 16): HTMLSpanElement {
