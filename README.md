@@ -2,6 +2,43 @@
 
 DataTrip is an original, fast, lightweight database IDE built with Rust and Tauri. It features a liquid-glass UI and is designed for people who want a focused tool for querying and editing data without a heavy runtime.
 
+## Installation
+
+Download the installer for your system from the [latest release](https://github.com/sepehr-dh99/data-trip/releases), or from the **Artifacts** section of the newest successful run under [Actions](https://github.com/sepehr-dh99/data-trip/actions) (sign in to GitHub to download artifacts; they come as a `.zip`).
+
+> The installers are not code-signed yet, so macOS and Windows show a warning the first time. The steps below get past it.
+
+### macOS (Apple Silicon and Intel)
+
+1. Open `DataTrip_<version>_universal.dmg` and drag **DataTrip** into **Applications**.
+2. Remove the download quarantine flag, which macOS uses to block unsigned apps:
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/DataTrip.app
+   ```
+   Alternatively, open DataTrip once, then go to **System Settings → Privacy & Security** and click **Open Anyway**.
+3. Launch DataTrip from Applications or Spotlight.
+
+### Windows 10 / 11
+
+1. Run `DataTrip_<version>_x64-setup.exe` (or the `.msi` for managed installs).
+2. If SmartScreen says "Windows protected your PC", click **More info → Run anyway**.
+
+### Linux
+
+**AppImage** (any distribution):
+```bash
+chmod +x DataTrip_<version>_amd64.AppImage
+./DataTrip_<version>_amd64.AppImage
+```
+On Ubuntu 22.04+ install FUSE 2 first if it does not start: `sudo apt install libfuse2` (Ubuntu 24.04: `libfuse2t64`).
+
+**Debian / Ubuntu package:**
+```bash
+sudo apt install ./DataTrip_<version>_amd64.deb
+```
+
+Passwords are stored in the system keychain (macOS Keychain, Windows Credential Manager, or the Secret Service on Linux, e.g. GNOME Keyring or KWallet).
+
 ## Supported databases
 
 - PostgreSQL
@@ -20,6 +57,8 @@ DataTrip is an original, fast, lightweight database IDE built with Rust and Taur
 - **Cancel** for long-running queries.
 - **History** of executed statements, searchable per connection.
 - **Export** of query results to CSV or JSON.
+- **Import from DataGrip**: paste copied data-source settings (`#DataSourceSettings#`) or pick a project's `.idea/dataSources.xml`.
+- **HashiCorp Vault authentication**: token from `~/.vault-token`, `VAULT_TOKEN` or the keychain; KV v1/v2 and dynamic database credentials.
 
 ## Keyboard shortcuts
 
