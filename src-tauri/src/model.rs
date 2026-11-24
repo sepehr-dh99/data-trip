@@ -127,6 +127,46 @@ pub struct SessionInfo {
     pub server_version: String,
     /// Default schema for unqualified names (e.g. "public", "dbo", current MySQL database, "main").
     pub default_schema: Option<String>,
+    /// Database this session is connected to (PG/MSSQL catalog, MySQL current database, SQLite "main").
+    #[serde(default)]
+    pub database: Option<String>,
+}
+
+/// A database on the server (PostgreSQL/SQL Server catalogs, MySQL databases, SQLite "main").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseNode {
+    pub name: String,
+    /// True for the database the session is connected to.
+    pub is_current: bool,
+    /// System databases (MySQL mysql/sys/information_schema/performance_schema, MSSQL master/model/msdb/tempdb).
+    #[serde(default)]
+    pub is_system: bool,
+    #[serde(default)]
+    pub size_bytes: Option<i64>,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+/// A generic group of server-level objects for the explorer's "Server objects" folder,
+/// e.g. { label: "Roles", items: [...] }, { label: "Tablespaces", items: [...] }.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectGroup {
+    pub label: String,
+    pub items: Vec<ObjectItem>,
+    /// Set when the group could not be read (e.g. permission denied); items is then empty.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectItem {
+    pub name: String,
+    /// Short secondary text, e.g. "superuser · login", "owner postgres".
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +201,8 @@ pub struct ColumnNode {
 pub enum TableKind {
     Table,
     View,
+    /// PostgreSQL materialized view.
+    Materialized,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +212,50 @@ pub struct TableNode {
     pub kind: TableKind,
     pub columns: Vec<ColumnNode>,
     pub primary_key: Vec<String>,
+    #[serde(default)]
+    pub indexes: Vec<IndexNode>,
+    #[serde(default)]
+    pub foreign_keys: Vec<ForeignKeyNode>,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexNode {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+    pub primary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForeignKeyNode {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub ref_schema: Option<String>,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RoutineKind {
+    Function,
+    Procedure,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutineNode {
+    pub name: String,
+    pub kind: RoutineKind,
+    /// Argument list as text, e.g. "(p_id integer, p_name text)".
+    #[serde(default)]
+    pub arguments: Option<String>,
+    #[serde(default)]
+    pub return_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +263,10 @@ pub struct TableNode {
 pub struct SchemaNode {
     pub name: String,
     pub tables: Vec<TableNode>,
+    #[serde(default)]
+    pub routines: Vec<RoutineNode>,
+    #[serde(default)]
+    pub sequences: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

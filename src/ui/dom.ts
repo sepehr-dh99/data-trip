@@ -82,6 +82,16 @@ const ICONS: Record<string, string> = {
   caret: '<path d="M8 4.8l10.8 7.2L8 19.2z" fill="currentColor" stroke="none"/>',
   caretDown: '<path d="M7 10l5 5 5-5"/>',
   commit: '<circle cx="12" cy="12" r="3.6"/><path d="M3.5 12h4.9M15.6 12h4.9"/>',
+  server: '<rect x="4" y="4.5" width="16" height="6" rx="2"/><rect x="4" y="13.5" width="16" height="6" rx="2"/><path d="M8 7.5h.01M8 16.5h.01"/>',
+  matview: '<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><path d="M9.6 12h4.8M12 9.6v4.8"/>',
+  func: '<path d="M15 4.8c-2.4-.9-3.8.4-4.2 2.7l-1.3 9c-.4 2.3-1.8 3.6-4.2 2.700M7 11.200h8"/>',
+  proc: '<rect x="4" y="4.5" width="16" height="15" rx="3.5"/><path d="M10.3 9.200l4.4 2.8-4.4 2.800z"/>',
+  seq: '<path d="M9.5 4L8 20M16 4l-1.5 16M4.5 9h15M4 15h15"/>',
+  column: '<path d="M12 4.5l7.5 7.5-7.5 7.5L4.5 12z"/>',
+  fk: '<path d="M4.5 12h11M11.5 7.500l4.5 4.5-4.5 4.500M19.5 5v14"/>',
+  index: '<path d="M4.5 6.500h15M4.5 12h10M4.5 17.500h6M17 14.500l3 3-3 3"/>',
+  role: '<circle cx="12" cy="8.5" r="3.5"/><path d="M5 20c0-3.6 3.1-6 7-6s7 2.4 7 6"/>',
+  tablespace: '<path d="M3.5 8.500h17v9a2 2 0 01-2 2h-13a2 2 0 01-2-2zM3.5 8.500l2-4h13l2 4M8.5 13.500h7"/>',
   row: '<rect x="3.5" y="8" width="17" height="8" rx="2.5"/>',
 };
 

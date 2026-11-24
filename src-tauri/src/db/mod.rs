@@ -3,7 +3,8 @@
 
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    ColumnMeta, ColumnNode, ConnectionConfig, Driver, EditKind, QueryResult, RowEdit, SchemaNode,
+    ColumnMeta, ColumnNode, ConnectionConfig, DatabaseNode, Driver, EditKind, ForeignKeyNode,
+    IndexNode, ObjectGroup, ObjectItem, QueryResult, RoutineKind, RoutineNode, RowEdit, SchemaNode,
     TableKind, TableNode,
 };
 use serde_json::Value;
@@ -104,6 +105,8 @@ pub struct Connected {
     pub conn: DbConn,
     pub server_version: String,
     pub default_schema: Option<String>,
+    /// Database the connection landed in (PG current_database(), MySQL DATABASE(), MSSQL DB_NAME(), SQLite "main").
+    pub database: Option<String>,
     /// Server-side connection/process id (Postgres pid, MySQL connection id).
     pub backend_id: Option<i64>,
 }
@@ -243,6 +246,34 @@ impl DbConn {
                 DbConn::Mysql(c) => mysql::introspect(c).await,
                 DbConn::Sqlite(c) => sqlite::introspect(c).await,
                 DbConn::Mssql(c) => mssql::introspect(c).await,
+            }
+        })
+    }
+
+    pub fn list_databases<'a>(
+        &'a mut self,
+    ) -> futures::future::BoxFuture<'a, AppResult<Vec<DatabaseNode>>> {
+        Box::pin(async move {
+            let mut dbs = match self {
+                DbConn::Postgres(c) => postgres::list_databases(c).await?,
+                DbConn::Mysql(c) => mysql::list_databases(c).await?,
+                DbConn::Sqlite(c) => sqlite::list_databases(c).await?,
+                DbConn::Mssql(c) => mssql::list_databases(c).await?,
+            };
+            sort_databases(&mut dbs);
+            Ok(dbs)
+        })
+    }
+
+    pub fn list_server_objects<'a>(
+        &'a mut self,
+    ) -> futures::future::BoxFuture<'a, AppResult<Vec<ObjectGroup>>> {
+        Box::pin(async move {
+            match self {
+                DbConn::Postgres(c) => postgres::list_server_objects(c).await,
+                DbConn::Mysql(c) => mysql::list_server_objects(c).await,
+                DbConn::Sqlite(_) => Ok(Vec::new()),
+                DbConn::Mssql(c) => mssql::list_server_objects(c).await,
             }
         })
     }
@@ -771,21 +802,52 @@ fn cell(r: &[Option<String>], i: usize) -> Option<String> {
     r.get(i).cloned().flatten()
 }
 
+pub type CatRow = Vec<Option<String>>;
+
+/// Optional catalog parts, merged into the schema tree by `assemble`.
+/// Missing/failed parts are simply empty.
+#[derive(Default)]
+pub struct CatalogExtras {
+    /// Schema names that must appear even when they hold no tables: [schema]
+    pub schemas: Vec<String>,
+    /// [schema, table, index, unique("1"|"0"), primary("1"|"0"), column] one row per key column, in order.
+    pub indexes: Vec<CatRow>,
+    /// [schema, table, fk name, column, ref schema, ref table, ref column] one row per column, in order.
+    pub fks: Vec<CatRow>,
+    /// [schema, table, comment]
+    pub comments: Vec<CatRow>,
+    /// [schema, name, "function"|"procedure", arguments, return type]
+    pub routines: Vec<CatRow>,
+    /// [schema, name]
+    pub sequences: Vec<CatRow>,
+}
+
+#[derive(Default)]
+struct SchemaAcc {
+    tables: BTreeMap<String, TableNode>,
+    routines: Vec<RoutineNode>,
+    sequences: Vec<String>,
+}
+
 /// Builds the schema tree from catalog rows.
-/// `col_rows`: [schema, table, kind("table"|"view"), column, data_type, nullable("1"|"0"), default, ordinal]
+/// `col_rows`: [schema, table, kind("table"|"view"|"materialized"), column, data_type, nullable("1"|"0"), default, ordinal]
 /// `pk_rows`:  [schema, table, column] ordered by key position.
 pub fn assemble(
-    col_rows: &[Vec<Option<String>>],
-    pk_rows: &[Vec<Option<String>>],
+    col_rows: &[CatRow],
+    pk_rows: &[CatRow],
+    extras: &CatalogExtras,
 ) -> Vec<SchemaNode> {
-    let mut map: BTreeMap<String, BTreeMap<String, TableNode>> = BTreeMap::new();
+    let mut map: BTreeMap<String, SchemaAcc> = BTreeMap::new();
+    for name in &extras.schemas {
+        map.entry(name.clone()).or_default();
+    }
     for r in col_rows {
         let schema = cell(r, 0).unwrap_or_default();
         let table = cell(r, 1).unwrap_or_default();
-        let kind = if cell(r, 2).as_deref() == Some("view") {
-            TableKind::View
-        } else {
-            TableKind::Table
+        let kind = match cell(r, 2).as_deref() {
+            Some("view") => TableKind::View,
+            Some("materialized") => TableKind::Materialized,
+            _ => TableKind::Table,
         };
         let col = ColumnNode {
             name: cell(r, 3).unwrap_or_default(),
@@ -793,12 +855,15 @@ pub fn assemble(
             nullable: cell(r, 5).as_deref() != Some("0"),
             default_value: cell(r, 6),
         };
-        let tables = map.entry(schema).or_default();
+        let tables = &mut map.entry(schema).or_default().tables;
         let node = tables.entry(table.clone()).or_insert_with(|| TableNode {
             name: table,
             kind,
             columns: Vec::new(),
             primary_key: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            comment: None,
         });
         node.columns.push(col);
     }
@@ -806,16 +871,135 @@ pub fn assemble(
         let schema = cell(r, 0).unwrap_or_default();
         let table = cell(r, 1).unwrap_or_default();
         let col = cell(r, 2).unwrap_or_default();
-        if let Some(tables) = map.get_mut(&schema) {
-            if let Some(t) = tables.get_mut(&table) {
-                t.primary_key.push(col);
+        if let Some(t) = map.get_mut(&schema).and_then(|a| a.tables.get_mut(&table)) {
+            t.primary_key.push(col);
+        }
+    }
+    for r in &extras.indexes {
+        let schema = cell(r, 0).unwrap_or_default();
+        let table = cell(r, 1).unwrap_or_default();
+        let name = cell(r, 2).unwrap_or_default();
+        let col = cell(r, 5).unwrap_or_else(|| "(expression)".to_string());
+        if let Some(t) = map.get_mut(&schema).and_then(|a| a.tables.get_mut(&table)) {
+            match t.indexes.last_mut() {
+                Some(ix) if ix.name == name => ix.columns.push(col),
+                _ => t.indexes.push(IndexNode {
+                    name,
+                    columns: vec![col],
+                    unique: cell(r, 3).as_deref() == Some("1"),
+                    primary: cell(r, 4).as_deref() == Some("1"),
+                }),
             }
         }
     }
+    for r in &extras.fks {
+        let schema = cell(r, 0).unwrap_or_default();
+        let table = cell(r, 1).unwrap_or_default();
+        let name = cell(r, 2).unwrap_or_default();
+        let col = cell(r, 3).unwrap_or_default();
+        let ref_col = cell(r, 6);
+        if let Some(t) = map.get_mut(&schema).and_then(|a| a.tables.get_mut(&table)) {
+            match t.foreign_keys.last_mut() {
+                Some(fk) if fk.name == name => {
+                    fk.columns.push(col);
+                    if let Some(c) = ref_col {
+                        fk.ref_columns.push(c);
+                    }
+                }
+                _ => t.foreign_keys.push(ForeignKeyNode {
+                    name,
+                    columns: vec![col],
+                    ref_schema: cell(r, 4),
+                    ref_table: cell(r, 5).unwrap_or_default(),
+                    ref_columns: ref_col.into_iter().collect(),
+                }),
+            }
+        }
+    }
+    for r in &extras.comments {
+        let schema = cell(r, 0).unwrap_or_default();
+        let table = cell(r, 1).unwrap_or_default();
+        let comment = cell(r, 2).filter(|c| !c.trim().is_empty());
+        if let Some(t) = map.get_mut(&schema).and_then(|a| a.tables.get_mut(&table)) {
+            t.comment = comment;
+        }
+    }
+    for r in &extras.routines {
+        let schema = cell(r, 0).unwrap_or_default();
+        let kind = if cell(r, 2).as_deref() == Some("procedure") {
+            RoutineKind::Procedure
+        } else {
+            RoutineKind::Function
+        };
+        map.entry(schema).or_default().routines.push(RoutineNode {
+            name: cell(r, 1).unwrap_or_default(),
+            kind,
+            arguments: cell(r, 3),
+            return_type: cell(r, 4),
+        });
+    }
+    for r in &extras.sequences {
+        let schema = cell(r, 0).unwrap_or_default();
+        map.entry(schema)
+            .or_default()
+            .sequences
+            .push(cell(r, 1).unwrap_or_default());
+    }
     map.into_iter()
-        .map(|(name, tables)| SchemaNode {
+        .map(|(name, acc)| SchemaNode {
             name,
-            tables: tables.into_values().collect(),
+            tables: acc.tables.into_values().collect(),
+            routines: acc.routines,
+            sequences: acc.sequences,
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Server-level listings
+// ---------------------------------------------------------------------------
+
+pub fn truthy(v: Option<&String>) -> bool {
+    matches!(
+        v.map(|s| s.trim().to_lowercase()).as_deref(),
+        Some("1") | Some("t") | Some("true")
+    )
+}
+
+/// Current first, then user databases A-Z, then system databases A-Z.
+pub fn sort_databases(dbs: &mut [DatabaseNode]) {
+    dbs.sort_by(|a, b| {
+        let rank = |d: &DatabaseNode| -> u8 {
+            if d.is_current {
+                0
+            } else if !d.is_system {
+                1
+            } else {
+                2
+            }
+        };
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+}
+
+/// Builds a server-object group from a query result; an error becomes the group's `error`.
+pub fn make_group(
+    label: &str,
+    res: AppResult<Vec<CatRow>>,
+    f: impl Fn(&CatRow) -> Option<ObjectItem>,
+) -> ObjectGroup {
+    match res {
+        Ok(rows) => ObjectGroup {
+            label: label.to_string(),
+            items: rows.iter().filter_map(|r| f(r)).collect(),
+            error: None,
+        },
+        Err(e) => ObjectGroup {
+            label: label.to_string(),
+            items: Vec::new(),
+            error: Some(e.message),
+        },
+    }
 }

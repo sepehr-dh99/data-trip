@@ -334,7 +334,7 @@ body.resizing-row {
 .sidebar {
   position: relative;
   flex: none;
-  width: var(--sidebar-w, 244px);
+  width: var(--sidebar-w, 288px);
   min-height: 0;
   display: flex;
   flex-direction: column;
@@ -543,8 +543,85 @@ body.resizing-col .resizer {
 .node-row:focus-within .node-actions {
   display: flex;
 }
-.node-row:hover .meta {
+.node-row.has-actions:hover .meta {
   display: none;
+}
+/* virtualized tree: rows are absolutely positioned inside a fixed-height spacer */
+.tree-inner {
+  position: relative;
+}
+.tree-inner > .node-row {
+  overflow: hidden;
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  margin: 0;
+}
+.node-row .indent + .twisty + .ico {
+  margin-right: 8px;
+}
+.node-row .ico.pk {
+  color: var(--warn-text);
+}
+.node-row.group > .ico,
+.node-row.db > .ico,
+.node-row.schema > .ico {
+  color: var(--text-2);
+}
+.node-row.group .label {
+  color: var(--text-dim);
+}
+.node-row.group .meta {
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+.node-row.db.current .label {
+  color: var(--text);
+  font-weight: 500;
+}
+.node-row .meta.mono {
+  font: 11px var(--font-mono);
+}
+.node-row.leaf .label {
+  flex: 0 1 auto;
+  min-width: 24px;
+  color: var(--text-dim);
+}
+.node-row.leaf .meta {
+  flex-shrink: 2;
+
+  min-width: 0;
+  max-width: 52%;
+  margin-left: auto;
+  padding-left: 8px;
+  text-align: right;
+}
+.node-row.note .label {
+  padding-left: 22px;
+  color: var(--text-3);
+  font-style: italic;
+  font-size: 12px;
+}
+.node-row.note.err .label {
+  color: var(--danger-text);
+}
+.node-row.note {
+  pointer-events: auto;
+}
+.badge-tag {
+  flex: none;
+  margin-left: 6px;
+  height: 16px;
+  padding: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  border-radius: 5px;
+  background: var(--fill);
+  color: var(--text-2);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
 }
 .node-error {
   margin: 0 10px 4px;
@@ -717,6 +794,29 @@ html.mac .shell.no-sidebar .cap-wrap {
   animation: pulse 0.9s ease-in-out infinite;
 }
 .tab-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tab-db {
+  flex: none;
+  max-width: 110px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-3);
+  font-weight: 400;
+  font-size: 12px;
+}
+/* database picker pill in the capsule */
+.cap-btn.dbpick {
+  gap: 6px;
+  padding: 0 10px;
+  max-width: 190px;
+}
+.cap-btn.dbpick .ico {
+  color: var(--text-2);
+}
+.dbpick-name {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2335,6 +2435,8 @@ input[type="checkbox"] {
 
 /* ================================================================== 17 menus & toasts */
 .ctx-menu {
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
   position: fixed;
   z-index: 80;
   min-width: 190px;
@@ -2520,4 +2622,25 @@ html.os-linux .overlay::before {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* ── Tree: names win over secondary text ──
+   The label keeps its natural width; the muted meta (types, sizes, args) takes what is left and
+   truncates first. Full text stays available in the row tooltip. */
+.node-row .label,
+.node-row.leaf .label,
+.node-row.column .label,
+.node-row.group .label {
+  flex: 0 1 auto;
+  min-width: 2.5em;
+}
+.node-row .meta,
+.node-row.leaf .meta,
+.node-row.column .meta,
+.node-row.group .meta {
+  flex: 1 100 auto;
+  min-width: 0;
+  max-width: none;
+  text-align: right;
+  padding-left: 8px;
 }

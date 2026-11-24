@@ -1,11 +1,11 @@
 //! SQLite driver (sqlx). Values are typed, so cells are decoded by their runtime storage class.
 
 use super::{
-    first_keyword, float_value, hex_value, int_value, is_query_like, Connected, DbConn, RowSink,
-    StreamEnd, TextRows,
+    first_keyword, float_value, hex_value, int_value, is_query_like, CatRow, CatalogExtras,
+    Connected, DbConn, RowSink, StreamEnd, TextRows,
 };
 use crate::error::{AppError, AppResult};
-use crate::model::{ColumnMeta, ConnectionConfig, SchemaNode};
+use crate::model::{ColumnMeta, ConnectionConfig, DatabaseNode, SchemaNode};
 use futures::StreamExt;
 use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
@@ -43,6 +43,7 @@ pub fn connect<'a>(
             conn: DbConn::Sqlite(conn),
             server_version,
             default_schema: Some("main".to_string()),
+            database: Some("main".to_string()),
             backend_id: None,
         })
     })
@@ -303,6 +304,96 @@ pub fn introspect<'a>(
             .into_iter()
             .map(|(t, _, c)| vec![Some("main".to_string()), Some(t), Some(c)])
             .collect();
-        Ok(super::assemble(&col_rows, &pk_rows))
+
+        let idx_sql = "SELECT m.name, il.name, CAST(il.\"unique\" AS TEXT), \
+                              CASE WHEN il.origin = 'pk' THEN '1' ELSE '0' END, ii.name \
+                       FROM sqlite_master m, pragma_index_list(m.name) il, pragma_index_info(il.name) ii \
+                       WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+                       ORDER BY m.name, il.name, ii.seqno";
+        let fk_sql = "SELECT m.name, fk.id, fk.\"from\", fk.\"table\", fk.\"to\" \
+                      FROM sqlite_master m, pragma_foreign_key_list(m.name) fk \
+                      WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
+                      ORDER BY m.name, fk.id, fk.seq";
+        // Reshape into the shared row formats.
+        let mut indexes: Vec<CatRow> = Vec::new();
+        let mut idx = TextRows::new();
+        if stream(conn, idx_sql, &mut idx).await.is_ok() {
+            for r in idx.rows {
+                let g = |i: usize| -> Option<String> { r.get(i).cloned().flatten() };
+                let unique = if g(2).as_deref() == Some("1") {
+                    "1"
+                } else {
+                    "0"
+                };
+                indexes.push(vec![
+                    Some("main".to_string()),
+                    g(0),
+                    g(1),
+                    Some(unique.to_string()),
+                    g(3),
+                    g(4),
+                ]);
+            }
+        }
+        let mut fks: Vec<CatRow> = Vec::new();
+        let mut fk = TextRows::new();
+        if stream(conn, fk_sql, &mut fk).await.is_ok() {
+            for r in fk.rows {
+                let g = |i: usize| -> Option<String> { r.get(i).cloned().flatten() };
+                let table = g(0).unwrap_or_default();
+                let name = format!("{}_fk_{}", table, g(1).unwrap_or_default());
+                fks.push(vec![
+                    Some("main".to_string()),
+                    Some(table),
+                    Some(name),
+                    g(2),
+                    Some("main".to_string()),
+                    g(3),
+                    g(4),
+                ]);
+            }
+        }
+        let extras = CatalogExtras {
+            schemas: vec!["main".to_string()],
+            indexes,
+            fks,
+            ..Default::default()
+        };
+        Ok(super::assemble(&col_rows, &pk_rows, &extras))
+    })
+}
+
+pub fn list_databases<'a>(
+    conn: &'a mut SqliteConnection,
+) -> futures::future::BoxFuture<'a, AppResult<Vec<DatabaseNode>>> {
+    Box::pin(async move {
+        let mut out = vec![DatabaseNode {
+            name: "main".to_string(),
+            is_current: true,
+            is_system: false,
+            size_bytes: None,
+            comment: None,
+        }];
+        // Attached databases (best effort); "main" and "temp" are skipped.
+        let mut sink = TextRows::new();
+        if stream(conn, "PRAGMA database_list", &mut sink)
+            .await
+            .is_ok()
+        {
+            for r in &sink.rows {
+                if let Some(name) = r.get(1).cloned().flatten() {
+                    if name != "main" && name != "temp" {
+                        out.push(DatabaseNode {
+                            name,
+                            is_current: false,
+                            is_system: false,
+                            size_bytes: None,
+                            comment: None,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(out)
     })
 }

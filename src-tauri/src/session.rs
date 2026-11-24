@@ -5,7 +5,8 @@ use crate::db::{self, DbConn};
 use crate::error::{AppError, AppResult};
 use crate::export;
 use crate::model::{
-    ConnectionConfig, Driver, ExportFormat, QueryResult, RowEdit, SchemaNode, SessionInfo,
+    ConnectionConfig, DatabaseNode, Driver, ExportFormat, ObjectGroup, QueryResult, RowEdit,
+    SchemaNode, SessionInfo,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,6 +24,8 @@ pub enum Job {
         path: String,
     },
     Introspect,
+    ListDatabases,
+    ServerObjects,
     Edits(Vec<RowEdit>),
     Simple(String),
 }
@@ -31,6 +34,8 @@ pub enum JobOut {
     Query(QueryResult),
     Count(u64),
     Schema(Vec<SchemaNode>),
+    Databases(Vec<DatabaseNode>),
+    Groups(Vec<ObjectGroup>),
     Unit,
 }
 
@@ -84,6 +89,7 @@ impl Session {
             driver: config.driver,
             server_version: connected.server_version.clone(),
             default_schema: connected.default_schema.clone(),
+            database: connected.database.clone(),
         };
         let session = Arc::new(Session {
             id: info.session_id.clone(),
@@ -195,6 +201,8 @@ impl Session {
                     Ok(JobOut::Count(n))
                 }
                 Job::Introspect => Ok(JobOut::Schema(conn.introspect().await?)),
+                Job::ListDatabases => Ok(JobOut::Databases(conn.list_databases().await?)),
+                Job::ServerObjects => Ok(JobOut::Groups(conn.list_server_objects().await?)),
                 Job::Edits(edits) => {
                     if self.config.read_only {
                         return Err(AppError::new(
@@ -258,6 +266,20 @@ impl Session {
     pub async fn introspect(self: &Arc<Self>) -> AppResult<Vec<SchemaNode>> {
         match self.run(Job::Introspect).await? {
             JobOut::Schema(s) => Ok(s),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn list_databases(self: &Arc<Self>) -> AppResult<Vec<DatabaseNode>> {
+        match self.run(Job::ListDatabases).await? {
+            JobOut::Databases(d) => Ok(d),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn list_server_objects(self: &Arc<Self>) -> AppResult<Vec<ObjectGroup>> {
+        match self.run(Job::ServerObjects).await? {
+            JobOut::Groups(g) => Ok(g),
             _ => Err(AppError::new("Unexpected result")),
         }
     }

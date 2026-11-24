@@ -10,6 +10,7 @@ import { openConnectionDialog } from "./connDialog";
 import { openImportDialog } from "./importDialog";
 import { brandMark, clear, copyText, errMsg, h, icon } from "./dom";
 import { Explorer } from "./explorer";
+import type { OpenConsoleOpts } from "./explorer";
 import { HistoryPanel } from "./history";
 import { store } from "./state";
 import { connColor } from "./sqlutil";
@@ -30,7 +31,7 @@ export class App {
   private btnAdd!: HTMLButtonElement;
   private stack = h("div", { class: "stack" });
   private empty = h("div", { class: "empty-state" });
-  private sidebarW = Number(localStorage.getItem("dt.sidebarW")) || 244;
+  private sidebarW = Number(localStorage.getItem("dt.sidebarW")) || 288;
   private selectedConn: string | null = null;
   private counts = new Map<string, number>();
   private prevStatus = new Map<string, string>();
@@ -213,6 +214,7 @@ export class App {
       this.tabEls.get(c)?.classList.toggle("running", c.isRunning);
     },
     onSchemaChanged: (id) => void store.refresh(id).catch(() => undefined),
+    onDatabase: () => this.renderTabs(),
   };
 
   private async newConsole(): Promise<void> {
@@ -228,7 +230,7 @@ export class App {
     await this.openConsole(id);
   }
 
-  private async openConsole(connId: string, opts: { sql?: string; run?: boolean; title?: string } = {}): Promise<void> {
+  private async openConsole(connId: string, opts: OpenConsoleOpts = {}): Promise<void> {
     const entry = store.conns.get(connId);
     if (!entry) return;
     if (entry.status !== "connected") {
@@ -242,7 +244,7 @@ export class App {
     const n = (this.counts.get(connId) ?? 0) + 1;
     this.counts.set(connId, n);
     const title = opts.title ?? (n === 1 ? "console" : `console ${n}`);
-    const pane = new ConsolePane(connId, title, this.host, opts.sql ?? "");
+    const pane = new ConsolePane(connId, title, this.host, opts.sql ?? "", opts.database ?? null, opts.schema ?? null);
     this.tabs.push(pane);
     this.stack.appendChild(pane.el);
     this.activate(pane);
@@ -271,6 +273,7 @@ export class App {
       const color = e ? connColor(e.config) : "var(--accent)";
       const isActive = t === this.active;
       const server = e ? `${DRIVER_LABELS[e.config.driver].split(" / ")[0]}${e.session?.serverVersion ? " " + e.session.serverVersion : ""}` : "";
+      const dbName = t.effectiveDatabase;
       const close = h(
         "button",
         { class: "tab-close", type: "button", tabindex: "-1", title: `Close (${MOD}W)`, "aria-label": `Close ${t.title}`, onclick: (ev: Event) => (ev.stopPropagation(), void this.closeTab(t)) },
@@ -283,11 +286,12 @@ export class App {
           role: "tab",
           tabindex: isActive ? "0" : "-1",
           style: `--c:${color}`,
-          title: `${t.title} — ${e?.config.name ?? ""}${server ? " (" + server + ")" : ""}`,
+          title: `${t.title} — ${e?.config.name ?? ""}${dbName ? " · " + dbName : ""}${server ? " (" + server + ")" : ""}`,
           "aria-selected": String(isActive),
         },
         h("span", { class: "tab-dot", "aria-hidden": "true" }),
         h("span", { class: "tab-title" }, t.title),
+        isActive && dbName ? h("span", { class: "tab-db" }, "· " + dbName) : null,
         close,
       );
       tab.addEventListener("click", () => {

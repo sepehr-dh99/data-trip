@@ -2,8 +2,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   ConnectionConfig,
+  DatabaseNode,
   ExportFormat,
   HistoryEntry,
+  ObjectGroup,
   QueryResult,
   RowEdit,
   SchemaNode,
@@ -32,7 +34,13 @@ export const api = {
   testConnection: (config: ConnectionConfig, password: string | null, vaultToken: string | null = null) =>
     call<ServerInfo>("test_connection", { config, password, vaultToken }),
 
-  openSession: (connectionId: string) => call<SessionInfo>("open_session", { connectionId }),
+  /** database: connect to this database instead of the connection's default (null = default). */
+  openSession: (connectionId: string, database: string | null = null) =>
+    call<SessionInfo>("open_session", { connectionId, database }),
+  /** Databases on the session's server. */
+  listDatabases: (sessionId: string) => call<DatabaseNode[]>("list_databases", { sessionId }),
+  /** Server-level objects (roles, tablespaces, users, logins…), grouped. */
+  listServerObjects: (sessionId: string) => call<ObjectGroup[]>("list_server_objects", { sessionId }),
   closeSession: (sessionId: string) => call<null>("close_session", { sessionId }),
   introspect: (sessionId: string) => call<SchemaNode[]>("introspect", { sessionId }),
 

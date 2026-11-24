@@ -57,6 +57,29 @@ export interface SessionInfo {
   driver: Driver;
   serverVersion: string;
   defaultSchema: string | null;
+  /** Database this session is connected to. */
+  database: string | null;
+}
+
+/** A database on the server (PG/MSSQL catalogs, MySQL databases, SQLite "main"). */
+export interface DatabaseNode {
+  name: string;
+  isCurrent: boolean;
+  isSystem: boolean;
+  sizeBytes: number | null;
+  comment: string | null;
+}
+
+/** Group of server-level objects shown under "Server objects" (Roles, Tablespaces, Users, Logins…). */
+export interface ObjectGroup {
+  label: string;
+  items: ObjectItem[];
+  error: string | null;
+}
+
+export interface ObjectItem {
+  name: string;
+  detail: string | null;
 }
 
 export type Cell = null | boolean | number | string;
@@ -82,18 +105,47 @@ export interface ColumnNode {
   defaultValue: string | null;
 }
 
-export type TableKind = "table" | "view";
+export type TableKind = "table" | "view" | "materialized";
 
 export interface TableNode {
   name: string;
   kind: TableKind;
   columns: ColumnNode[];
   primaryKey: string[];
+  indexes: IndexNode[];
+  foreignKeys: ForeignKeyNode[];
+  comment: string | null;
+}
+
+export interface IndexNode {
+  name: string;
+  columns: string[];
+  unique: boolean;
+  primary: boolean;
+}
+
+export interface ForeignKeyNode {
+  name: string;
+  columns: string[];
+  refSchema: string | null;
+  refTable: string;
+  refColumns: string[];
+}
+
+export type RoutineKind = "function" | "procedure";
+
+export interface RoutineNode {
+  name: string;
+  kind: RoutineKind;
+  arguments: string | null;
+  returnType: string | null;
 }
 
 export interface SchemaNode {
   name: string;
   tables: TableNode[];
+  routines: RoutineNode[];
+  sequences: string[];
 }
 
 export type EditKind = "insert" | "update" | "delete";

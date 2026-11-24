@@ -1,11 +1,13 @@
 //! SQL Server driver (tiberius over tokio TcpStream).
 
 use super::{
-    first_keyword, float_value, hex_value, int_value, Connected, DbConn, RowSink, StreamEnd,
-    TextRows,
+    first_keyword, float_value, hex_value, int_value, make_group, truthy, CatRow, CatalogExtras,
+    Connected, DbConn, RowSink, StreamEnd, TextRows,
 };
 use crate::error::AppResult;
-use crate::model::{ColumnMeta, ConnectionConfig, SchemaNode};
+use crate::model::{
+    ColumnMeta, ConnectionConfig, DatabaseNode, ObjectGroup, ObjectItem, SchemaNode,
+};
 use futures::TryStreamExt;
 use serde_json::Value;
 use tiberius::{AuthMethod, Client, ColumnData, Config, EncryptionLevel, QueryItem};
@@ -54,10 +56,12 @@ pub fn connect<'a>(
             .unwrap_or_default();
         let server_version = version.lines().next().unwrap_or("").trim().to_string();
         let default_schema = scalar(&mut client, "SELECT SCHEMA_NAME()").await?;
+        let database = scalar(&mut client, "SELECT DB_NAME()").await?;
         Ok(Connected {
             conn: DbConn::Mssql(client),
             server_version,
             default_schema,
+            database,
             backend_id: None,
         })
     })
@@ -264,6 +268,20 @@ pub fn exec_params<'a>(
     })
 }
 
+fn rows_of<'a>(
+    client: &'a mut MssqlClient,
+    sql: &'a str,
+) -> futures::future::BoxFuture<'a, AppResult<Vec<CatRow>>> {
+    Box::pin(async move {
+        let mut sink = TextRows::new();
+        stream(client, sql, &mut sink).await?;
+        Ok(sink.rows)
+    })
+}
+
+const SCHEMA_OK: &str =
+    "{s}.name NOT IN ('sys', 'INFORMATION_SCHEMA', 'guest') AND {s}.name NOT LIKE 'db[_]%'";
+
 pub fn introspect<'a>(
     client: &'a mut MssqlClient,
 ) -> futures::future::BoxFuture<'a, AppResult<Vec<SchemaNode>>> {
@@ -296,10 +314,119 @@ pub fn introspect<'a>(
               AND kcu.TABLE_NAME = tc.TABLE_NAME \
              WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' \
              ORDER BY kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.ORDINAL_POSITION";
-        let mut cols = TextRows::new();
-        stream(client, cols_sql, &mut cols).await?;
-        let mut pks = TextRows::new();
-        stream(client, pk_sql, &mut pks).await?;
-        Ok(super::assemble(&cols.rows, &pks.rows))
+        let schemas_sql = format!(
+            "SELECT s.name FROM sys.schemas s WHERE {} ORDER BY s.name",
+            SCHEMA_OK.replace("{s}", "s")
+        );
+        let idx_sql = format!(
+            "SELECT s.name, t.name, i.name, \
+                    CASE WHEN i.is_unique = 1 THEN '1' ELSE '0' END, \
+                    CASE WHEN i.is_primary_key = 1 THEN '1' ELSE '0' END, c.name \
+             FROM sys.indexes i \
+             JOIN sys.tables t ON t.object_id = i.object_id \
+             JOIN sys.schemas s ON s.schema_id = t.schema_id \
+             JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+                                      AND ic.is_included_column = 0 \
+             JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+             WHERE i.type > 0 AND i.is_hypothetical = 0 AND i.name IS NOT NULL AND {} \
+             ORDER BY s.name, t.name, i.name, ic.key_ordinal, ic.index_column_id",
+            SCHEMA_OK.replace("{s}", "s")
+        );
+        let fk_sql = format!(
+            "SELECT s.name, t.name, fk.name, pc.name, rs.name, rt.name, rc.name \
+             FROM sys.foreign_keys fk \
+             JOIN sys.tables t ON t.object_id = fk.parent_object_id \
+             JOIN sys.schemas s ON s.schema_id = t.schema_id \
+             JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id \
+             JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id \
+             JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id \
+             JOIN sys.schemas rs ON rs.schema_id = rt.schema_id \
+             JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
+             WHERE {} \
+             ORDER BY s.name, t.name, fk.name, fkc.constraint_column_id",
+            SCHEMA_OK.replace("{s}", "s")
+        );
+        // Arguments are best effort (FOR XML PATH escapes &, < and > in names).
+        let routine_sql = format!(
+            "SELECT s.name, o.name, CASE WHEN o.type = 'P' THEN 'procedure' ELSE 'function' END, \
+                    '(' + ISNULL(STUFF((SELECT ', ' + p.name + ' ' + TYPE_NAME(p.user_type_id) \
+                                        FROM sys.parameters p \
+                                        WHERE p.object_id = o.object_id AND p.parameter_id > 0 \
+                                        ORDER BY p.parameter_id FOR XML PATH('')), 1, 2, ''), '') + ')', \
+                    (SELECT TYPE_NAME(p.user_type_id) FROM sys.parameters p \
+                     WHERE p.object_id = o.object_id AND p.parameter_id = 0) \
+             FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id \
+             WHERE o.type IN ('P', 'FN', 'IF', 'TF') AND o.is_ms_shipped = 0 AND {} \
+             ORDER BY s.name, o.name",
+            SCHEMA_OK.replace("{s}", "s")
+        );
+        let seq_sql = format!(
+            "SELECT s.name, q.name FROM sys.sequences q \
+             JOIN sys.schemas s ON s.schema_id = q.schema_id \
+             WHERE {} ORDER BY s.name, q.name",
+            SCHEMA_OK.replace("{s}", "s")
+        );
+
+        let cols = rows_of(client, cols_sql).await?;
+        let pks = rows_of(client, pk_sql).await?;
+        let extras = CatalogExtras {
+            schemas: rows_of(client, &schemas_sql)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|r| r.into_iter().next().flatten())
+                .collect(),
+            indexes: rows_of(client, &idx_sql).await.unwrap_or_default(),
+            fks: rows_of(client, &fk_sql).await.unwrap_or_default(),
+            comments: Vec::new(),
+            routines: rows_of(client, &routine_sql).await.unwrap_or_default(),
+            sequences: rows_of(client, &seq_sql).await.unwrap_or_default(),
+        };
+        Ok(super::assemble(&cols, &pks, &extras))
+    })
+}
+
+pub fn list_databases<'a>(
+    client: &'a mut MssqlClient,
+) -> futures::future::BoxFuture<'a, AppResult<Vec<DatabaseNode>>> {
+    Box::pin(async move {
+        let sql = "SELECT name, CASE WHEN name = DB_NAME() THEN 1 ELSE 0 END, database_id \
+                   FROM sys.databases WHERE HAS_DBACCESS(name) = 1";
+        let rows = rows_of(client, sql).await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let name = r.first().cloned().flatten()?;
+                let id = r
+                    .get(2)
+                    .cloned()
+                    .flatten()
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .unwrap_or(i64::MAX);
+                Some(DatabaseNode {
+                    name,
+                    is_current: truthy(r.get(1).and_then(|v| v.as_ref())),
+                    is_system: id <= 4,
+                    size_bytes: None,
+                    comment: None,
+                })
+            })
+            .collect())
+    })
+}
+
+pub fn list_server_objects<'a>(
+    client: &'a mut MssqlClient,
+) -> futures::future::BoxFuture<'a, AppResult<Vec<ObjectGroup>>> {
+    Box::pin(async move {
+        let sql = "SELECT name, LOWER(type_desc) FROM sys.server_principals \
+                   WHERE type IN ('S', 'U', 'G') AND name NOT LIKE '##%' ORDER BY name";
+        let logins = rows_of(client, sql).await;
+        Ok(vec![make_group("Logins", logins, |r| {
+            Some(ObjectItem {
+                name: r.first().cloned().flatten()?,
+                detail: r.get(1).cloned().flatten(),
+            })
+        })])
     })
 }

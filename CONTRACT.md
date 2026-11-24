@@ -99,3 +99,27 @@ The frontend shows `message`.
 - DataGrip import (frontend only): parses `#DataSourceSettings#` clipboard blocks and `.idea/dataSources.xml`
   (+ optional `dataSources.local.xml` for user names) into ConnectionConfig. DataGrip `uuid` becomes the
   connection id, so re-importing updates instead of duplicating. Passwords are never imported.
+
+## v0.3 additions — server / database / schema explorer
+
+| command | args | returns |
+|---|---|---|
+| open_session | connectionId, database: string\|null | SessionInfo (now includes `database`) |
+| list_databases | sessionId | DatabaseNode[] |
+| list_server_objects | sessionId | ObjectGroup[] |
+
+- `open_session` with a database connects to that database instead of the config's default
+  (PG/MSSQL: separate connection to that catalog; MySQL: that default database; SQLite: ignored).
+- `introspect` returns only the session's database: PG/MSSQL → its non-system schemas; MySQL → exactly one
+  SchemaNode named after the current database; SQLite → "main". It now also fills tables' indexes, foreign keys
+  and comments, materialized views (PG, kind "materialized"), and per-schema routines and sequences.
+- `list_databases`: PG `pg_database` (not template, datallowconn, CONNECT privilege; size when permitted);
+  MySQL `SHOW DATABASES` (system ones flagged); MSSQL `sys.databases` with `HAS_DBACCESS = 1` (system flagged);
+  SQLite: `main`. Sorted: current first, then user databases A–Z, then system.
+- `list_server_objects`: PG → Roles (login/superuser detail), Tablespaces; MySQL → Users (`mysql.user`, may be
+  denied → group with `error`); MSSQL → Logins (`sys.server_principals` S/U/G), Databases are listed separately;
+  SQLite → []. A permission error on one group never fails the command.
+- Explorer tree (DataGrip-style): Connection → Databases (current expanded) and Server objects → Database →
+  Schemas (always shown for PG/MSSQL; MySQL/SQLite skip the schema level) → Tables / Views / Materialized views /
+  Routines / Sequences → Table → Columns / Keys / Foreign keys / Indexes. Each console is bound to
+  (connection, database).

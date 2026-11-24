@@ -49,6 +49,8 @@ pub fn run() {
             commands::open_session,
             commands::close_session,
             commands::introspect,
+            commands::list_databases,
+            commands::list_server_objects,
             commands::execute,
             commands::cancel,
             commands::set_auto_commit,

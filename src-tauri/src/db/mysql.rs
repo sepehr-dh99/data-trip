@@ -1,11 +1,13 @@
 //! MySQL / MariaDB driver (sqlx, text protocol for ad-hoc SQL).
 
 use super::{
-    first_keyword, hex_value, is_query_like, text_to_value, Connected, DbConn, RowSink, StreamEnd,
-    TextRows,
+    first_keyword, hex_value, is_query_like, make_group, text_to_value, CatRow, CatalogExtras,
+    Connected, DbConn, RowSink, StreamEnd, TextRows,
 };
 use crate::error::AppResult;
-use crate::model::{ColumnMeta, ConnectionConfig, Driver, SchemaNode};
+use crate::model::{
+    ColumnMeta, ConnectionConfig, DatabaseNode, Driver, ObjectGroup, ObjectItem, SchemaNode,
+};
 use futures::StreamExt;
 use serde_json::Value;
 use sqlx::mysql::{MySqlConnectOptions, MySqlRow, MySqlSslMode};
@@ -57,6 +59,7 @@ pub fn connect<'a>(
         Ok(Connected {
             conn: DbConn::Mysql(conn),
             server_version,
+            database: default_schema.clone(),
             default_schema,
             backend_id,
         })
@@ -253,10 +256,32 @@ pub fn exec_params<'a>(
 
 const SYSTEM_DBS: &str = "('information_schema', 'mysql', 'performance_schema', 'sys')";
 
+fn rows_of<'a>(
+    conn: &'a mut MySqlConnection,
+    sql: &'a str,
+) -> futures::future::BoxFuture<'a, AppResult<Vec<CatRow>>> {
+    Box::pin(async move {
+        let mut sink = TextRows::new();
+        stream(conn, sql, &mut sink).await?;
+        Ok(sink.rows)
+    })
+}
+
+/// Schema filter on `col`: the session's database, or every non-system database if none is selected.
+fn schema_filter(col: &str, has_db: bool) -> String {
+    if has_db {
+        format!("{} = DATABASE()", col)
+    } else {
+        format!("{} NOT IN {}", col, SYSTEM_DBS)
+    }
+}
+
 pub fn introspect<'a>(
     conn: &'a mut MySqlConnection,
 ) -> futures::future::BoxFuture<'a, AppResult<Vec<SchemaNode>>> {
     Box::pin(async move {
+        let current = scalar(conn, "SELECT DATABASE()").await?;
+        let has_db = current.is_some();
         // Everything is cast to CHAR: some MySQL 8 information_schema columns are reported as binary.
         let cols_sql = format!(
             "SELECT CAST(c.TABLE_SCHEMA AS CHAR), CAST(c.TABLE_NAME AS CHAR), \
@@ -267,21 +292,113 @@ pub fn introspect<'a>(
              FROM information_schema.COLUMNS c \
              JOIN information_schema.TABLES t \
                ON t.TABLE_SCHEMA = c.TABLE_SCHEMA AND t.TABLE_NAME = c.TABLE_NAME \
-             WHERE c.TABLE_SCHEMA NOT IN {} \
+             WHERE {} \
              ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION",
-            SYSTEM_DBS
+            schema_filter("c.TABLE_SCHEMA", has_db)
         );
         let pk_sql = format!(
             "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(COLUMN_NAME AS CHAR) \
              FROM information_schema.KEY_COLUMN_USAGE \
-             WHERE CONSTRAINT_NAME = 'PRIMARY' AND TABLE_SCHEMA NOT IN {} \
+             WHERE CONSTRAINT_NAME = 'PRIMARY' AND {} \
              ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION",
-            SYSTEM_DBS
+            schema_filter("TABLE_SCHEMA", has_db)
         );
-        let mut cols = TextRows::new();
-        stream(conn, &cols_sql, &mut cols).await?;
-        let mut pks = TextRows::new();
-        stream(conn, &pk_sql, &mut pks).await?;
-        Ok(super::assemble(&cols.rows, &pks.rows))
+        let idx_sql = format!(
+            "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(INDEX_NAME AS CHAR), \
+                    CAST(CASE WHEN NON_UNIQUE = 0 THEN '1' ELSE '0' END AS CHAR), \
+                    CAST(CASE WHEN INDEX_NAME = 'PRIMARY' THEN '1' ELSE '0' END AS CHAR), \
+                    CAST(COLUMN_NAME AS CHAR) \
+             FROM information_schema.STATISTICS \
+             WHERE {} \
+             ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
+            schema_filter("TABLE_SCHEMA", has_db)
+        );
+        let fk_sql = format!(
+            "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(CONSTRAINT_NAME AS CHAR), \
+                    CAST(COLUMN_NAME AS CHAR), CAST(REFERENCED_TABLE_SCHEMA AS CHAR), \
+                    CAST(REFERENCED_TABLE_NAME AS CHAR), CAST(REFERENCED_COLUMN_NAME AS CHAR) \
+             FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE REFERENCED_TABLE_NAME IS NOT NULL AND {} \
+             ORDER BY TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME, ORDINAL_POSITION",
+            schema_filter("TABLE_SCHEMA", has_db)
+        );
+        let comment_sql = format!(
+            "SELECT CAST(TABLE_SCHEMA AS CHAR), CAST(TABLE_NAME AS CHAR), CAST(TABLE_COMMENT AS CHAR) \
+             FROM information_schema.TABLES \
+             WHERE TABLE_COMMENT <> '' AND TABLE_COMMENT <> 'VIEW' AND {}",
+            schema_filter("TABLE_SCHEMA", has_db)
+        );
+        let routine_sql = format!(
+            "SELECT CAST(r.ROUTINE_SCHEMA AS CHAR), CAST(r.ROUTINE_NAME AS CHAR), \
+                    CAST(LOWER(r.ROUTINE_TYPE) AS CHAR), \
+                    CAST(CONCAT('(', IFNULL((SELECT GROUP_CONCAT(CONCAT_WS(' ', p.PARAMETER_MODE, p.PARAMETER_NAME, p.DTD_IDENTIFIER) \
+                                                    ORDER BY p.ORDINAL_POSITION SEPARATOR ', ') \
+                                             FROM information_schema.PARAMETERS p \
+                                             WHERE p.SPECIFIC_SCHEMA = r.ROUTINE_SCHEMA \
+                                               AND p.SPECIFIC_NAME = r.SPECIFIC_NAME \
+                                               AND p.ORDINAL_POSITION > 0), ''), ')') AS CHAR), \
+                    CAST(CASE WHEN r.ROUTINE_TYPE = 'FUNCTION' THEN r.DTD_IDENTIFIER END AS CHAR) \
+             FROM information_schema.ROUTINES r \
+             WHERE {} \
+             ORDER BY r.ROUTINE_SCHEMA, r.ROUTINE_NAME",
+            schema_filter("r.ROUTINE_SCHEMA", has_db)
+        );
+
+        let cols = rows_of(conn, &cols_sql).await?;
+        let pks = rows_of(conn, &pk_sql).await?;
+        let extras = CatalogExtras {
+            // Exactly one schema for the current database, even when it is empty.
+            schemas: current.into_iter().collect(),
+            indexes: rows_of(conn, &idx_sql).await.unwrap_or_default(),
+            fks: rows_of(conn, &fk_sql).await.unwrap_or_default(),
+            comments: rows_of(conn, &comment_sql).await.unwrap_or_default(),
+            routines: rows_of(conn, &routine_sql).await.unwrap_or_default(),
+            sequences: Vec::new(),
+        };
+        Ok(super::assemble(&cols, &pks, &extras))
+    })
+}
+
+pub fn list_databases<'a>(
+    conn: &'a mut MySqlConnection,
+) -> futures::future::BoxFuture<'a, AppResult<Vec<DatabaseNode>>> {
+    Box::pin(async move {
+        let sql = "SELECT CAST(SCHEMA_NAME AS CHAR), CAST(DATABASE() AS CHAR) \
+                   FROM information_schema.SCHEMATA";
+        let rows = rows_of(conn, sql).await?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                let name = r.first().cloned().flatten()?;
+                let current = r.get(1).cloned().flatten();
+                let is_system = matches!(
+                    name.to_lowercase().as_str(),
+                    "information_schema" | "mysql" | "performance_schema" | "sys"
+                );
+                Some(DatabaseNode {
+                    is_current: current.as_deref() == Some(name.as_str()),
+                    name,
+                    is_system,
+                    size_bytes: None,
+                    comment: None,
+                })
+            })
+            .collect())
+    })
+}
+
+pub fn list_server_objects<'a>(
+    conn: &'a mut MySqlConnection,
+) -> futures::future::BoxFuture<'a, AppResult<Vec<ObjectGroup>>> {
+    Box::pin(async move {
+        let sql =
+            "SELECT CAST(user AS CHAR), CAST(host AS CHAR) FROM mysql.user ORDER BY user, host";
+        let users = rows_of(conn, sql).await;
+        Ok(vec![make_group("Users", users, |r| {
+            Some(ObjectItem {
+                name: r.first().cloned().flatten()?,
+                detail: r.get(1).cloned().flatten(),
+            })
+        })])
     })
 }

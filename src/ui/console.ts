@@ -3,9 +3,10 @@
 // floating capsule while this console is active.
 import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
-import type { QueryResult, RowEdit, SessionInfo } from "../types";
+import type { QueryResult, RowEdit, SchemaNode, SessionInfo } from "../types";
 import { clear, errMsg, h, icon } from "./dom";
 import { DRIVER_LABELS } from "../types";
+import { confirmDialog } from "./confirm";
 import { showMenu } from "./menu";
 import { SqlEditor } from "./editor";
 import { ResultGrid } from "./grid";
@@ -30,6 +31,8 @@ export interface ConsoleHost {
   onExecuted(connId: string): void;
   onStatus(c: ConsolePane): void;
   onSchemaChanged(connId: string): void;
+  /** The console was bound to another database. */
+  onDatabase(c: ConsolePane): void;
 }
 
 interface ResultItem {
@@ -64,6 +67,8 @@ export class ConsolePane {
   private btnRunAll: HTMLButtonElement;
   private btnStop: HTMLButtonElement;
   private btnTx: HTMLButtonElement;
+  private btnDb: HTMLButtonElement;
+  private dbMenuClosedAt = 0;
   private waitEl: HTMLElement;
   private waitText: HTMLElement;
   private txMenuClosedAt = 0;
@@ -74,6 +79,10 @@ export class ConsolePane {
     title: string,
     private host: ConsoleHost,
     initialSql = "",
+    /** Database this console is bound to; null = the connection's default. */
+    public database: string | null = null,
+    /** Schema that completion defaults to (set when opened from a schema node). */
+    public schema: string | null = null,
   ) {
     this.title = title;
     const entry = store.conns.get(connId);
@@ -87,8 +96,10 @@ export class ConsolePane {
     this.btnStop.disabled = true;
     this.btnRunAll = h("button", { class: "cap-btn ghost", type: "button", title: `Run all statements (${mod}Shift+Enter)`, onclick: () => void this.runAll() }, "Run all");
     this.btnTx = h("button", { class: "cap-btn fill tx", type: "button", title: "Transaction mode", "aria-haspopup": "menu", onclick: () => this.openTxMenu() });
-    this.controls = h("div", { class: "cap-controls" }, this.btnRun, this.btnStop, this.btnRunAll, this.btnTx);
+    this.btnDb = h("button", { class: "cap-btn fill dbpick", type: "button", "aria-haspopup": "menu", onclick: () => void this.openDbMenu() });
+    this.controls = h("div", { class: "cap-controls" }, this.btnDb, this.btnRun, this.btnStop, this.btnRunAll, this.btnTx);
     this.syncTxLabel();
+    this.syncDbLabel();
     this.waitText = h("span", null, "Running…");
     this.waitEl = h("div", { class: "r-wait", role: "status" }, h("span", { class: "spinner", "aria-hidden": "true" }), this.waitText);
 
@@ -107,6 +118,7 @@ export class ConsolePane {
     this.el = h("div", { class: "console" }, this.editorWrap, splitter, results);
     this.showEmptyResults();
     this.updateSchema();
+    this.loadSchema();
   }
 
   // ---------------------------------------------------------------- public
@@ -128,11 +140,94 @@ export class ConsolePane {
     await this.runList([sql.trim().replace(/;\s*$/, "")]);
   }
 
+  /** Schemas of this console's (connection, database). */
+  private schemas(): SchemaNode[] {
+    return store.schemasFor(this.connId, this.database);
+  }
+
+  /** Effective database name: the bound one, else the connection's default. */
+  get effectiveDatabase(): string | null {
+    return this.database ?? store.conns.get(this.connId)?.defaultDb ?? null;
+  }
+
   updateSchema(): void {
     const e = store.conns.get(this.connId);
     if (!e) return;
-    const def = e.session?.defaultSchema ?? this.session?.defaultSchema ?? null;
-    this.editor.setSchema(buildCompletionSchema(e.schemas, def), e.config.driver);
+    const def = this.schema ?? store.defaultSchemaFor(this.connId, this.database) ?? this.session?.defaultSchema ?? null;
+    this.editor.setSchema(buildCompletionSchema(this.schemas(), def), e.config.driver);
+  }
+
+  /** Makes sure the database's introspection is loaded for completion. */
+  private loadSchema(): void {
+    if (this.database === null) return;
+    void store.ensureDb(this.connId, this.database).then(() => this.alive && this.updateSchema());
+  }
+
+  private syncDbLabel(): void {
+    clear(this.btnDb);
+    const name = this.effectiveDatabase;
+    this.btnDb.append(icon("database", 14), h("span", { class: "dbpick-name" }, name ?? "database"), h("span", { class: "tx-caret", "aria-hidden": "true" }, "▾"));
+    this.btnDb.title = `Database: ${name ?? "default"} — click to switch`;
+    this.btnDb.setAttribute("aria-label", `Database: ${name ?? "default"}`);
+  }
+
+  private async openDbMenu(): Promise<void> {
+    if (performance.now() - this.dbMenuClosedAt < 250) return;
+    const e = store.conns.get(this.connId);
+    if (!e || e.status !== "connected") return;
+    if (e.databases.length === 0 && e.session) {
+      try {
+        e.databases = await api.listDatabases(e.session.sessionId);
+      } catch (err) {
+        toast(errMsg(err), "error");
+        return;
+      }
+    }
+    const cur = this.effectiveDatabase;
+    const r = this.btnDb.getBoundingClientRect();
+    const item = (d: { name: string }) => ({ label: d.name, checked: d.name === cur, onClick: () => void this.switchDatabase(d.name) });
+    const user = e.databases.filter((d) => !d.isSystem);
+    const sys = e.databases.filter((d) => d.isSystem);
+    const items = [...user.map(item), ...(sys.length ? [{ sep: true }, ...sys.map(item)] : [])];
+    this.btnDb.classList.add("open");
+    showMenu(r.left, r.bottom + 8, items, {
+      minWidth: Math.max(200, r.width),
+      onClose: () => {
+        this.dbMenuClosedAt = performance.now();
+        this.btnDb.classList.remove("open");
+      },
+    });
+  }
+
+  /** Rebinds the console to another database: closes its session, the next run opens a new one. */
+  async switchDatabase(name: string): Promise<void> {
+    const e = store.conns.get(this.connId);
+    const target = name === e?.defaultDb ? null : name;
+    if (target === this.database) return;
+    if (this.running) {
+      toast("Wait for the running statement to finish first", "info");
+      return;
+    }
+    if (this.session && !this.autoCommit) {
+      const ok = await confirmDialog("Switch database?", "This console has a manual transaction open. Switching databases will roll it back.", "Switch", true);
+      if (!ok) return;
+    }
+    const old = this.session;
+    this.session = null;
+    this.sessionPromise = null;
+    if (old) {
+      if (!this.autoCommit) await api.rollback(old.sessionId).catch(() => undefined);
+      await api.closeSession(old.sessionId).catch(() => undefined);
+    }
+    this.autoCommit = true;
+    this.database = target;
+    this.schema = null;
+    this.syncTxUi();
+    this.syncDbLabel();
+    this.updateSchema();
+    this.loadSchema();
+    this.host.onDatabase(this);
+    toast(`Console now uses ${name}`, "info");
   }
 
   dropSession(): void {
@@ -161,7 +256,7 @@ export class ConsolePane {
   private ensureSession(): Promise<SessionInfo> {
     if (this.session) return Promise.resolve(this.session);
     if (!this.sessionPromise) {
-      this.sessionPromise = api.openSession(this.connId).then(
+      this.sessionPromise = api.openSession(this.connId, this.database).then(
         async (s) => {
           if (!this.alive) {
             // The tab was closed while the session was opening: don't leak it.
@@ -439,9 +534,10 @@ export class ConsolePane {
   private applyGrid(grid: ResultGrid, res: QueryResult, maxRows: number): void {
     const e = store.conns.get(this.connId);
     const def = this.session?.defaultSchema ?? e?.session?.defaultSchema ?? null;
-    const det = detectEditContext(res.statement || "", res.columns, e?.schemas ?? [], def, e?.config.readOnly === true);
+    const schemas = this.schemas();
+    const det = detectEditContext(res.statement || "", res.columns, schemas, def, e?.config.readOnly === true);
     // Prefer the statement we sent when the backend echoes nothing useful.
-    const det2 = det.ctx || !e ? det : detectEditContext(this.lastSql(grid), res.columns, e.schemas, def, e.config.readOnly === true);
+    const det2 = det.ctx || !e ? det : detectEditContext(this.lastSql(grid), res.columns, schemas, def, e.config.readOnly === true);
     grid.setResult(res, det2.ctx, det2.reason, maxRows);
     grid.setMeta(`${res.elapsedMs.toLocaleString()} ms${this.serverLabel() ? " · " + this.serverLabel() : ""}`);
   }

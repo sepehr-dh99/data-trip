@@ -2,8 +2,8 @@
 
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    AuthMethod, ConnectionConfig, ExportFormat, HistoryEntry, QueryResult, RowEdit, SchemaNode,
-    ServerInfo, SessionInfo, VaultCheck, VaultTokenSource,
+    AuthMethod, ConnectionConfig, DatabaseNode, Driver, ExportFormat, HistoryEntry, ObjectGroup,
+    QueryResult, RowEdit, SchemaNode, ServerInfo, SessionInfo, VaultCheck, VaultTokenSource,
 };
 use crate::session::Session;
 use crate::{vault, AppState};
@@ -58,8 +58,15 @@ pub async fn test_connection(
 pub async fn open_session(
     state: State<'_, AppState>,
     connection_id: String,
+    database: Option<String>,
 ) -> AppResult<SessionInfo> {
-    let config = state.store.get_connection(&connection_id).await?;
+    let mut config = state.store.get_connection(&connection_id).await?;
+    // The override lives in the session's config, so reconnects reuse it. SQLite has one file.
+    if config.driver != Driver::Sqlite {
+        if let Some(db) = database.filter(|d| !d.trim().is_empty()) {
+            config.database = Some(db);
+        }
+    }
     let (session, info) = Session::open(config, state.creds.clone()).await?;
     state.sessions.insert(session);
     Ok(info)
@@ -80,6 +87,24 @@ pub async fn introspect(
 ) -> AppResult<Vec<SchemaNode>> {
     let s = state.sessions.get(&session_id)?;
     s.introspect().await
+}
+
+#[tauri::command]
+pub async fn list_databases(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> AppResult<Vec<DatabaseNode>> {
+    let s = state.sessions.get(&session_id)?;
+    s.list_databases().await
+}
+
+#[tauri::command]
+pub async fn list_server_objects(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> AppResult<Vec<ObjectGroup>> {
+    let s = state.sessions.get(&session_id)?;
+    s.list_server_objects().await
 }
 
 #[tauri::command]
