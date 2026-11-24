@@ -9,10 +9,12 @@ import { DRIVER_LABELS } from "../types";
 import { confirmDialog } from "./confirm";
 import { showMenu } from "./menu";
 import { SqlEditor } from "./editor";
+import { kafkaNames, loadOverview } from "./kafka";
 import { ResultGrid } from "./grid";
 import { store } from "./state";
-import { buildCompletionSchema, detectEditContext } from "./sqlutil";
+import { buildCompletionSchema, detectEditContext, quoteIdent } from "./sqlutil";
 import { toast } from "./toast";
+import type { TabPane } from "./tabs";
 
 const DEFAULT_MAX_ROWS = 500;
 const MOD = /Mac/.test(navigator.userAgent) ? "⌘" : "Ctrl+";
@@ -31,8 +33,10 @@ export interface ConsoleHost {
   onExecuted(connId: string): void;
   onStatus(c: ConsolePane): void;
   onSchemaChanged(connId: string): void;
-  /** The console was bound to another database. */
+  /** The console was bound to another database / data source / schema. */
   onDatabase(c: ConsolePane): void;
+  /** Connects the data source if needed; resolves true when it is connected. */
+  ensureConnected(connId: string): Promise<boolean>;
 }
 
 interface ResultItem {
@@ -46,7 +50,8 @@ interface ResultItem {
 
 let counter = 0;
 
-export class ConsolePane {
+export class ConsolePane implements TabPane {
+  readonly kind = "console" as const;
   readonly el: HTMLElement;
   /** Run controls shown in the shell's floating capsule while this console is active. */
   readonly controls: HTMLElement;
@@ -67,15 +72,15 @@ export class ConsolePane {
   private btnRunAll: HTMLButtonElement;
   private btnStop: HTMLButtonElement;
   private btnTx: HTMLButtonElement;
-  private btnDb: HTMLButtonElement;
-  private dbMenuClosedAt = 0;
+  /** True once the user picked the schema in the navigator (PostgreSQL then also gets a search_path). */
+  private schemaExplicit = false;
   private waitEl: HTMLElement;
   private waitText: HTMLElement;
   private txMenuClosedAt = 0;
   private alive = true;
 
   constructor(
-    readonly connId: string,
+    public connId: string,
     title: string,
     private host: ConsoleHost,
     initialSql = "",
@@ -94,12 +99,11 @@ export class ConsolePane {
     this.btnRun = h("button", { class: "cap-btn run", type: "button", title: `Run selection or statement at cursor (${mod}Enter)`, onclick: () => void this.runCurrent() }, icon("run", 10), "Run");
     this.btnStop = h("button", { class: "cap-btn stop", type: "button", title: "Cancel running statement", onclick: () => void this.cancel() }, icon("stop", 13), "Cancel");
     this.btnStop.disabled = true;
-    this.btnRunAll = h("button", { class: "cap-btn ghost", type: "button", title: `Run all statements (${mod}Shift+Enter)`, onclick: () => void this.runAll() }, "Run all");
+    this.btnRunAll = h("button", { class: "cap-btn ghost icon-only", type: "button", title: `Run all statements (${mod}Shift+Enter)`, "aria-label": "Run all statements", onclick: () => void this.runAll() }, icon("playAll", 15));
     this.btnTx = h("button", { class: "cap-btn fill tx", type: "button", title: "Transaction mode", "aria-haspopup": "menu", onclick: () => this.openTxMenu() });
-    this.btnDb = h("button", { class: "cap-btn fill dbpick", type: "button", "aria-haspopup": "menu", onclick: () => void this.openDbMenu() });
-    this.controls = h("div", { class: "cap-controls" }, this.btnDb, this.btnRun, this.btnStop, this.btnRunAll, this.btnTx);
+    this.controls = h("div", { class: "cap-controls" }, this.btnRun, this.btnStop, this.btnRunAll, this.btnTx);
+    this.btnTx.hidden = driver === "redis" || driver === "kafka";
     this.syncTxLabel();
-    this.syncDbLabel();
     this.waitText = h("span", null, "Running…");
     this.waitEl = h("div", { class: "r-wait", role: "status" }, h("span", { class: "spinner", "aria-hidden": "true" }), this.waitText);
 
@@ -107,6 +111,7 @@ export class ConsolePane {
     this.editor = new SqlEditor(this.editorWrap, {
       doc: initialSql,
       driver,
+      kafkaNames: () => kafkaNames(this.connId),
       onRun: () => void this.runCurrent(),
       onRunAll: () => void this.runAll(),
     });
@@ -119,6 +124,7 @@ export class ConsolePane {
     this.showEmptyResults();
     this.updateSchema();
     this.loadSchema();
+    if (driver === "kafka") void loadOverview(connId);
   }
 
   // ---------------------------------------------------------------- public
@@ -137,7 +143,23 @@ export class ConsolePane {
   }
 
   async runSqlText(sql: string): Promise<void> {
-    await this.runList([sql.trim().replace(/;\s*$/, "")]);
+    // Redis / Kafka commands are line-based: a trailing ";" would be part of the last argument.
+    await this.runList([this.isLineBased ? sql.trim() : sql.trim().replace(/;\s*$/, "")]);
+  }
+
+  /** True while this console is bound to a Redis data source. */
+  get isRedis(): boolean {
+    return store.conns.get(this.connId)?.config.driver === "redis";
+  }
+
+  /** True while this console is bound to a Kafka data source. */
+  get isKafka(): boolean {
+    return store.conns.get(this.connId)?.config.driver === "kafka";
+  }
+
+  /** Redis and Kafka consoles run one command per line. */
+  get isLineBased(): boolean {
+    return this.isRedis || this.isKafka;
   }
 
   /** Schemas of this console's (connection, database). */
@@ -163,42 +185,6 @@ export class ConsolePane {
     void store.ensureDb(this.connId, this.database).then(() => this.alive && this.updateSchema());
   }
 
-  private syncDbLabel(): void {
-    clear(this.btnDb);
-    const name = this.effectiveDatabase;
-    this.btnDb.append(icon("database", 14), h("span", { class: "dbpick-name" }, name ?? "database"), h("span", { class: "tx-caret", "aria-hidden": "true" }, "▾"));
-    this.btnDb.title = `Database: ${name ?? "default"} — click to switch`;
-    this.btnDb.setAttribute("aria-label", `Database: ${name ?? "default"}`);
-  }
-
-  private async openDbMenu(): Promise<void> {
-    if (performance.now() - this.dbMenuClosedAt < 250) return;
-    const e = store.conns.get(this.connId);
-    if (!e || e.status !== "connected") return;
-    if (e.databases.length === 0 && e.session) {
-      try {
-        e.databases = await api.listDatabases(e.session.sessionId);
-      } catch (err) {
-        toast(errMsg(err), "error");
-        return;
-      }
-    }
-    const cur = this.effectiveDatabase;
-    const r = this.btnDb.getBoundingClientRect();
-    const item = (d: { name: string }) => ({ label: d.name, checked: d.name === cur, onClick: () => void this.switchDatabase(d.name) });
-    const user = e.databases.filter((d) => !d.isSystem);
-    const sys = e.databases.filter((d) => d.isSystem);
-    const items = [...user.map(item), ...(sys.length ? [{ sep: true }, ...sys.map(item)] : [])];
-    this.btnDb.classList.add("open");
-    showMenu(r.left, r.bottom + 8, items, {
-      minWidth: Math.max(200, r.width),
-      onClose: () => {
-        this.dbMenuClosedAt = performance.now();
-        this.btnDb.classList.remove("open");
-      },
-    });
-  }
-
   /** Rebinds the console to another database: closes its session, the next run opens a new one. */
   async switchDatabase(name: string): Promise<void> {
     const e = store.conns.get(this.connId);
@@ -222,12 +208,74 @@ export class ConsolePane {
     this.autoCommit = true;
     this.database = target;
     this.schema = null;
+    this.schemaExplicit = false;
     this.syncTxUi();
-    this.syncDbLabel();
     this.updateSchema();
     this.loadSchema();
     this.host.onDatabase(this);
     toast(`Console now uses ${name}`, "info");
+  }
+
+  /** Drops the session (rolling back a manual transaction). Caller has confirmed. */
+  private async releaseSession(): Promise<void> {
+    const old = this.session;
+    this.session = null;
+    this.sessionPromise = null;
+    if (old) {
+      if (!this.autoCommit) await api.rollback(old.sessionId).catch(() => undefined);
+      await api.closeSession(old.sessionId).catch(() => undefined);
+    }
+    this.autoCommit = true;
+  }
+
+  /** Rebinds the console to another data source (its default database). */
+  async switchConnection(connId: string): Promise<void> {
+    if (connId === this.connId) return;
+    if (this.running) {
+      toast("Wait for the running statement to finish first", "info");
+      return;
+    }
+    if (this.session && !this.autoCommit) {
+      const ok = await confirmDialog("Switch data source?", "This console has a manual transaction open. Switching data sources will roll it back.", "Switch", true);
+      if (!ok) return;
+    }
+    if (!(await this.host.ensureConnected(connId))) return;
+    await this.releaseSession();
+    this.connId = connId;
+    this.database = null;
+    this.schema = null;
+    this.schemaExplicit = false;
+    const e = store.conns.get(connId);
+    this.status.serverVersion = e?.session?.serverVersion ?? "";
+    this.syncTxUi();
+    this.updateSchema();
+    this.showEmptyIfNoResults();
+    this.host.onDatabase(this);
+    toast(`Console now uses ${e?.config.name ?? "the new data source"}`, "info");
+  }
+
+  /** Default schema as the navigator shows it. */
+  currentSchemaName(): string | null {
+    return this.schema ?? store.defaultSchemaFor(this.connId, this.database) ?? this.session?.defaultSchema ?? null;
+  }
+
+  /** Sets the schema used for completion and unqualified names (PostgreSQL: also the session search_path). */
+  async setDefaultSchema(name: string): Promise<void> {
+    this.schema = name;
+    this.schemaExplicit = true;
+    this.updateSchema();
+    this.host.onDatabase(this);
+    if (this.session && !this.running) await this.applySearchPath(this.session);
+  }
+
+  private async applySearchPath(s: SessionInfo): Promise<void> {
+    const e = store.conns.get(this.connId);
+    if (e?.config.driver !== "postgres" || !this.schemaExplicit || !this.schema) return;
+    try {
+      await api.execute(s.sessionId, `SET search_path TO ${quoteIdent("postgres", this.schema)}, public`, 1);
+    } catch (err) {
+      toast(`Could not set the schema: ${errMsg(err)}`, "error");
+    }
   }
 
   dropSession(): void {
@@ -265,6 +313,7 @@ export class ConsolePane {
           }
           this.session = s;
           this.status.serverVersion = s.serverVersion;
+          await this.applySearchPath(s);
           if (!this.autoCommit) await api.setAutoCommit(s.sessionId, false);
           this.updateSchema();
           return s;
@@ -311,6 +360,7 @@ export class ConsolePane {
   }
 
   private syncTxLabel(): void {
+    this.btnTx.hidden = this.isLineBased;
     clear(this.btnTx);
     this.btnTx.append(this.autoCommit ? "Auto" : "Manual", h("span", { class: "tx-caret", "aria-hidden": "true" }, "▾"));
     this.btnTx.classList.toggle("manual", !this.autoCommit);
@@ -397,7 +447,8 @@ export class ConsolePane {
         try {
           const res = await api.execute(sess.sessionId, sql, DEFAULT_MAX_ROWS);
           this.addResult(sql, res, DEFAULT_MAX_ROWS, i + 1, stmts.length);
-          if (/^\s*(create|alter|drop|rename)\b/i.test(sql)) schemaTouched = true;
+          if (!this.isLineBased && /^\s*(create|alter|drop|rename)\b/i.test(sql)) schemaTouched = true;
+          if (this.isKafka && /^\s*(create|delete)\s+topic\b/i.test(sql)) void loadOverview(this.connId, true);
         } catch (e) {
           this.addError(sql, errMsg(e), i + 1, stmts.length);
           toast(errMsg(e), "error");
@@ -435,14 +486,29 @@ export class ConsolePane {
   }
 
   private showEmptyResults(): void {
+    const redis = this.isLineBased;
+    const kafka = this.isKafka;
     this.bodyEl.appendChild(
       h(
         "div",
         { class: "r-empty" },
-        h("div", { class: "r-empty-title" }, "Run a statement to see results here"),
-        h("div", { class: "hint" }, h("kbd", null, MOD + "↵"), " runs the statement at the cursor  ·  ", h("kbd", null, MOD + "⇧↵"), " runs everything"),
+        h("div", { class: "r-empty-title" }, kafka ? "Run a command to see its result here" : redis ? "Run a command to see its reply here" : "Run a statement to see results here"),
+        h(
+          "div",
+          { class: "hint" },
+          h("kbd", null, MOD + "↵"),
+          redis ? " runs the line under the cursor  ·  " : " runs the statement at the cursor  ·  ",
+          h("kbd", null, MOD + "⇧↵"),
+          " runs everything",
+        ),
       ),
     );
+  }
+
+  private showEmptyIfNoResults(): void {
+    if (this.items.length > 0) return;
+    clear(this.bodyEl);
+    this.showEmptyResults();
   }
 
   private addItem(label: string, sql: string, view: HTMLElement, kind: "rows" | "ok" | "err"): ResultItem {
@@ -533,6 +599,14 @@ export class ConsolePane {
 
   private applyGrid(grid: ResultGrid, res: QueryResult, maxRows: number): void {
     const e = store.conns.get(this.connId);
+    if (e?.config.driver === "redis" || e?.config.driver === "kafka") {
+      // Redis replies / Kafka results are plain read-only tables: no edit context, no edit actions.
+      grid.setOptions({ hideReadOnlyChip: true, plainMenu: true, fillLast: true });
+      grid.setResult(res, null, e.config.driver === "kafka" ? "Kafka results are read-only" : "Redis replies are read-only", maxRows);
+      grid.setMeta(`${res.elapsedMs.toLocaleString()} ms${this.serverLabel() ? " · " + this.serverLabel() : ""}`);
+      return;
+    }
+    grid.setOptions({});
     const def = this.session?.defaultSchema ?? e?.session?.defaultSchema ?? null;
     const schemas = this.schemas();
     const det = detectEditContext(res.statement || "", res.columns, schemas, def, e?.config.readOnly === true);
@@ -563,7 +637,7 @@ export class ConsolePane {
       "div",
       { class: "r-message err", role: "alert" },
       icon("alert", 20),
-      h("div", { class: "r-message-title" }, "Statement failed"),
+      h("div", { class: "r-message-title" }, this.isLineBased ? "Command failed" : "Statement failed"),
       h("div", { class: "r-error-text" }, msg),
       sql ? h("pre", { class: "r-sql" }, sql) : null,
     );

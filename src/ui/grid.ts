@@ -23,6 +23,22 @@ export interface GridCallbacks {
   onExport(): void;
 }
 
+/** Presentation tweaks for read-only uses of the grid (Redis key viewer / console). */
+export interface GridOptions {
+  hideExport?: boolean;
+  hideReadOnlyChip?: boolean;
+  /** Context menu with the copy actions only. */
+  plainMenu?: boolean;
+  /** Stretch the last column over the free width. */
+  fillLast?: boolean;
+  /** Replaces the "N rows" text of the result pill. */
+  countLabel?: (shown: number, total: number, truncated: boolean) => string;
+  loadMoreLabel?: string;
+  loadMoreTitle?: string;
+  /** Minimum width (px) per column, by index. */
+  minWidths?: number[];
+}
+
 interface InsertRow {
   cells: Cell[];
   touched: Set<number>;
@@ -38,6 +54,9 @@ type RowEl = HTMLDivElement & { _ri?: number; _wv?: number; _cells?: HTMLDivElem
 export class ResultGrid {
   readonly el: HTMLElement;
   private cb: GridCallbacks;
+  private opts: GridOptions = {};
+  private baseWidths: number[] = [];
+  private btnExport!: HTMLButtonElement;
 
   // data
   private cols: ColumnMeta[] = [];
@@ -143,6 +162,7 @@ export class ResultGrid {
     this.roChip = h("span", { class: "pill-chip" }, "read-only");
     const btn = (label: string, fn: () => void, cls = "", title = label): HTMLButtonElement => h("button", { class: "pill-btn " + cls, type: "button", title, onclick: fn }, label);
     const btnExport = btn("Export", () => this.cb.onExport(), "", "Export result to CSV or JSON");
+    this.btnExport = btnExport;
     this.btnAdd = btn("+ Row", () => this.addRow(), "", "Add a row");
     this.pendingEl = h("span", { class: "pill-pending" });
     this.btnRevert = btn("Revert", () => this.revert(), "", "Discard pending changes");
@@ -182,7 +202,35 @@ export class ResultGrid {
     this.scroller.addEventListener("dblclick", (e) => this.onDblClick(e));
     this.scroller.addEventListener("keydown", (e) => this.onKey(e));
     this.scroller.addEventListener("contextmenu", (e) => this.onContextMenu(e));
-    new ResizeObserver(() => this.schedule()).observe(this.scroller);
+    new ResizeObserver(() => {
+      this.fitLast();
+      this.schedule();
+    }).observe(this.scroller);
+  }
+
+  /** Read-only presentation tweaks; call before setResult. */
+  setOptions(o: GridOptions): void {
+    this.opts = o;
+    this.btnExport.hidden = o.hideExport === true;
+    if (o.loadMoreLabel) this.btnLoadMore.textContent = o.loadMoreLabel;
+    this.updateBar();
+  }
+
+  /** With fillLast: the last column takes whatever width the others leave free. */
+  private fitLast(): void {
+    if (!this.opts.fillLast || this.cols.length === 0) return;
+    const last = this.cols.length - 1;
+    let others = this.rnW;
+    for (let i = 0; i < last; i++) others += this.widths[i];
+    const avail = this.scroller.clientWidth - others - 2;
+    const w = Math.max(this.baseWidths[last] ?? this.widths[last], avail);
+    if (w === this.widths[last]) return;
+    this.widths[last] = w;
+    const hc = this.headEl.children[last] as HTMLElement | undefined;
+    if (hc) hc.style.width = w + "px";
+    this.widthVersion++;
+    this.body.style.width = this.totalW() + "px";
+    this.headEl.style.width = this.totalW() - this.rnW + "px";
   }
 
   /** Timing / server text shown next to the row count, e.g. "15 ms · PostgreSQL 16.2". */
@@ -210,11 +258,13 @@ export class ResultGrid {
     this.colCls = this.cols.map((c, i) => (this.numeric[i] ? " num" : TEMPORAL_TYPE.test(c.typeName) ? " t" : ""));
     this.rnW = Math.max(RN_MIN, String(this.rows.length).length * 7 + 22);
     const keep = this.widths.length === this.cols.length && this.sortCol >= 0 ? this.sortCol : -1;
-    this.widths = this.cols.map((c, i) => this.autoWidth(c, i));
+    this.widths = this.cols.map((c, i) => Math.max(this.autoWidth(c, i), this.opts.minWidths?.[i] ?? 0));
+    this.baseWidths = [...this.widths];
     this.sortCol = keep;
     if (keep < 0) this.sortDir = 1;
     this.poolColCount = -1;
     this.buildHeader();
+    this.fitLast();
     this.rebuildOrder();
     this.scroller.scrollTop = 0;
     this.scroller.scrollLeft = 0;
@@ -396,6 +446,7 @@ export class ResultGrid {
     const startW = this.widths[i];
     const move = (ev: PointerEvent): void => {
       this.widths[i] = Math.max(48, Math.min(1200, startW + ev.clientX - startX));
+      this.baseWidths[i] = this.widths[i];
       hc.style.width = this.widths[i] + "px";
       this.widthVersion++;
       this.body.style.width = this.totalW() + "px";
@@ -729,6 +780,13 @@ export class ResultGrid {
       for (let r = s2.r0; r <= s2.r1; r++) if (this.deleted.has(this.order[r])) return true;
       return false;
     })();
+    if (this.opts.plainMenu) {
+      showMenu(e.clientX, e.clientY, [
+        { label: "Copy", icon: "copy", hint: MODK + "C", onClick: () => void this.copySelection(false) },
+        { label: "Copy with header", icon: "copy", hint: MODK + "⇧C", onClick: () => void this.copySelection(true) },
+      ]);
+      return;
+    }
     showMenu(e.clientX, e.clientY, [
       { label: "Copy", icon: "copy", hint: MODK + "C", onClick: () => void this.copySelection(false) },
       { label: "Copy with header", icon: "copy", hint: MODK + "⇧C", onClick: () => void this.copySelection(true) },
@@ -989,15 +1047,18 @@ export class ResultGrid {
   private updateBar(): void {
     const total = this.rows.length + this.inserts.length;
     const shown = this.order.length;
-    this.countEl.textContent =
-      shown === total ? `${total.toLocaleString()} row${total === 1 ? "" : "s"}` : `${shown.toLocaleString()} of ${total.toLocaleString()} rows`;
+    this.countEl.textContent = this.opts.countLabel
+      ? this.opts.countLabel(shown, total, this.truncated)
+      : shown === total
+        ? `${total.toLocaleString()} row${total === 1 ? "" : "s"}`
+        : `${shown.toLocaleString()} of ${total.toLocaleString()} rows`;
     const editable = this.editable();
     const pending = this.pendingCount();
     this.btnAdd.hidden = !editable;
-    this.roChip.hidden = editable;
+    this.roChip.hidden = editable || this.opts.hideReadOnlyChip === true;
     this.roChip.title = this.reason || "This result can't be edited";
     this.btnLoadMore.hidden = !this.truncated;
-    this.btnLoadMore.title = `Showing the first ${this.maxRows.toLocaleString()} rows — load ${(this.maxRows * 2).toLocaleString()}`;
+    this.btnLoadMore.title = this.opts.loadMoreTitle ?? `Showing the first ${this.maxRows.toLocaleString()} rows — load ${(this.maxRows * 2).toLocaleString()}`;
     this.pendGroup.hidden = !editable || pending === 0;
     this.pill.classList.toggle("has-pending", editable && pending > 0);
     this.btnSubmit.disabled = pending === 0 || this.submitting;

@@ -1,7 +1,8 @@
 // Left sidebar card: brand, filter and a lazy, virtualized DataGrip-style tree:
 // connection -> databases (+ System databases) / Server objects -> schemas -> Tables / Views /
 // Materialized views / Routines / Sequences -> table -> Columns / Keys / Foreign keys / Indexes.
-import type { DatabaseNode, ForeignKeyNode, IndexNode, RoutineNode, SchemaNode, TableNode } from "../types";
+import { api } from "../api";
+import type { DatabaseNode, ForeignKeyNode, IndexNode, RedisKey, RoutineNode, SchemaNode, TableNode } from "../types";
 import { DRIVER_LABELS } from "../types";
 import { brandMark, clear, errMsg, h, icon } from "./dom";
 import { showMenu } from "./menu";
@@ -9,12 +10,22 @@ import type { ConnEntry } from "./state";
 import { store } from "./state";
 import { connColor, qualifiedName } from "./sqlutil";
 import { toast } from "./toast";
+import { humanSize } from "./format";
+import type { Density } from "./prefs";
+import { ROW_HEIGHT, getCollapsedFolders, getDensity, pushRecent, renameCollapsedFolder, setDensity, setFolderCollapsed } from "./prefs";
+import { dbVisible, folderNames, onScopeChange, schemaVisible, scopeLabel, scopeSummary, setFolder, setFolderForMany } from "./scope";
+import { DRIVER_ABBR, openScopePicker } from "./scopePicker";
+import { promptDialog } from "./prompt";
+import { confirmDialog } from "./confirm";
+import type { TNode } from "./redis";
+import { KeyTrie, dbLabel, leafName, parseTtlInput, redisDbMeta, ttlLong, ttlShort, typeInfo } from "./redis";
+import { collate, forgetOverview, loadOverview, onOverview, overviewOf, overviewState, stateClass, stateLabel } from "./kafka";
+import { deleteTopicFlow, openCreateTopicDialog } from "./kafkaDialogs";
 
-const ROW_H = 32;
 const OVERSCAN = 8;
-/** Indent (px) per tree depth, from the spec: 0 / 16 / 30, then +14 per level. */
-const indentOf = (d: number): number => (d <= 0 ? 0 : 16 + (d - 1) * 14);
-const DRIVER_ABBR: Record<string, string> = { postgres: "PG", mysql: "MY", sqlite: "SQ", mssql: "MS" };
+/** Indent (px) per tree depth: compact = 12 per level (spec); comfortable keeps 0 / 16 / 30, then +14. */
+const indentOf = (d: number, density: Density): number => (density === "compact" ? d * 12 : d <= 0 ? 0 : 16 + (d - 1) * 14);
+const DRAG_MIME = "application/x-datatrip-conn";
 const STATUS_TEXT: Record<string, string> = { idle: "not connected", connecting: "connecting…", connected: "connected", error: "connection failed" };
 
 export interface OpenConsoleOpts {
@@ -25,6 +36,8 @@ export interface OpenConsoleOpts {
   database?: string | null;
   /** Schema to default completion to. */
   schema?: string | null;
+  /** The schema was chosen by the user (navigator): PostgreSQL consoles also get a search_path. */
+  explicitSchema?: boolean;
 }
 
 export interface ExplorerHost {
@@ -35,7 +48,38 @@ export interface ExplorerHost {
   deleteConnection(id: string): void;
   copy(text: string): void;
   onSelect(connId: string): void;
+  /** Redis: open a key in a key tab. */
+  openKey(connId: string, db: string, key: string, keyType: string): void;
+  /** Redis: keys were deleted from the explorer (open key tabs mark themselves gone). */
+  keysDeleted(connId: string, db: string, keys: string[]): void;
+  /** Redis: a key's TTL changed from the explorer (an open key tab reloads). */
+  keyTouched(connId: string, db: string, key: string): void;
+  /** Kafka: open a topic / consumer group tab. */
+  openTopic(connId: string, topic: string): void;
+  openGroup(connId: string, groupId: string): void;
+  /** Kafka: open the produce dialog for a topic. */
+  produceTo(connId: string, topic: string): void;
+  /** Kafka: a topic was deleted from the explorer (its tab closes). */
+  topicDeleted(connId: string, topic: string): void;
 }
+
+/** Per (connection, database) Redis scan state behind the namespace tree. */
+interface RedisState {
+  sid: string;
+  pattern: string;
+  trie: KeyTrie;
+  cursor: string;
+  done: boolean;
+  loading: boolean;
+  error: string | null;
+  /** Bumped on reset so late scan replies are dropped. */
+  gen: number;
+}
+
+const SCAN_COUNT = 500;
+/** A "page" of the namespace tree: scan until at least this many new keys (or the scan ends). */
+const PAGE_KEYS = 100;
+const MAX_SCAN_STEPS = 60;
 
 interface RowSpec {
   key: string;
@@ -45,7 +89,13 @@ interface RowSpec {
   badge?: HTMLElement;
   meta?: string;
   metaMono?: boolean;
+  /** Extra class on the meta text (Kafka group states). */
+  metaCls?: string;
   tag?: string;
+  /** Extra class on the tag chip (Redis key types). */
+  tagCls?: string;
+  /** A Redis database row: kept visible, and its tree unfiltered, while the explorer filter drives the SCAN pattern. */
+  redisDb?: boolean;
   expandable?: boolean;
   children?: () => RowSpec[];
   cls?: string;
@@ -56,24 +106,20 @@ interface RowSpec {
   onContext?: (e: MouseEvent) => void;
   /** Called when the user opens the row (lazy loading, default child expansion). */
   onOpen?: () => void;
+  /** Called after the row was expanded / collapsed by the user. */
+  onToggle?: (open: boolean) => void;
+  /** Right-aligned control after the meta text (the scope chip). */
+  chip?: HTMLElement;
+  /** Connection id this row can be dragged by (onto a folder row). */
+  dragConn?: string;
+  /** Folder name this row accepts dropped connections for. */
+  dropFolder?: string;
 }
 
 interface Flat {
   spec: RowSpec;
   depth: number;
   open: boolean;
-}
-
-function humanSize(n: number | null): string | undefined {
-  if (n === null || n === undefined || n < 0) return undefined;
-  const u = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0;
-  let v = n;
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${i === 0 || v >= 100 ? Math.round(v) : Number(v.toFixed(1))} ${u[i]}`;
 }
 
 export class Explorer {
@@ -85,31 +131,34 @@ export class Explorer {
   private autoOpened = new Set<string>();
   private selected = "";
   private filter = "";
+  /** The filter as typed (case kept): Redis SCAN patterns are case-sensitive. */
+  private filterRaw = "";
+  private redisSt = new Map<string, RedisState>();
+  private rescanTimer: number | undefined;
   private flat: Flat[] = [];
   private rendered = new Map<number, HTMLElement>();
   private scrollQueued = false;
+  private density: Density = getDensity();
+  private rowH = ROW_HEIGHT[getDensity()];
 
   constructor(private host: ExplorerHost) {
     this.filterInput = h("input", {
       type: "search",
-      placeholder: "Search",
-      "aria-label": "Filter connections and tables",
+      placeholder: "Filter",
+      "aria-label": "Filter data sources and tables",
       spellcheck: false,
-      oninput: () => {
-        this.filter = this.filterInput.value.trim().toLowerCase();
-        this.render();
-      },
+      oninput: () => this.applyFilter(),
       onkeydown: (e: KeyboardEvent) => {
         if (e.key === "Escape" && this.filterInput.value) {
           e.stopPropagation();
           this.filterInput.value = "";
-          this.filter = "";
-          this.render();
+          this.applyFilter();
         }
       },
     });
     this.inner = h("div", { class: "tree-inner" });
-    this.tree = h("div", { class: "tree", role: "tree", "aria-label": "Connections" }, this.inner);
+    this.tree = h("div", { class: "tree", role: "tree", tabindex: "0", "aria-label": "Connections" }, this.inner);
+    this.tree.addEventListener("keydown", (ev) => this.onTreeKey(ev));
     this.tree.addEventListener("scroll", () => {
       if (this.scrollQueued) return;
       this.scrollQueued = true;
@@ -121,33 +170,108 @@ export class Explorer {
     const addBtn = h(
       "button",
       {
-        class: "pill-btn wide side-add",
+        class: "side-plus",
         type: "button",
+        title: "New data source",
+        "aria-label": "New data source",
         "aria-haspopup": "menu",
         onclick: (ev: MouseEvent) => {
           const r = (ev.currentTarget as HTMLElement).getBoundingClientRect();
-          showMenu(r.left, r.top - 6, [
-            { label: "New connection…", icon: "plus", onClick: () => host.addConnection() },
-            { label: "Import from DataGrip…", icon: "download", onClick: () => host.importDataGrip() },
-          ], { above: true, minWidth: r.width });
+          showMenu(
+            r.right - 230,
+            r.bottom + 6,
+            [
+              { label: "New connection…", icon: "plus", onClick: () => host.addConnection() },
+              { label: "Import from DataGrip…", icon: "download", onClick: () => host.importDataGrip() },
+              { sep: true },
+              { label: "Density: Compact", checked: this.density === "compact", onClick: () => this.setDensity("compact") },
+              { label: "Density: Comfortable", checked: this.density === "comfortable", onClick: () => this.setDensity("comfortable") },
+            ],
+            { minWidth: 230 },
+          );
         },
       },
-      "+ New connection",
+      icon("plus", 14),
     );
-    // macOS draws the traffic lights over this strip (titleBarStyle Overlay); it doubles as a drag handle.
-    // Windows/Linux have native title bars: the strip is hidden by CSS there.
-    const strip = h("div", { class: "traffic-strip", "data-tauri-drag-region": "", "aria-hidden": "true" });
+    // macOS draws the traffic lights over this strip (titleBarStyle Overlay); it doubles as a drag handle and
+    // carries the logo mark. Windows/Linux have native title bars: the strip is hidden and the logo moves
+    // into the filter row.
+    const strip = h("div", { class: "traffic-strip", "data-tauri-drag-region": "" }, h("span", { class: "strip-fill", "data-tauri-drag-region": "" }), brandMark(18));
     this.el = h(
       "aside",
-      { class: "sidebar", "aria-label": "Explorer" },
+      { class: "sidebar" },
       strip,
-      h("div", { class: "brand-row", "data-tauri-drag-region": "" }, brandMark(22), h("span", { class: "brand-name", "data-tauri-drag-region": "" }, "DataTrip")),
-      h("label", { class: "side-search" }, icon("search", 13), this.filterInput),
+      h(
+        "div",
+        { class: "side-top" },
+        h("span", { class: "side-logo", "aria-hidden": "true" }, brandMark(18)),
+        h("label", { class: "side-search" }, icon("search", 12), this.filterInput),
+        addBtn,
+      ),
       this.tree,
-      h("div", { class: "side-foot" }, addBtn),
     );
+    this.el.setAttribute("aria-label", "Explorer");
+    this.applyDensity();
+    onScopeChange(() => this.render());
     store.subscribe(() => this.render());
+    onOverview(() => this.render());
     new ResizeObserver(() => this.paintWindow(false)).observe(this.tree);
+  }
+
+  private applyFilter(): void {
+    this.filterRaw = this.filterInput.value.trim();
+    this.filter = this.filterRaw.toLowerCase();
+    this.render();
+    // Redis trees are filtered by the server (SCAN MATCH): rescan the open databases once typing pauses.
+    window.clearTimeout(this.rescanTimer);
+    this.rescanTimer = window.setTimeout(() => {
+      for (const e of store.list()) {
+        if (e.config.driver !== "redis" || e.status !== "connected") continue;
+        for (const d of e.databases) if (this.expanded.has(`d:${e.config.id}:${d.name}`)) void this.loadRedis(e, d.name);
+      }
+    }, 250);
+  }
+
+  /** ↑ ↓ move the selection, → / ← expand / collapse, ↵ activates (opens a key, toggles a folder). */
+  private onTreeKey(ev: KeyboardEvent): void {
+    if (ev.target !== this.tree || ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    if (!["ArrowDown", "ArrowUp", "ArrowRight", "ArrowLeft", "Enter"].includes(ev.key)) return;
+    if (this.flat.length === 0) return;
+    ev.preventDefault();
+    let i = this.flat.findIndex((f) => f.spec.key === this.selected);
+    if (i < 0) i = 0;
+    const cur = this.flat[i];
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      const n = Math.max(0, Math.min(this.flat.length - 1, i + (ev.key === "ArrowDown" ? 1 : -1)));
+      this.selected = this.flat[n].spec.key;
+      const top = n * this.rowH;
+      if (top < this.tree.scrollTop) this.tree.scrollTop = top;
+      else if (top + this.rowH > this.tree.scrollTop + this.tree.clientHeight) this.tree.scrollTop = top + this.rowH - this.tree.clientHeight;
+      this.render();
+    } else if (ev.key === "ArrowRight") {
+      if (cur.spec.expandable && !cur.open) this.toggle(cur.spec);
+    } else if (ev.key === "ArrowLeft") {
+      if (cur.spec.expandable && cur.open) this.toggle(cur.spec);
+    } else {
+      this.selected = cur.spec.key;
+      if (cur.spec.onClick) cur.spec.onClick(new MouseEvent("click"), cur.spec);
+      else if (cur.spec.expandable) this.toggle(cur.spec);
+    }
+  }
+
+  private applyDensity(): void {
+    this.rowH = ROW_HEIGHT[this.density];
+    this.el.classList.toggle("compact", this.density === "compact");
+    this.el.classList.toggle("comfortable", this.density === "comfortable");
+    this.el.style.setProperty("--row-h", this.rowH + "px");
+  }
+
+  private setDensity(d: Density): void {
+    if (d === this.density) return;
+    this.density = d;
+    setDensity(d);
+    this.applyDensity();
+    this.render();
   }
 
   // ------------------------------------------------------------------ expansion
@@ -156,6 +280,14 @@ export class Explorer {
   expandConnection(id: string): void {
     this.expanded.add("c:" + id);
     const e = store.conns.get(id);
+    if (e?.config.driver === "kafka") {
+      void loadOverview(id);
+      for (const k of [`kf:t:${id}`, `kf:g:${id}`]) {
+        if (this.autoOpened.has(k)) continue;
+        this.autoOpened.add(k);
+        this.expanded.add(k);
+      }
+    }
     if (e?.defaultDb) this.openDatabaseDefaults(e, e.defaultDb);
     this.render();
   }
@@ -172,7 +304,11 @@ export class Explorer {
     if (!d || d.status !== "ready") return;
     this.autoOpened.add(dkey);
     this.expanded.add(dkey);
-    const schemas = d.schemas;
+    if (e.config.driver === "redis") {
+      void this.loadRedis(e, db);
+      return;
+    }
+    const schemas = d.schemas.filter((s) => schemaVisible(e, db, s.name));
     const ds = store.defaultSchemaFor(id, db === e.defaultDb ? null : db);
     const pick = (ds && schemas.find((s) => s.name === ds)?.name) ?? (schemas.find((s) => s.name === "public") ?? schemas[0])?.name;
     if (!pick) return;
@@ -182,10 +318,13 @@ export class Explorer {
 
   private toggle(spec: RowSpec): void {
     const key = spec.key;
-    if (this.expanded.has(key)) this.expanded.delete(key);
-    else {
+    if (this.expanded.has(key)) {
+      this.expanded.delete(key);
+      spec.onToggle?.(false);
+    } else {
       this.expanded.add(key);
       spec.onOpen?.();
+      spec.onToggle?.(true);
     }
     this.render();
   }
@@ -222,6 +361,8 @@ export class Explorer {
       cls: "conn " + e.status,
       title: e.status === "error" && e.error ? e.error : `${e.config.name} — ${DRIVER_LABELS[e.config.driver]}${e.session ? " " + e.session.serverVersion : ""}`,
       actions,
+      chip: connected && e.config.driver !== "sqlite" && e.config.driver !== "kafka" && scopeSummary(e).total > 0 ? this.chipEl(e) : undefined,
+      dragConn: id,
       children: () => {
         if (!connected) return e.status === "error" && e.error ? [this.note(`err:${id}`, e.error, "err")] : [];
         return this.connChildren(e);
@@ -243,8 +384,16 @@ export class Explorer {
 
   private connChildren(e: ConnEntry): RowSpec[] {
     const id = e.config.id;
+    if (e.config.driver === "kafka") return this.kafkaChildren(e);
+    if (e.config.driver === "redis") {
+      const dbs = e.databases.slice().sort((a, b) => Number(a.name) - Number(b.name));
+      const out = dbs.filter((d) => dbVisible(e, d.name)).map((d) => this.redisDbSpec(e, d));
+      if (out.length === 0) out.push(this.note(`rn:${id}`, "No databases shown — use the chip to pick some"));
+      out.push(this.serverObjectsSpec(e));
+      return out;
+    }
     const dbs = e.databases.slice().sort((a, b) => Number(b.name === e.defaultDb) - Number(a.name === e.defaultDb));
-    const user = dbs.filter((d) => !d.isSystem);
+    const user = dbs.filter((d) => !d.isSystem && dbVisible(e, d.name));
     const sys = dbs.filter((d) => d.isSystem);
     const out: RowSpec[] = user.map((d) => this.dbSpec(e, d));
     if (sys.length) {
@@ -258,15 +407,19 @@ export class Explorer {
         children: () => sys.map((d) => this.dbSpec(e, d)),
       });
     }
-    out.push({
-      key: `so:${id}`,
+    out.push(this.serverObjectsSpec(e));
+    return out;
+  }
+
+  private serverObjectsSpec(e: ConnEntry): RowSpec {
+    return {
+      key: `so:${e.config.id}`,
       label: "Server objects",
       icon: "server",
       expandable: true,
       cls: "group",
       children: () => this.serverObjectGroups(e),
-    });
-    return out;
+    };
   }
 
   private serverObjectGroups(e: ConnEntry): RowSpec[] {
@@ -322,7 +475,9 @@ export class Explorer {
         }
         if (entry.schemas.length === 0) return [this.note(`em:${key}`, "No schemas")];
         const ds = store.defaultSchemaFor(id, isDefault ? null : d.name);
-        return entry.schemas.map((s) => this.schemaSpec(e, d.name, s, s.name === ds));
+        const shown = entry.schemas.filter((s) => schemaVisible(e, d.name, s.name));
+        if (shown.length === 0) return [this.note(`hs:${key}`, "All schemas are hidden (see visible databases)")];
+        return shown.map((s) => this.schemaSpec(e, d.name, s, s.name === ds));
       },
       onContext: (ev) =>
         showMenu(ev.clientX, ev.clientY, [
@@ -407,7 +562,10 @@ export class Explorer {
     const key = `t:${id}:${db}:${s.name}:${t.name}`;
     const q = qualifiedName(e.config.driver, s.name, t.name);
     const consoleDb = db === e.defaultDb ? null : db;
-    const openData = (): void => this.host.openConsole(id, { sql: `SELECT * FROM ${q} `, run: true, title: t.name, database: consoleDb, schema: s.name });
+    const openData = (): void => {
+      pushRecent(id, { db, schema: s.name, name: t.name, kind: t.kind });
+      this.host.openConsole(id, { sql: `SELECT * FROM ${q} `, run: true, title: t.name, database: consoleDb, schema: s.name });
+    };
     const colsKey = `${key}:cols`;
     const fkLabel = (fk: ForeignKeyNode): string => `→ ${fk.refSchema && fk.refSchema !== s.name ? fk.refSchema + "." : ""}${fk.refTable}(${fk.refColumns.join(", ")})`;
     const ixTag = (ix: IndexNode): string | undefined => (ix.primary ? "PK" : ix.unique ? "unique" : undefined);
@@ -497,15 +655,382 @@ export class Explorer {
     };
   }
 
+  // ------------------------------------------------------------------ redis
+
+  private rkey(id: string, db: string): string {
+    return `${id}\u0000${db}`;
+  }
+
+  private redisPattern(): string {
+    return this.filterRaw ? `*${this.filterRaw}*` : "*";
+  }
+
+  private redisDbSpec(e: ConnEntry, d: DatabaseNode): RowSpec {
+    const id = e.config.id;
+    const key = `d:${id}:${d.name}`;
+    const isDefault = d.name === e.defaultDb;
+    const consoleDb = isDefault ? null : d.name;
+    const meta = redisDbMeta(d);
+    return {
+      key,
+      label: dbLabel(d.name),
+      icon: "database",
+      meta: meta || undefined,
+      expandable: true,
+      redisDb: true,
+      cls: "db rdb" + (isDefault ? " current" : "") + (meta === "empty" ? " empty" : ""),
+      title: `${dbLabel(d.name)}${d.comment ? " — " + d.comment : ""}${isDefault ? " (current)" : ""}`,
+      onOpen: () => void this.loadRedis(e, d.name),
+      children: () => this.redisDbChildren(e, d.name),
+      onContext: (ev) =>
+        showMenu(ev.clientX, ev.clientY, [
+          { label: "New console here", icon: "terminal", onClick: () => this.host.openConsole(id, { database: consoleDb }) },
+          { label: "Refresh keys", icon: "refresh", onClick: () => void this.loadRedis(e, d.name, true) },
+          { sep: true },
+          { label: "Copy name", icon: "copy", onClick: () => this.host.copy(dbLabel(d.name)) },
+        ]),
+    };
+  }
+
+  /** Opens the database's session and runs the first SCAN step (or restarts it when the filter changed). */
+  async loadRedis(e: ConnEntry, db: string, fresh = false): Promise<void> {
+    const id = e.config.id;
+    const k = this.rkey(id, db);
+    await store.ensureDb(id, db);
+    const entry = e.dbs.get(db);
+    const sid = entry?.session?.sessionId;
+    const prev = this.redisSt.get(k);
+    if (!sid) {
+      this.redisSt.set(k, { sid: "", pattern: "*", trie: new KeyTrie(), cursor: "0", done: true, loading: false, error: entry?.error ?? "Could not open the database", gen: (prev?.gen ?? 0) + 1 });
+      this.render();
+      return;
+    }
+    const pattern = this.redisPattern();
+    if (prev && !fresh && prev.sid === sid && prev.pattern === pattern && !prev.error) return;
+    this.redisSt.set(k, { sid, pattern, trie: new KeyTrie(), cursor: "0", done: false, loading: false, error: null, gen: (prev?.gen ?? 0) + 1 });
+    await this.scanMore(e, db);
+  }
+
+  private async scanMore(e: ConnEntry, db: string): Promise<void> {
+    const k = this.rkey(e.config.id, db);
+    const st = this.redisSt.get(k);
+    if (!st || st.loading || st.done || !st.sid) return;
+    st.loading = true;
+    st.error = null;
+    const gen = st.gen;
+    this.render();
+    try {
+      // One "page" keeps scanning until it found a useful number of new keys: SCAN MATCH can return empty
+      // steps while the cursor is still moving.
+      let fresh = 0;
+      for (let step = 0; step < MAX_SCAN_STEPS && !st.done && fresh < PAGE_KEYS; step++) {
+        const r = await api.redisScan(st.sid, st.pattern, st.cursor, SCAN_COUNT, null);
+        if (st.gen !== gen || this.redisSt.get(k) !== st) return;
+        fresh += st.trie.add(r.keys);
+        st.cursor = r.cursor;
+        st.done = r.done;
+        if (this.filterRaw) {
+          // A server-side filter leaves few keys: open the small namespaces so the matches are visible.
+          for (const f of st.trie.folders(st.trie.root, 3, 30)) this.expanded.add(`rf:${e.config.id}:${db}:${f.path}`);
+        }
+        if (!st.done && fresh < PAGE_KEYS) this.render();
+      }
+    } catch (err) {
+      if (st.gen !== gen || this.redisSt.get(k) !== st) return;
+      st.error = errMsg(err);
+    } finally {
+      if (st.gen === gen) st.loading = false;
+      this.render();
+    }
+  }
+
+  private redisDbChildren(e: ConnEntry, db: string): RowSpec[] {
+    const id = e.config.id;
+    const k = this.rkey(id, db);
+    const entry = e.dbs.get(db);
+    if (entry?.status === "error") return [this.note(`er:${k}`, entry.error ?? "Could not open database", "err")];
+    const st = this.redisSt.get(k);
+    if (!st) return [this.note(`ld:${k}`, "Scanning…")];
+    if (st.trie.size === 0) {
+      if (st.error) return [this.note(`se:${k}`, st.error, "err")];
+      if (st.loading || !st.done) return [this.note(`ld:${k}`, "Scanning…")];
+      return [this.note(`em:${k}`, this.filterRaw ? `No keys match “${this.filterRaw}”` : "No keys")];
+    }
+    const out = this.redisNodeRows(e, db, st, st.trie.root);
+    if (st.error) out.push(this.note(`se:${k}`, st.error, "err"));
+    if (st.loading) out.push(this.note(`ld:${k}`, "Scanning…"));
+    else if (!st.done) {
+      out.push({
+        key: `rm:${k}`,
+        label: "Load more…",
+        cls: "note more",
+        meta: `${st.trie.size.toLocaleString()} loaded`,
+        title: "Scan the next batch of keys",
+        onClick: () => void this.scanMore(e, db),
+      });
+    }
+    return out;
+  }
+
+  private redisNodeRows(e: ConnEntry, db: string, st: RedisState, n: TNode): RowSpec[] {
+    const { folders, leaves } = st.trie.childrenOf(n);
+    const out: RowSpec[] = [];
+    for (const f of folders) out.push(this.redisFolderSpec(e, db, st, f));
+    for (const k of leaves) out.push(this.redisKeySpec(e, db, st, k));
+    return out;
+  }
+
+  private redisFolderSpec(e: ConnEntry, db: string, st: RedisState, f: TNode): RowSpec {
+    const id = e.config.id;
+    const ro = e.config.readOnly === true;
+    return {
+      key: `rf:${id}:${db}:${f.path}`,
+      label: f.name || "(empty)",
+      icon: "folder",
+      meta: f.count.toLocaleString(),
+      expandable: true,
+      cls: "group rfolder",
+      title: `${f.path}* — ${f.count.toLocaleString()} loaded key${f.count === 1 ? "" : "s"}`,
+      children: () => this.redisNodeRows(e, db, st, f),
+      onContext: (ev) =>
+        showMenu(ev.clientX, ev.clientY, [
+          { label: "Copy pattern", icon: "copy", hint: `${f.path}*`, onClick: () => this.host.copy(`${f.path}*`) },
+          { sep: true },
+          { label: "Delete all keys under…", icon: "trash", danger: true, disabled: ro, onClick: () => void this.deleteNamespace(e, db, st, f) },
+        ]),
+    };
+  }
+
+  private redisKeySpec(e: ConnEntry, db: string, st: RedisState, k: RedisKey): RowSpec {
+    const id = e.config.id;
+    const t = typeInfo(k.keyType);
+    const ttl = ttlShort(k.ttl);
+    const ro = e.config.readOnly === true;
+    return {
+      key: `rk:${id}:${db}:${k.key}`,
+      label: leafName(k.key) || "(empty)",
+      icon: "key",
+      tag: t.chip,
+      tagCls: t.cls,
+      meta: ttl || undefined,
+      cls: "leaf rkey",
+      title: `${k.key} — ${t.label}${k.ttl !== null ? ` · expires in ${ttlLong(k.ttl)}` : ""}`,
+      onClick: () => this.host.openKey(id, db, k.key, k.keyType),
+      onContext: (ev) =>
+        showMenu(ev.clientX, ev.clientY, [
+          { label: "Open", icon: "view", hint: "↵", onClick: () => this.host.openKey(id, db, k.key, k.keyType) },
+          { label: "Copy key", icon: "copy", onClick: () => this.host.copy(k.key) },
+          { sep: true },
+          { label: "Set TTL…", icon: "clock", disabled: ro, onClick: () => void this.setKeyTtl(e, db, st, k) },
+          { label: "Delete…", icon: "trash", danger: true, disabled: ro, onClick: () => void this.deleteKey(e, db, st, k) },
+        ]),
+    };
+  }
+
+  private async setKeyTtl(e: ConnEntry, db: string, st: RedisState, k: RedisKey): Promise<void> {
+    const text = await promptDialog("Set TTL", "Time to live", k.ttl !== null ? String(Math.round(k.ttl)) : "", "Set TTL", [], {
+      icon: "clock",
+      hint: "Seconds, or 5m / 2h / 1d. Type “persist” to remove the expiry.",
+      validate: (v) => (parseTtlInput(v) === undefined ? "Not a valid TTL — try 90, 5m, 2h, 1d or persist." : null),
+    });
+    if (text === null) return;
+    const ttl = parseTtlInput(text);
+    if (ttl === undefined) return;
+    try {
+      await api.redisSetTtl(st.sid, k.key, ttl);
+      k.ttl = ttl;
+      this.render();
+      this.host.keyTouched(e.config.id, db, k.key);
+      toast(ttl === null ? "Expiry removed" : `TTL set to ${ttlLong(ttl)}`, "ok");
+    } catch (err) {
+      toast(errMsg(err), "error");
+    }
+  }
+
+  private async deleteKey(e: ConnEntry, db: string, st: RedisState, k: RedisKey): Promise<void> {
+    const ok = await confirmDialog("Delete key?", `“${k.key}” will be removed from ${dbLabel(db)}. This can't be undone.`, "Delete", true);
+    if (!ok) return;
+    try {
+      const n = await api.redisDelete(st.sid, [k.key]);
+      st.trie.remove([k.key]);
+      this.render();
+      this.host.keysDeleted(e.config.id, db, [k.key]);
+      toast(n > 0 ? "Key deleted" : "Key was already gone", n > 0 ? "ok" : "info");
+    } catch (err) {
+      toast(errMsg(err), "error");
+    }
+  }
+
+  private async deleteNamespace(e: ConnEntry, db: string, st: RedisState, f: TNode): Promise<void> {
+    const keys = st.trie.collect(f);
+    if (keys.length === 0) return;
+    const partial = st.done ? "" : " The scan has not finished, so the server may hold more keys with this prefix; they are not touched.";
+    const ok = await confirmDialog(
+      "Delete keys?",
+      `Delete the ${keys.length.toLocaleString()} loaded key${keys.length === 1 ? "" : "s"} under “${f.path}*” from ${dbLabel(db)}? Only keys already loaded in this tree are deleted.${partial} This can't be undone.`,
+      `Delete ${keys.length.toLocaleString()} key${keys.length === 1 ? "" : "s"}`,
+      true,
+    );
+    if (!ok) return;
+    try {
+      let removed = 0;
+      for (let i = 0; i < keys.length; i += 500) removed += await api.redisDelete(st.sid, keys.slice(i, i + 500));
+      st.trie.remove(keys);
+      this.render();
+      this.host.keysDeleted(e.config.id, db, keys);
+      toast(`Deleted ${removed.toLocaleString()} key${removed === 1 ? "" : "s"}`, "ok");
+    } catch (err) {
+      toast(`Delete failed: ${errMsg(err)}`, "error");
+      void this.loadRedis(e, db, true);
+    }
+  }
+
+  /** A key was deleted elsewhere (key tab): drop it from the loaded tree. */
+  redisKeysRemoved(connId: string, db: string, keys: string[]): void {
+    const st = this.redisSt.get(this.rkey(connId, db));
+    if (!st) return;
+    st.trie.remove(keys);
+    this.render();
+  }
+
+  /** A key's TTL changed elsewhere (key tab). */
+  redisTtlChanged(connId: string, db: string, key: string, ttl: number | null): void {
+    const k = this.redisSt.get(this.rkey(connId, db))?.trie.get(key);
+    if (!k) return;
+    k.ttl = ttl;
+    this.render();
+  }
+
+  private forgetRedis(id: string): void {
+    for (const k of [...this.redisSt.keys()]) if (k.startsWith(id + "\u0000")) this.redisSt.delete(k);
+  }
+
+  // ------------------------------------------------------------------ kafka
+
+  private kafkaChildren(e: ConnEntry): RowSpec[] {
+    const id = e.config.id;
+    const o = overviewOf(id);
+    if (!o) {
+      const st = overviewState(id);
+      return [st.error ? this.note(`kf:err:${id}`, st.error, "err") : this.note(`kf:ld:${id}`, "Loading…")];
+    }
+    const ro = e.config.readOnly === true;
+    const topics = o.topics.slice().sort((a, b) => collate(a.name, b.name));
+    const groups = o.groups.slice().sort((a, b) => collate(a.groupId, b.groupId));
+    const topicRows = (): RowSpec[] =>
+      topics.length === 0
+        ? [this.note(`kf:t0:${id}`, "No topics")]
+        : topics.map((t) => ({
+            key: `kf:tp:${id}:${t.name}`,
+            label: t.name,
+            icon: "topic",
+            meta: `${t.partitions}p`,
+            cls: "leaf ktopic" + (t.internal ? " internal" : ""),
+            title: `${t.name} — ${t.partitions} partition${t.partitions === 1 ? "" : "s"} · RF ${t.replicationFactor}${t.internal ? " · internal" : ""}`,
+            onClick: () => this.host.openTopic(id, t.name),
+            onContext: (ev) =>
+              showMenu(ev.clientX, ev.clientY, [
+                { label: "Open", icon: "view", hint: "↵", onClick: () => this.host.openTopic(id, t.name) },
+                { label: "Produce message…", icon: "send", disabled: ro, onClick: () => this.host.produceTo(id, t.name) },
+                { label: "Copy name", icon: "copy", onClick: () => this.host.copy(t.name) },
+                { sep: true },
+                { label: "Delete topic…", icon: "trash", danger: true, disabled: ro, onClick: () => void this.deleteTopic(id, t.name) },
+              ]),
+          }));
+    const groupRows = (): RowSpec[] =>
+      groups.length === 0
+        ? [this.note(`kf:g0:${id}`, "No consumer groups")]
+        : groups.map((g) => ({
+            key: `kf:gp:${id}:${g.groupId}`,
+            label: g.groupId,
+            icon: "group",
+            meta: stateLabel(g.state),
+            metaCls: stateClass(g.state),
+            cls: "leaf kgroup",
+            title: `${g.groupId} — ${stateLabel(g.state)} · ${g.members} member${g.members === 1 ? "" : "s"}`,
+            onClick: () => this.host.openGroup(id, g.groupId),
+            onContext: (ev) =>
+              showMenu(ev.clientX, ev.clientY, [
+                { label: "Open", icon: "view", hint: "↵", onClick: () => this.host.openGroup(id, g.groupId) },
+                { label: "Copy id", icon: "copy", onClick: () => this.host.copy(g.groupId) },
+              ]),
+          }));
+    const brokerRows = (): RowSpec[] =>
+      o.brokers.map((b) => ({
+        key: `kf:br:${id}:${b.id}`,
+        label: `${b.id} · ${b.host}:${b.port}`,
+        icon: "server",
+        meta: b.isController ? "controller" : undefined,
+        cls: "leaf kbroker",
+        title: `Broker ${b.id} — ${b.host}:${b.port}${b.isController ? " (controller)" : ""}`,
+      }));
+    return [
+      {
+        key: `kf:t:${id}`,
+        label: "Topics",
+        icon: "topic",
+        meta: String(topics.length),
+        expandable: true,
+        cls: "group",
+        children: topicRows,
+        onContext: (ev) =>
+          showMenu(ev.clientX, ev.clientY, [
+            { label: "Create topic…", icon: "plus", disabled: ro, onClick: () => void this.createTopic(id) },
+            { label: "Refresh", icon: "refresh", onClick: () => void loadOverview(id, true) },
+          ]),
+      },
+      { key: `kf:g:${id}`, label: "Consumer groups", icon: "group", meta: String(groups.length), expandable: true, cls: "group", children: groupRows },
+      { key: `kf:b:${id}`, label: "Brokers", icon: "server", meta: String(o.brokers.length), expandable: true, cls: "group", children: brokerRows },
+    ];
+  }
+
+  private async createTopic(id: string): Promise<void> {
+    const name = await openCreateTopicDialog(id);
+    if (name) this.host.openTopic(id, name);
+  }
+
+  private async deleteTopic(id: string, topic: string): Promise<void> {
+    if (await deleteTopicFlow(id, topic)) this.host.topicDeleted(id, topic);
+  }
+
   // ------------------------------------------------------------------ flattening
 
   private flatten(): Flat[] {
     const out: Flat[] = [];
-    const f = this.filter;
     const entries = store.list();
+    const collapsed = getCollapsedFolders();
+    const folders = new Map<string, ConnEntry[]>();
+    const loose: ConnEntry[] = [];
     for (const e of entries) {
-      const spec = this.connSpec(e);
-      if (!f) this.walk(spec, 0, out);
+      const f = e.config.folder?.trim();
+      if (f) {
+        const list = folders.get(f);
+        if (list) list.push(e);
+        else folders.set(f, [e]);
+      } else loose.push(e);
+    }
+    const top: RowSpec[] = [];
+    for (const [name, list] of folders) {
+      const key = "fo:" + name;
+      if (collapsed.has(name)) this.expanded.delete(key);
+      else this.expanded.add(key);
+      top.push({
+        key,
+        label: name,
+        icon: "folder",
+        meta: String(list.length),
+        expandable: true,
+        cls: "folder",
+        title: `${name} — ${list.length} data source${list.length === 1 ? "" : "s"}`,
+        children: () => list.map((e) => this.connSpec(e)),
+        onToggle: (open) => setFolderCollapsed(name, !open),
+        onContext: (ev) => this.folderMenu(ev, name, list),
+        dropFolder: name,
+      });
+    }
+    for (const e of loose) top.push(this.connSpec(e));
+    for (const spec of top) {
+      if (!this.filter) this.walk(spec, 0, out);
       else this.walkFiltered(spec, 0, out);
     }
     return out;
@@ -519,6 +1044,12 @@ export class Explorer {
 
   /** Keeps a node when it or any loaded descendant matches; matching branches auto-expand. */
   private walkFiltered(spec: RowSpec, depth: number, out: Flat[]): boolean {
+    if (spec.redisDb && this.expanded.has(spec.key) && spec.children) {
+      // The server already filtered this tree (SCAN MATCH): show it as loaded.
+      out.push({ spec, depth, open: true });
+      for (const c of spec.children()) this.walk(c, depth + 1, out);
+      return true;
+    }
     const self = spec.label.toLowerCase().includes(this.filter);
     const kids: Flat[] = [];
     if (spec.expandable && spec.children) for (const c of spec.children()) this.walkFiltered(c, depth + 1, kids);
@@ -548,13 +1079,13 @@ export class Explorer {
           "div",
           { class: "side-empty" },
           h("div", { class: "side-empty-title" }, "No connections yet"),
-          h("div", { class: "side-empty-text" }, "Add a PostgreSQL, MySQL, SQLite or SQL Server database to start exploring."),
+          h("div", { class: "side-empty-text" }, "Add a PostgreSQL, MySQL, SQLite, SQL Server, Redis or Kafka data source to start exploring."),
           h("button", { class: "linkbtn", type: "button", onclick: () => this.host.importDataGrip() }, "Import from DataGrip…"),
         ),
       );
       return;
     }
-    this.inner.style.height = n * ROW_H + "px";
+    this.inner.style.height = n * this.rowH + "px";
     this.paintWindow(true);
   }
 
@@ -573,8 +1104,8 @@ export class Explorer {
     if (n === 0) return;
     const top = this.tree.scrollTop;
     const vh = this.tree.clientHeight || 600;
-    const start = Math.max(0, Math.floor(top / ROW_H) - OVERSCAN);
-    const end = Math.min(n, Math.ceil((top + vh) / ROW_H) + OVERSCAN);
+    const start = Math.max(0, Math.floor(top / this.rowH) - OVERSCAN);
+    const end = Math.min(n, Math.ceil((top + vh) / this.rowH) + OVERSCAN);
     for (const [i, el] of this.rendered) {
       if (i < start || i >= end) {
         el.remove();
@@ -592,10 +1123,11 @@ export class Explorer {
   private rowEl(fr: Flat, idx: number): HTMLElement {
     const s = fr.spec;
     const expandable = !!s.expandable;
-    const caret = h("span", { class: "twisty" + (expandable ? (fr.open ? " open" : "") : " none"), "aria-hidden": "true" }, expandable ? icon("caret", 10) : null);
+    const compact = this.density === "compact";
+    const caret = h("span", { class: "twisty" + (expandable ? (fr.open ? " open" : "") : " none"), "aria-hidden": "true" }, expandable ? icon("caret", compact ? 8 : 10) : null);
     let lead: HTMLElement | null = s.badge ?? null;
     if (!lead && s.icon) {
-      lead = icon(s.icon, 15);
+      lead = icon(s.icon, compact ? 13 : 15);
       if (s.iconCls) lead.classList.add(s.iconCls);
     }
     const r = h(
@@ -607,16 +1139,44 @@ export class Explorer {
         "aria-expanded": expandable ? String(fr.open) : undefined,
         "aria-selected": this.selected === s.key ? "true" : undefined,
         title: s.title ?? (s.meta ? `${s.label} — ${s.meta}` : s.label),
-        style: `top:${idx * ROW_H}px`,
+        style: `top:${idx * this.rowH}px`,
       },
-      h("span", { class: "indent", style: `width:${indentOf(fr.depth)}px` }),
+      h("span", { class: "indent", style: `width:${indentOf(fr.depth, this.density)}px` }),
       caret,
       lead,
       h("span", { class: "label" }, s.label),
-      s.tag ? h("span", { class: "badge-tag" }, s.tag) : null,
-      s.meta ? h("span", { class: "meta" + (s.metaMono ? " mono" : "") }, s.meta) : null,
+      s.tag ? h("span", { class: "badge-tag" + (s.tagCls ? " " + s.tagCls : "") }, s.tag) : null,
+      s.meta ? h("span", { class: "meta" + (s.metaMono ? " mono" : "") + (s.metaCls ? " " + s.metaCls : "") }, s.meta) : null,
       s.actions && s.actions.length ? h("span", { class: "node-actions" }, s.actions) : null,
+      s.chip ?? null,
     );
+    if (s.dragConn) {
+      const cid = s.dragConn;
+      r.draggable = true;
+      r.addEventListener("dragstart", (ev) => {
+        ev.dataTransfer?.setData(DRAG_MIME, cid);
+        ev.dataTransfer?.setData("text/plain", store.conns.get(cid)?.config.name ?? cid);
+        if (ev.dataTransfer) ev.dataTransfer.effectAllowed = "move";
+      });
+    }
+    if (s.dropFolder !== undefined) {
+      const folder = s.dropFolder;
+      const accepts = (ev: DragEvent): boolean => ev.dataTransfer?.types.includes(DRAG_MIME) === true;
+      r.addEventListener("dragover", (ev) => {
+        if (!accepts(ev)) return;
+        ev.preventDefault();
+        if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
+        r.classList.add("drop-target");
+      });
+      r.addEventListener("dragleave", () => r.classList.remove("drop-target"));
+      r.addEventListener("drop", (ev) => {
+        r.classList.remove("drop-target");
+        const cid = ev.dataTransfer?.getData(DRAG_MIME);
+        if (!cid) return;
+        ev.preventDefault();
+        void setFolder(cid, folder);
+      });
+    }
     r.addEventListener("click", (e) => {
       this.selected = s.key;
       if (s.onClick) s.onClick(e, s);
@@ -648,9 +1208,78 @@ export class Explorer {
       { label: "Refresh", icon: "refresh", disabled: !connected, onClick: () => void this.refresh(id) },
       { sep: true },
       { label: "Edit…", icon: "pencil", onClick: () => this.host.editConnection(id) },
+      { label: "Move to folder", icon: "folder", hint: "▸", onClick: () => this.moveMenu(ev.clientX, ev.clientY, e) },
       { label: "Copy name", icon: "copy", onClick: () => this.host.copy(e.config.name) },
       { sep: true },
       { label: "Delete", icon: "trash", danger: true, onClick: () => this.host.deleteConnection(id) },
+    ]);
+  }
+
+  /** The "N of M" / "all" scope chip on a connected server row. */
+  private chipEl(e: ConnEntry): HTMLElement {
+    const sum = scopeSummary(e);
+    const id = e.config.id;
+    return h(
+      "button",
+      {
+        class: "scope-chip" + (sum.filtered ? " filtered" : ""),
+        type: "button",
+        title: "Choose visible databases",
+        "aria-label": `Visible databases on ${e.config.name}: ${scopeLabel(sum)}. Choose…`,
+        "aria-haspopup": "dialog",
+        onclick: (ev: MouseEvent) => {
+          ev.stopPropagation();
+          const chip = ev.currentTarget as HTMLElement;
+          const sb = this.el.getBoundingClientRect();
+          const r = chip.getBoundingClientRect();
+          this.selected = "c:" + id;
+          this.host.onSelect(id);
+          openScopePicker(id, { x: sb.right - 36, y: r.bottom + 6 });
+          this.render();
+        },
+        ondblclick: (ev: Event) => ev.stopPropagation(),
+      },
+      scopeLabel(sum),
+    );
+  }
+
+  private moveMenu(x: number, y: number, e: ConnEntry): void {
+    const id = e.config.id;
+    const cur = e.config.folder?.trim() || null;
+    const items = folderNames().map((f) => ({ label: f, checked: f === cur, onClick: () => void setFolder(id, f) }));
+    showMenu(
+      x,
+      y,
+      [
+        ...items,
+        ...(items.length ? [{ sep: true }] : []),
+        { label: "New folder…", icon: "plus", onClick: () => void this.newFolderFor(id) },
+        { label: "Remove from folder", icon: "x", disabled: cur === null, onClick: () => void setFolder(id, null) },
+      ],
+      { minWidth: 200 },
+    );
+  }
+
+  private async newFolderFor(id: string): Promise<void> {
+    const name = await promptDialog("New folder", "Folder name", "", "Create", folderNames());
+    if (name) await setFolder(id, name);
+  }
+
+  private folderMenu(ev: MouseEvent, name: string, members: ConnEntry[]): void {
+    const ids = members.map((m) => m.config.id);
+    showMenu(ev.clientX, ev.clientY, [
+      {
+        label: "Rename…",
+        icon: "pencil",
+        onClick: async () => {
+          const next = await promptDialog("Rename folder", "Folder name", name, "Rename", folderNames());
+          if (next && next !== name) {
+            renameCollapsedFolder(name, next);
+            await setFolderForMany(ids, next);
+          }
+        },
+      },
+      { label: "Ungroup", icon: "x", onClick: () => void setFolderForMany(ids, null) },
     ]);
   }
 
@@ -666,12 +1295,20 @@ export class Explorer {
   }
 
   async disconnect(id: string): Promise<void> {
+    this.forgetRedis(id);
+    forgetOverview(id);
     await store.disconnect(id);
   }
 
   async refresh(id: string): Promise<void> {
     try {
       await store.refresh(id);
+      const e = store.conns.get(id);
+      if (e?.config.driver === "kafka") await loadOverview(id, true);
+      if (e?.config.driver === "redis") {
+        this.forgetRedis(id);
+        for (const d of e.databases) if (this.expanded.has(`d:${id}:${d.name}`)) void this.loadRedis(e, d.name);
+      }
       toast("Refreshed", "ok");
     } catch (err) {
       toast(`Refresh failed: ${errMsg(err)}`, "error");

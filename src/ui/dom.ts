@@ -93,6 +93,17 @@ const ICONS: Record<string, string> = {
   role: '<circle cx="12" cy="8.5" r="3.5"/><path d="M5 20c0-3.6 3.1-6 7-6s7 2.4 7 6"/>',
   tablespace: '<path d="M3.5 8.500h17v9a2 2 0 01-2 2h-13a2 2 0 01-2-2zM3.5 8.500l2-4h13l2 4M8.5 13.500h7"/>',
   row: '<rect x="3.5" y="8" width="17" height="8" rx="2.5"/>',
+  kString: '<path d="M7 8.5h10M12 8.5v8M9.500 16.500h5"/>',
+  kHash: '<path d="M9.500 5L8 19M16 5l-1.500 14M5 9.500h14.500M4.500 14.500H19"/>',
+  kList: '<path d="M8.500 7h11M8.500 12h11M8.500 17h11"/><circle cx="4.800" cy="7" r="0.9" fill="currentColor"/><circle cx="4.800" cy="12" r="0.9" fill="currentColor"/><circle cx="4.800" cy="17" r="0.9" fill="currentColor"/>',
+  kSet: '<circle cx="9.500" cy="12" r="5.500"/><circle cx="14.500" cy="12" r="5.500"/>',
+  kZset: '<path d="M6 19v-6M12 19V6M18 19v-9"/>',
+  kStream: '<path d="M3.500 9h10M3.500 15h14M17 6.500l3.500 2.500-3.500 2.500M20.500 15l-3 2.500"/>',
+  kJson: '<path d="M9 4.500C6.500 4.500 7.500 9 5 12c2.500 3 1.500 7.500 4 7.500M15 4.500c2.500 0 1.500 4.500 4 7.500-2.500 3-1.500 7.500-4 7.500"/>',
+  topic: '<path d="M4 8c2-2 3-2 5 0s3 2 5 0 3-2 6 0M4 12.500c2-2 3-2 5 0s3 2 5 0 3-2 6 0M4 17c2-2 3-2 5 0s3 2 5 0 3-2 6 0"/>',
+  group: '<circle cx="12" cy="12" r="8.500"/><circle cx="12" cy="12" r="3.600"/>',
+  send: '<path d="M4 12l16-7-6 15-2.500-6.200z"/><path d="M11.500 13.800L20 5"/>',
+  copyCheck: '<path d="M5 12.500l4.500 4.500L19 7.500"/>',
 };
 
 export function icon(name: string, size = 16): HTMLSpanElement {

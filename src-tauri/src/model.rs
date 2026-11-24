@@ -10,6 +10,8 @@ pub enum Driver {
     Mysql,
     Sqlite,
     Mssql,
+    Redis,
+    Kafka,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +49,30 @@ pub struct ConnectionConfig {
     /// Required when `auth_method == Vault`.
     #[serde(default)]
     pub vault: Option<VaultConfig>,
+    /// Explorer folder this data source is grouped under (e.g. "Production"); None = top level.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// Which databases/schemas the explorer shows for this data source. None = everything.
+    #[serde(default)]
+    pub scope: Option<ExplorerScope>,
+    /// Kafka only. `host` holds the bootstrap servers ("b1:9092,b2:9092"); `username`/password are SASL creds.
+    #[serde(default)]
+    pub kafka: Option<KafkaConfig>,
+}
+
+/// Explorer visibility for one data source (UI-only; the backend just stores it).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExplorerScope {
+    /// Visible databases; None = all databases.
+    #[serde(default)]
+    pub databases: Option<Vec<String>>,
+    /// Per database: visible schemas. A database missing here shows all its schemas.
+    #[serde(default)]
+    pub schemas: std::collections::BTreeMap<String, Vec<String>>,
+    /// Whether databases that appear on the server later are shown automatically.
+    #[serde(default)]
+    pub show_new: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -312,4 +338,260 @@ pub struct HistoryEntry {
 pub enum ExportFormat {
     Csv,
     Json,
+}
+
+// ── Redis ────────────────────────────────────────────────────────────────────
+
+/// One key from a Redis SCAN, with its type and TTL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisKey {
+    pub key: String,
+    /// "string" | "hash" | "list" | "set" | "zset" | "stream" | "ReJSON-RL" | other TYPE reply.
+    pub key_type: String,
+    /// Seconds to live; None = no expiry.
+    pub ttl: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisScanResult {
+    /// Cursor to pass to the next call; "0" when the scan is complete.
+    pub cursor: String,
+    pub keys: Vec<RedisKey>,
+    pub done: bool,
+}
+
+/// A key's value, shaped by type:
+/// - string / ReJSON-RL: `value` = string
+/// - hash: `value` = [{ "field": string, "value": string }]
+/// - list: `value` = [string]            (index = position + offset 0)
+/// - set:  `value` = [string]
+/// - zset: `value` = [{ "member": string, "score": number|string }]  (ascending by score)
+/// - stream: `value` = [{ "id": string, "fields": { name: value } }] (oldest first)
+/// Binary-unsafe bytes are rendered as "0x…" hex like SQL binary cells.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisValue {
+    pub key: String,
+    pub key_type: String,
+    pub ttl: Option<i64>,
+    /// Element count (STRLEN for strings, HLEN/LLEN/SCARD/ZCARD/XLEN otherwise).
+    pub size: Option<i64>,
+    /// Approximate memory in bytes (MEMORY USAGE), when permitted.
+    pub memory_bytes: Option<i64>,
+    pub value: serde_json::Value,
+    /// True when only the first `limit` elements (or 1 MiB of a string) were returned.
+    pub truncated: bool,
+}
+
+// ── Kafka ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaConfig {
+    /// "plaintext" | "ssl" | "sasl_plaintext" | "sasl_ssl" (librdkafka security.protocol). Default "plaintext".
+    #[serde(default)]
+    pub security_protocol: Option<String>,
+    /// "PLAIN" | "SCRAM-SHA-256" | "SCRAM-SHA-512" | "OAUTHBEARER". Default "PLAIN" when SASL is used.
+    #[serde(default)]
+    pub sasl_mechanism: Option<String>,
+    /// PEM CA bundle path.
+    #[serde(default)]
+    pub ca_cert_path: Option<String>,
+    /// mTLS client certificate / key (PEM).
+    #[serde(default)]
+    pub client_cert_path: Option<String>,
+    #[serde(default)]
+    pub client_key_path: Option<String>,
+    #[serde(default)]
+    pub skip_tls_verify: bool,
+    /// Show internal topics (__consumer_offsets, _schemas, …). Default false.
+    #[serde(default)]
+    pub show_internal: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaBroker {
+    pub id: i32,
+    pub host: String,
+    pub port: i32,
+    pub is_controller: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaTopicInfo {
+    pub name: String,
+    pub partitions: i32,
+    pub replication_factor: i32,
+    pub internal: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaGroupInfo {
+    pub group_id: String,
+    /// "Stable" | "Empty" | "PreparingRebalance" | "CompletingRebalance" | "Dead" | other.
+    pub state: String,
+    pub protocol_type: String,
+    pub members: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaOverview {
+    pub cluster_id: Option<String>,
+    pub brokers: Vec<KafkaBroker>,
+    pub topics: Vec<KafkaTopicInfo>,
+    pub groups: Vec<KafkaGroupInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaPartitionInfo {
+    pub id: i32,
+    pub leader: i32,
+    pub replicas: Vec<i32>,
+    pub isr: Vec<i32>,
+    /// Low / high watermarks (earliest available offset, next offset to be written).
+    pub low: i64,
+    pub high: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaConfigEntry {
+    pub name: String,
+    pub value: Option<String>,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaTopicDetail {
+    pub name: String,
+    pub internal: bool,
+    pub partitions: Vec<KafkaPartitionInfo>,
+    /// Sum over partitions of (high - low). Approximate for compacted topics.
+    pub message_count: i64,
+    pub configs: Vec<KafkaConfigEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaHeader {
+    pub key: String,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaMessage {
+    pub partition: i32,
+    pub offset: i64,
+    /// Epoch milliseconds, if the record has a timestamp.
+    pub timestamp_ms: Option<i64>,
+    /// UTF-8 text, or "0x…" hex for binary; None = null key/value.
+    pub key: Option<String>,
+    pub value: Option<String>,
+    pub headers: Vec<KafkaHeader>,
+    pub key_size: i64,
+    pub value_size: i64,
+    /// Value cut at 256 KiB.
+    pub value_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaConsumeRequest {
+    pub topic: String,
+    /// None = all partitions.
+    #[serde(default)]
+    pub partition: Option<i32>,
+    /// "latest" (the newest `limit` messages) | "earliest" | "timestamp" | "offset" | "positions".
+    pub from: String,
+    #[serde(default)]
+    pub timestamp_ms: Option<i64>,
+    /// With from == "offset": start offset in `partition` (or every partition).
+    #[serde(default)]
+    pub offset: Option<i64>,
+    /// With from == "positions": partition -> next offset to read (from a previous result; used to follow).
+    #[serde(default)]
+    pub positions: Option<std::collections::BTreeMap<i32, i64>>,
+    pub limit: u32,
+    #[serde(default)]
+    pub key_contains: Option<String>,
+    #[serde(default)]
+    pub value_contains: Option<String>,
+    /// Max time to wait for messages. Default 3000.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaConsumeResult {
+    /// Sorted by timestamp then partition/offset; newest last.
+    pub messages: Vec<KafkaMessage>,
+    /// partition -> next offset after what was read (pass back as `positions` to follow).
+    pub next_positions: std::collections::BTreeMap<i32, i64>,
+    /// True when every requested partition reached its high watermark.
+    pub reached_end: bool,
+    /// Messages scanned (including those dropped by the key/value filters).
+    pub scanned: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaProduceRequest {
+    pub topic: String,
+    #[serde(default)]
+    pub partition: Option<i32>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub headers: Vec<KafkaHeader>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaProduceResult {
+    pub partition: i32,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaGroupMember {
+    pub member_id: String,
+    pub client_id: String,
+    pub host: String,
+    /// "topic:0,1,2" style summary per topic.
+    pub assignments: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaGroupOffset {
+    pub topic: String,
+    pub partition: i32,
+    /// None = no committed offset.
+    pub committed: Option<i64>,
+    pub end: i64,
+    pub lag: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KafkaGroupDetail {
+    pub group_id: String,
+    pub state: String,
+    pub protocol: String,
+    pub members: Vec<KafkaGroupMember>,
+    pub offsets: Vec<KafkaGroupOffset>,
+    pub total_lag: i64,
 }

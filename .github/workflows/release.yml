@@ -25,6 +25,8 @@ env:
     build-essential
     libssl-dev
     libgtk-3-dev
+    cmake
+    g++
 
 jobs:
   check:
@@ -95,6 +97,19 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y $LINUX_DEPS
+
+      # librdkafka (rdkafka "cmake-build") needs cmake. It is preinstalled on the macos-latest,
+      # windows-latest and ubuntu-22.04 runner images; this step fails early if that ever changes.
+      # Windows: vendored OpenSSL (openssl-src) needs Perl, which the windows-latest image ships
+      # (Strawberry Perl); NASM is installed best-effort in case the OpenSSL build asks for it.
+      - name: Check cmake
+        run: cmake --version
+
+      - name: Install NASM (Windows, for vendored OpenSSL)
+        if: matrix.platform == 'windows-latest'
+        continue-on-error: true
+        shell: pwsh
+        run: choco install nasm -y --no-progress
 
       - uses: actions/setup-node@v4
         with:

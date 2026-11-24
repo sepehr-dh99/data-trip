@@ -7,6 +7,15 @@ import type {
   HistoryEntry,
   ObjectGroup,
   QueryResult,
+  RedisScanResult,
+  KafkaOverview,
+  KafkaTopicDetail,
+  KafkaConsumeRequest,
+  KafkaConsumeResult,
+  KafkaProduceRequest,
+  KafkaProduceResult,
+  KafkaGroupDetail,
+  RedisValue,
   RowEdit,
   SchemaNode,
   ServerInfo,
@@ -58,6 +67,35 @@ export const api = {
     call<HistoryEntry[]>("list_history", { connectionId, search, limit }),
   exportQuery: (sessionId: string, sql: string, format: ExportFormat, path: string) =>
     call<number>("export_query", { sessionId, sql, format, path }),
+
+  /** Redis: one SCAN step on the session's database. pattern uses Redis glob syntax ("*" = all). */
+  redisScan: (sessionId: string, pattern: string, cursor: string, count: number, keyType: string | null) =>
+    call<RedisScanResult>("redis_scan", { sessionId, pattern, cursor, count, keyType }),
+  /** Redis: a key's value, first `limit` elements for collections. */
+  redisGet: (sessionId: string, key: string, limit: number) =>
+    call<RedisValue>("redis_get", { sessionId, key, limit }),
+  /** Redis: delete keys (UNLINK); returns how many existed. Refused on read-only connections. */
+  redisDelete: (sessionId: string, keys: string[]) => call<number>("redis_delete", { sessionId, keys }),
+  /** Redis: set TTL in seconds, or null to persist (remove expiry). Refused on read-only connections. */
+  redisSetTtl: (sessionId: string, key: string, ttl: number | null) =>
+    call<null>("redis_set_ttl", { sessionId, key, ttl }),
+
+  /** Kafka: brokers, topics (internal ones only if config.kafka.showInternal) and consumer groups. */
+  kafkaOverview: (sessionId: string) => call<KafkaOverview>("kafka_overview", { sessionId }),
+  kafkaTopic: (sessionId: string, topic: string) => call<KafkaTopicDetail>("kafka_topic", { sessionId, topic }),
+  /** Reads messages without joining or committing any consumer group. */
+  kafkaConsume: (sessionId: string, request: KafkaConsumeRequest) =>
+    call<KafkaConsumeResult>("kafka_consume", { sessionId, request }),
+  /** Refused on read-only connections. */
+  kafkaProduce: (sessionId: string, request: KafkaProduceRequest) =>
+    call<KafkaProduceResult>("kafka_produce", { sessionId, request }),
+  kafkaGroup: (sessionId: string, groupId: string) => call<KafkaGroupDetail>("kafka_group", { sessionId, groupId }),
+  /** Reset a group's committed offsets for one topic. Group must be Empty. to: "earliest"|"latest"|"timestamp"|"offset". Refused on read-only. */
+  kafkaResetOffsets: (sessionId: string, groupId: string, topic: string, to: string, value: number | null) =>
+    call<number>("kafka_reset_offsets", { sessionId, groupId, topic, to, value }),
+  kafkaCreateTopic: (sessionId: string, topic: string, partitions: number, replicationFactor: number) =>
+    call<null>("kafka_create_topic", { sessionId, topic, partitions, replicationFactor }),
+  kafkaDeleteTopic: (sessionId: string, topic: string) => call<null>("kafka_delete_topic", { sessionId, topic }),
 
   /** Reads a UTF-8 text file chosen by the user (max 8 MiB). Used by importers. */
   readTextFile: (path: string) => call<string>("read_text_file", { path }),

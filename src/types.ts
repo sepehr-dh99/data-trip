@@ -1,6 +1,6 @@
 // IPC contract types. Mirrors src-tauri/src/model.rs. Do not change shapes without updating both sides.
 
-export type Driver = "postgres" | "mysql" | "sqlite" | "mssql";
+export type Driver = "postgres" | "mysql" | "sqlite" | "mssql" | "redis" | "kafka";
 
 export interface ConnectionConfig {
   id: string;
@@ -19,6 +19,22 @@ export interface ConnectionConfig {
   authMethod?: AuthMethod;
   /** Required when authMethod === "vault". */
   vault?: VaultConfig | null;
+  /** Explorer folder this data source is grouped under (e.g. "Production"); null = top level. */
+  folder?: string | null;
+  /** Which databases/schemas the explorer shows. null = everything. */
+  scope?: ExplorerScope | null;
+  /** Kafka only. `host` holds the bootstrap servers ("b1:9092,b2:9092"); username/password are SASL creds. */
+  kafka?: KafkaConfig | null;
+}
+
+/** Explorer visibility for one data source (stored with the connection, UI-only). */
+export interface ExplorerScope {
+  /** Visible databases; null = all. */
+  databases: string[] | null;
+  /** Per database: visible schemas; a database missing here shows all its schemas. */
+  schemas: Record<string, string[]>;
+  /** Show databases that appear on the server later. */
+  showNew: boolean;
 }
 
 export type AuthMethod = "password" | "vault";
@@ -181,6 +197,8 @@ export const DEFAULT_PORTS: Record<Driver, number | null> = {
   mysql: 3306,
   sqlite: null,
   mssql: 1433,
+  redis: 6379,
+  kafka: 9092,
 };
 
 export const DRIVER_LABELS: Record<Driver, string> = {
@@ -188,4 +206,75 @@ export const DRIVER_LABELS: Record<Driver, string> = {
   mysql: "MySQL / MariaDB",
   sqlite: "SQLite",
   mssql: "SQL Server",
+  redis: "Redis",
+  kafka: "Kafka",
 };
+
+// ── Redis ───────────────────────────────────────────────────────────────────
+
+export interface RedisKey {
+  key: string;
+  /** "string" | "hash" | "list" | "set" | "zset" | "stream" | "ReJSON-RL" | other */
+  keyType: string;
+  /** Seconds to live; null = no expiry. */
+  ttl: number | null;
+}
+
+export interface RedisScanResult {
+  /** Pass to the next call; "0" when complete. */
+  cursor: string;
+  keys: RedisKey[];
+  done: boolean;
+}
+
+/** A key's value. `value` shape by type:
+ *  string/ReJSON-RL: string · hash: {field,value}[] · list/set: string[] ·
+ *  zset: {member,score}[] · stream: {id, fields: Record<string,string>}[] */
+export interface RedisValue {
+  key: string;
+  keyType: string;
+  ttl: number | null;
+  size: number | null;
+  memoryBytes: number | null;
+  value: unknown;
+  truncated: boolean;
+}
+
+// ── Kafka ───────────────────────────────────────────────────────────────────
+
+export interface KafkaConfig {
+  /** "plaintext" | "ssl" | "sasl_plaintext" | "sasl_ssl" */
+  securityProtocol?: string | null;
+  /** "PLAIN" | "SCRAM-SHA-256" | "SCRAM-SHA-512" | "OAUTHBEARER" */
+  saslMechanism?: string | null;
+  caCertPath?: string | null;
+  clientCertPath?: string | null;
+  clientKeyPath?: string | null;
+  skipTlsVerify?: boolean;
+  showInternal?: boolean;
+}
+export interface KafkaBroker { id: number; host: string; port: number; isController: boolean; }
+export interface KafkaTopicInfo { name: string; partitions: number; replicationFactor: number; internal: boolean; }
+export interface KafkaGroupInfo { groupId: string; state: string; protocolType: string; members: number; }
+export interface KafkaOverview { clusterId: string | null; brokers: KafkaBroker[]; topics: KafkaTopicInfo[]; groups: KafkaGroupInfo[]; }
+export interface KafkaPartitionInfo { id: number; leader: number; replicas: number[]; isr: number[]; low: number; high: number; }
+export interface KafkaConfigEntry { name: string; value: string | null; isDefault: boolean; }
+export interface KafkaTopicDetail { name: string; internal: boolean; partitions: KafkaPartitionInfo[]; messageCount: number; configs: KafkaConfigEntry[]; }
+export interface KafkaHeader { key: string; value: string | null; }
+export interface KafkaMessage {
+  partition: number; offset: number; timestampMs: number | null;
+  key: string | null; value: string | null; headers: KafkaHeader[];
+  keySize: number; valueSize: number; valueTruncated: boolean;
+}
+export type KafkaFrom = "latest" | "earliest" | "timestamp" | "offset" | "positions";
+export interface KafkaConsumeRequest {
+  topic: string; partition?: number | null; from: KafkaFrom;
+  timestampMs?: number | null; offset?: number | null; positions?: Record<number, number> | null;
+  limit: number; keyContains?: string | null; valueContains?: string | null; timeoutMs?: number | null;
+}
+export interface KafkaConsumeResult { messages: KafkaMessage[]; nextPositions: Record<number, number>; reachedEnd: boolean; scanned: number; }
+export interface KafkaProduceRequest { topic: string; partition?: number | null; key?: string | null; value?: string | null; headers: KafkaHeader[]; }
+export interface KafkaProduceResult { partition: number; offset: number; }
+export interface KafkaGroupMember { memberId: string; clientId: string; host: string; assignments: string[]; }
+export interface KafkaGroupOffset { topic: string; partition: number; committed: number | null; end: number; lag: number | null; }
+export interface KafkaGroupDetail { groupId: string; state: string; protocol: string; members: KafkaGroupMember[]; offsets: KafkaGroupOffset[]; totalLag: number; }

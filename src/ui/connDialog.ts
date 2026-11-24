@@ -2,9 +2,11 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import { DEFAULT_PORTS, DRIVER_LABELS } from "../types";
-import type { AuthMethod, ConnectionConfig, Driver, VaultCheck, VaultConfig, VaultTokenSource } from "../types";
+import type { AuthMethod, ConnectionConfig, Driver, KafkaConfig, VaultCheck, VaultConfig, VaultTokenSource } from "../types";
 import { clear, errMsg, h, icon } from "./dom";
-import { CONN_COLORS } from "./sqlutil";
+import { CONN_COLORS, DRIVER_COLORS } from "./sqlutil";
+import { DRIVER_ABBR } from "./scopePicker";
+import { folderNames } from "./scope";
 
 function fmtLease(secs: number): string {
   if (secs >= 86400 && secs % 86400 === 0) return secs / 86400 + "d";
@@ -16,7 +18,9 @@ function fmtLease(secs: number): string {
   return secs + "s";
 }
 
-const DRIVERS: Driver[] = ["postgres", "mysql", "sqlite", "mssql"];
+const DRIVERS: Driver[] = ["postgres", "mysql", "sqlite", "mssql", "redis", "kafka"];
+const KAFKA_PROTOCOLS: [string, string][] = [["plaintext", "PLAINTEXT"], ["ssl", "SSL"], ["sasl_plaintext", "SASL_PLAINTEXT"], ["sasl_ssl", "SASL_SSL"]];
+const SASL_MECHANISMS = ["PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"];
 
 export function openConnectionDialog(existing: ConnectionConfig | null, onSaved: (c: ConnectionConfig) => void): void {
   const editing = existing !== null;
@@ -26,14 +30,20 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   let driver: Driver = cfg.driver;
   let color = cfg.color ?? CONN_COLORS[0];
   let nameTouched = editing;
+  let colorTouched = editing;
 
   const field = (label: string, input: HTMLElement, cls = ""): HTMLElement =>
     h("label", { class: "field " + cls }, h("span", { class: "field-label" }, label), input);
 
   const inName = h("input", { class: "input", type: "text", placeholder: "My database", value: cfg.name, oninput: () => (nameTouched = true) });
+  const folderList = h("datalist", { id: "dt-folder-options" }, folderNames().map((f) => h("option", { value: f })));
+  const inFolder = h("input", { class: "input", type: "text", placeholder: "None", value: cfg.folder ?? "", autocomplete: "off", spellcheck: false, "aria-label": "Folder" });
+  inFolder.setAttribute("list", "dt-folder-options");
   const inHost = h("input", { class: "input", type: "text", placeholder: "localhost", value: cfg.host ?? "", spellcheck: false });
   const inPort = h("input", { class: "input", type: "number", min: "1", max: "65535", value: cfg.port != null ? String(cfg.port) : "" });
-  const inDb = h("input", { class: "input", type: "text", value: cfg.database ?? "", spellcheck: false });
+  const inDb = h("input", { class: "input", type: "text", value: cfg.driver === "redis" ? "" : (cfg.database ?? ""), spellcheck: false });
+  const inDbIdx = h("input", { class: "input", type: "number", min: "0", max: "15", step: "1", placeholder: "0", value: cfg.driver === "redis" ? (cfg.database ?? "0") : "0", "aria-label": "Database index" });
+  const chkTls = h("input", { type: "checkbox", checked: cfg.driver === "redis" && cfg.sslMode === "require" });
   const inUser = h("input", { class: "input", type: "text", value: cfg.username ?? "", autocomplete: "off", spellcheck: false });
   const inPass = h("input", {
     class: "input",
@@ -53,6 +63,17 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   selSsl.value = cfg.sslMode ?? "prefer";
   const chkTrust = h("input", { type: "checkbox", checked: cfg.trustServerCertificate === true });
   const chkRo = h("input", { type: "checkbox", checked: cfg.readOnly === true });
+  // ----- Kafka -----
+  const k0 = existing?.kafka ?? {};
+  let kProtocol = (k0.securityProtocol ?? "plaintext").toLowerCase();
+  if (!KAFKA_PROTOCOLS.some(([v]) => v === kProtocol)) kProtocol = "plaintext";
+  const selSasl = h("select", { class: "input", "aria-label": "SASL mechanism" }, SASL_MECHANISMS.map((m) => h("option", { value: m }, m)));
+  selSasl.value = SASL_MECHANISMS.includes(k0.saslMechanism ?? "") ? (k0.saslMechanism as string) : "PLAIN";
+  const inKCa = h("input", { class: "input", type: "text", placeholder: "/path/to/ca.pem", value: k0.caCertPath ?? "", spellcheck: false, "aria-label": "CA certificate path" });
+  const inKCert = h("input", { class: "input", type: "text", placeholder: "/path/to/client.pem (optional)", value: k0.clientCertPath ?? "", spellcheck: false, "aria-label": "Client certificate path" });
+  const inKKey = h("input", { class: "input", type: "text", placeholder: "/path/to/client.key (optional)", value: k0.clientKeyPath ?? "", spellcheck: false, "aria-label": "Client key path" });
+  const chkKSkip = h("input", { type: "checkbox", checked: k0.skipTlsVerify === true });
+  const chkKInternal = h("input", { type: "checkbox", checked: k0.showInternal === true });
   const result = h("div", { class: "test-result", "aria-live": "polite" });
 
   // ----- HashiCorp Vault -----
@@ -75,7 +96,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   const chkVSkip = h("input", { type: "checkbox", checked: v0.skipTlsVerify === true });
   const vaultResult = h("div", { class: "test-result vault-result", "aria-live": "polite" });
   const hint = (text: string): HTMLElement => h("span", { class: "vault-hint" }, text);
-  const browse = (target: HTMLInputElement, title: string): HTMLElement =>
+  const browse = (target: HTMLInputElement, title: string, errEl: HTMLElement = vaultResult): HTMLElement =>
     h(
       "button",
       {
@@ -86,8 +107,8 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
             const p = await open({ multiple: false, directory: false, title });
             if (typeof p === "string") target.value = p;
           } catch (e) {
-            vaultResult.className = "test-result vault-result err";
-            vaultResult.textContent = errMsg(e);
+            errEl.className = "test-result err";
+            errEl.textContent = errMsg(e);
           }
         },
       },
@@ -137,8 +158,31 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     h("div", { class: "vault-test" }, btnVault, vaultResult),
   );
 
+  const protoBtns = KAFKA_PROTOCOLS.map(([v, label]) => {
+    const b = h("button", { type: "button", class: "seg-btn", role: "radio", onclick: () => setProtocol(v) }, label);
+    b.dataset.p = v;
+    return b;
+  });
+  const protoSeg = h("div", { class: "seg", role: "radiogroup", "aria-label": "Security protocol" }, protoBtns);
+  const saslField = field("SASL mechanism", selSasl);
+  const kafkaTlsFields = h(
+    "div",
+    { class: "kafka-tls" },
+    h("div", { class: "kafka-tls-title" }, icon("key", 13), "TLS"),
+    field("CA certificate", h("div", { class: "row2 tight" }, inKCa, browse(inKCa, "Choose CA certificate (PEM)", result))),
+    field("Client certificate", h("div", { class: "row2 tight" }, inKCert, browse(inKCert, "Choose client certificate (PEM)", result))),
+    field("Client key", h("div", { class: "row2 tight" }, inKKey, browse(inKKey, "Choose client key (PEM)", result))),
+    h("label", { class: "check" }, chkKSkip, h("span", null, "Skip TLS verification")),
+    h("div", { class: "vault-warn" }, icon("alert", 13), "Insecure: the brokers' identity is not checked. Use a CA certificate instead when you can."),
+  );
+
   const driverBtns = DRIVERS.map((d) => {
-    const b = h("button", { type: "button", class: "seg-btn", role: "radio", onclick: () => setDriver(d, true) }, DRIVER_LABELS[d]);
+    const b = h(
+      "button",
+      { type: "button", class: "seg-btn drv", role: "radio", title: DRIVER_LABELS[d], onclick: () => setDriver(d, true) },
+      h("span", { class: "drv-badge", style: `--c:${DRIVER_COLORS[d]}`, "aria-hidden": "true" }, DRIVER_ABBR[d]),
+      h("span", { class: "drv-name" }, DRIVER_LABELS[d].split(" / ")[0]),
+    );
     b.dataset.d = d;
     return b;
   });
@@ -149,24 +193,39 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     b.dataset.c = c;
     return b;
   });
-  const pick = (c: string): void => {
+  const pick = (c: string, user = true): void => {
+    if (user) colorTouched = true;
     color = c;
     for (const s of swatches) s.classList.toggle("on", s.dataset.c === c);
   };
 
   const passField = field("Password", inPass);
+  const userLabel = h("span", { class: "field-label" }, "User");
+  const userField = h("label", { class: "field" }, userLabel, inUser);
+  const dbField = field("Database", inDb);
+  const dbIdxField = field("Database index", h("div", { class: "vault-stack" }, inDbIdx, hint("0 – 15, selected when the connection opens")));
   const clearRow = h("label", { class: "check" }, chkClear, h("span", null, "Clear saved password"));
   const authField = field("Authentication", authSeg);
+  const hostLabel = h("span", { class: "field-label" }, "Host");
+  const hostField = h("label", { class: "field grow" }, hostLabel, inHost);
+  const portField = field("Port", inPort, "port");
+  const protoField = field("Security protocol", protoSeg);
+  const credRow = h("div", { class: "row2" }, userField, passField);
   const netFields = h(
     "div",
     { class: "net-fields" },
-    h("div", { class: "row2" }, field("Host", inHost, "grow"), field("Port", inPort, "port")),
-    field("Database", inDb),
+    h("div", { class: "row2" }, hostField, portField),
+    protoField,
+    saslField,
+    dbField,
+    dbIdxField,
     authField,
-    h("div", { class: "row2" }, field("User", inUser), passField),
+    credRow,
     editing ? clearRow : null,
   );
   const sslField = field("SSL mode", selSsl);
+  const tlsRow = h("label", { class: "check redis-only" }, chkTls, h("span", null, "Use TLS (rediss://)"));
+  const internalRow = h("label", { class: "check kafka-only" }, chkKInternal, h("span", null, "Show internal topics"));
   const optionRow = h(
     "div",
     { class: "row2" },
@@ -175,6 +234,8 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       "div",
       { class: "checks" },
       h("label", { class: "check mssql-only" }, chkTrust, h("span", null, "Trust server certificate")),
+      tlsRow,
+      internalRow,
       h("label", { class: "check" }, chkRo, h("span", null, "Read-only connection")),
     ),
   );
@@ -229,10 +290,26 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       inPort.value = np === null ? "" : String(np);
     }
     optionRow.querySelectorAll<HTMLElement>(".mssql-only").forEach((el) => (el.style.display = d === "mssql" ? "" : "none"));
-    sslField.style.display = sqlite ? "none" : "";
+    const redis = d === "redis";
+    const kafka = d === "kafka";
+    tlsRow.style.display = redis ? "" : "none";
+    internalRow.style.display = kafka ? "" : "none";
+    sslField.style.display = sqlite || redis || kafka ? "none" : "";
+    dbField.style.display = redis || kafka ? "none" : "";
+    dbIdxField.style.display = redis ? "" : "none";
+    portField.style.display = kafka ? "none" : "";
+    hostLabel.textContent = kafka ? "Bootstrap servers" : "Host";
+    inHost.placeholder = kafka ? "broker1:9092,broker2:9092" : "localhost";
+    userLabel.textContent = redis ? "ACL user" : "User";
+    inUser.placeholder = redis ? "default (optional)" : "";
+    if (userPick && !colorTouched) pick(redis ? DRIVER_COLORS.redis : kafka ? DRIVER_COLORS.kafka : CONN_COLORS[0], false);
     syncAuth();
   };
 
+  const setProtocol = (p: string): void => {
+    kProtocol = p;
+    syncAuth();
+  };
   const setAuth = (m: AuthMethod): void => {
     authMethod = m;
     syncAuth();
@@ -241,9 +318,24 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     tokenSource = t;
     syncAuth();
   };
+  const kafkaSasl = (): boolean => driver === "kafka" && kProtocol.startsWith("sasl");
+  const kafkaTls = (): boolean => driver === "kafka" && kProtocol.endsWith("ssl");
   const syncAuth = (): void => {
     const sqlite = driver === "sqlite";
-    const vault = authMethod === "vault" && !sqlite;
+    const kafka = driver === "kafka";
+    // Kafka only authenticates over SASL: no credentials for PLAINTEXT / SSL.
+    const noCreds = kafka && !kafkaSasl();
+    const vault = authMethod === "vault" && !sqlite && !noCreds;
+    for (const b of protoBtns) {
+      const on = b.dataset.p === kProtocol;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-checked", String(on));
+    }
+    protoField.style.display = kafka ? "" : "none";
+    saslField.style.display = kafkaSasl() ? "" : "none";
+    kafkaTlsFields.style.display = kafkaTls() ? "" : "none";
+    credRow.style.display = noCreds ? "none" : "";
+    clearRow.style.display = noCreds ? "none" : clearRow.style.display;
     for (const b of authBtns) {
       const on = b.dataset.m === authMethod;
       b.classList.toggle("on", on);
@@ -254,37 +346,58 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       b.classList.toggle("on", on);
       b.setAttribute("aria-checked", String(on));
     }
-    authField.style.display = sqlite ? "none" : "";
+    authField.style.display = sqlite || noCreds ? "none" : "";
     passField.style.display = vault ? "none" : "";
-    clearRow.style.display = vault ? "none" : "";
+    clearRow.style.display = vault || noCreds ? "none" : "";
     vaultFields.style.display = vault ? "" : "none";
     tokenFilePane.style.display = tokenSource === "file" ? "" : "none";
     tokenEnvPane.style.display = tokenSource === "env" ? "" : "none";
     tokenKeyPane.style.display = tokenSource === "keychain" ? "" : "none";
-    inUser.placeholder = vault ? "Fallback if the secret has no username" : "";
+    inUser.placeholder = vault ? "Fallback if the secret has no username" : driver === "redis" ? "default (optional)" : "";
+    userLabel.textContent = driver === "redis" ? "ACL user" : "User";
   };
 
+  /** Redis database index from the field: an integer 0–15, or null when it is not valid. */
+  const redisIndex = (): number | null => {
+    const t = inDbIdx.value.trim();
+    if (t === "") return 0;
+    const n = Number(t);
+    return Number.isInteger(n) && n >= 0 && n <= 15 ? n : null;
+  };
   const collect = (): ConnectionConfig => {
     const sqlite = driver === "sqlite";
-    const port = inPort.value.trim() === "" ? null : Number(inPort.value);
-    const vault = authMethod === "vault" && !sqlite;
+    const kafka = driver === "kafka";
+    const port = kafka ? null : inPort.value.trim() === "" ? null : Number(inPort.value);
+    const vault = authMethod === "vault" && !sqlite && !(kafka && !kafkaSasl());
     return {
       id: cfg.id,
       name: inName.value.trim() || (sqlite ? inFile.value.split(/[\\/]/).pop() || "SQLite" : inHost.value.trim() || DRIVER_LABELS[driver]),
       driver,
-      host: sqlite ? null : inHost.value.trim() || null,
+      host: sqlite ? null : kafka ? inHost.value.replace(/\s+/g, "") || null : inHost.value.trim() || null,
       port: sqlite ? null : port,
-      database: sqlite ? null : inDb.value.trim() || null,
-      username: sqlite ? null : inUser.value.trim() || null,
+      database: sqlite || kafka ? null : driver === "redis" ? String(redisIndex() ?? 0) : inDb.value.trim() || null,
+      username: sqlite || (kafka && !kafkaSasl()) ? null : inUser.value.trim() || null,
       filePath: sqlite ? inFile.value.trim() || null : null,
-      sslMode: sqlite ? null : (selSsl.value as "disable" | "prefer" | "require"),
+      sslMode: sqlite || kafka ? null : driver === "redis" ? (chkTls.checked ? "require" : "disable") : (selSsl.value as "disable" | "prefer" | "require"),
       trustServerCertificate: driver === "mssql" ? chkTrust.checked : false,
       color,
       readOnly: chkRo.checked,
       authMethod: vault ? "vault" : "password",
       vault: vault ? collectVault() : null,
+      folder: inFolder.value.trim() || null,
+      scope: cfg.scope ?? null,
+      kafka: kafka ? collectKafka() : null,
     };
   };
+  const collectKafka = (): KafkaConfig => ({
+    securityProtocol: kProtocol,
+    saslMechanism: kafkaSasl() ? selSasl.value : null,
+    caCertPath: kafkaTls() ? inKCa.value.trim() || null : null,
+    clientCertPath: kafkaTls() ? inKCert.value.trim() || null : null,
+    clientKeyPath: kafkaTls() ? inKKey.value.trim() || null : null,
+    skipTlsVerify: kafkaTls() && chkKSkip.checked,
+    showInternal: chkKInternal.checked,
+  });
   const collectVault = (): VaultConfig => ({
     address: inVAddr.value.trim() || null,
     namespace: inVNs.value.trim() || null,
@@ -296,17 +409,24 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     caCertPath: inVCa.value.trim() || null,
     skipTlsVerify: chkVSkip.checked,
   });
-  const isVault = (): boolean => authMethod === "vault" && driver !== "sqlite";
+  const isVault = (): boolean => authMethod === "vault" && driver !== "sqlite" && !(driver === "kafka" && !kafkaSasl());
   /** Token typed for the keychain source (null = none typed). */
   const typedToken = (): string | null => (isVault() && tokenSource === "keychain" && inVToken.value.trim() !== "" ? inVToken.value.trim() : null);
   const vaultProblem = (): string | null => (isVault() && inVPath.value.trim() === "" ? "Enter the Vault secret path." : null);
+  const kafkaProblem = (): string | null => {
+    if (driver !== "kafka") return null;
+    if (inHost.value.replace(/[\s,]/g, "") === "") return "Enter at least one bootstrap server, e.g. broker1:9092.";
+    if (kafkaTls() && inKCert.value.trim() !== "" && inKKey.value.trim() === "") return "A client certificate needs its private key.";
+    return null;
+  };
+  const formProblem = (): string | null => (driver === "redis" && redisIndex() === null ? "Database index must be a whole number from 0 to 15." : kafkaProblem() ?? vaultProblem());
   const showErr = (el: HTMLElement, msg: string): void => {
     el.className = el.className.replace(/\b(ok|err|busy)\b/g, "").trim() + " err";
     clear(el);
     el.append(icon("alert", 15), h("span", null, msg));
   };
   const passwordArg = (): string | null => {
-    if (driver === "sqlite" || isVault()) return null;
+    if (driver === "sqlite" || isVault() || (driver === "kafka" && !kafkaSasl())) return null;
     if (chkClear.checked && inPass.value === "") return "";
     if (inPass.value === "") return editing ? null : "";
     return inPass.value;
@@ -334,7 +454,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
 
   btnCancel.onclick = close;
   btnTest.onclick = async () => {
-    const problem = vaultProblem();
+    const problem = formProblem();
     if (problem) return showErr(result, problem);
     btnTest.disabled = true;
     result.className = "test-result busy";
@@ -376,7 +496,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     }
   };
   btnSave.onclick = async () => {
-    const problem = vaultProblem();
+    const problem = formProblem();
     if (problem) return showErr(result, problem);
     btnSave.disabled = true;
     try {
@@ -406,9 +526,10 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       "div",
       { class: "dialog-body" },
       field("Driver", drivers),
-      field("Name", inName),
+      h("div", { class: "row2" }, field("Name", inName), field("Folder", h("div", { class: "folder-combo" }, inFolder, folderList))),
       netFields,
       vaultFields,
+      kafkaTlsFields,
       fileFields,
       optionRow,
       field("Color", h("div", { class: "swatches" }, swatches)),
@@ -423,6 +544,6 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   document.body.appendChild(overlay);
   window.addEventListener("keydown", onKey, true);
   setDriver(driver, false);
-  pick(color);
+  pick(color, false);
   (driver === "sqlite" ? inFile : inName).focus();
 }

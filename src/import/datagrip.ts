@@ -127,8 +127,34 @@ function parseJdbc(url: string, raw: RawSource, base: ConnectionConfig): Parsed 
 
   if (lower.startsWith("jdbc:redshift:")) return unsupported("Amazon Redshift is not supported");
 
+  // Redis: jdbc:redis://[user[:pass]@]host[:port][/db] and jdbc:redis:ssl://… (Sentinel / Cluster are not supported)
+  if (/^jdbc:redis:(?:sentinel|cluster)/i.test(u)) {
+    return unsupported(/sentinel/i.test(u.slice(0, 20)) ? "Redis Sentinel isn't supported" : "Redis Cluster isn't supported");
+  }
+  let m = /^jdbc:redis(:ssl)?:\/\/(?:([^@/?]*)@)?([^/?]*)(?:\/(\d*))?(?:\?(.*))?$/i.exec(u);
+  if (m) {
+    const { host, port } = splitHostPort(m[3]);
+    const params = parseParams(m[5] ?? "", /&/);
+    const tls = !!m[1] || params["ssl"] === "true" || params["tls"] === "true";
+    // "user:pass@": keep the user, drop the password (secrets are never imported).
+    const ui = m[2] ?? "";
+    const colon = ui.indexOf(":");
+    const urlUser = dec(colon < 0 ? ui : ui.slice(0, colon));
+    const hadPassword = colon >= 0 && ui.slice(colon + 1) !== "";
+    const cfg: ConnectionConfig = {
+      ...base,
+      driver: "redis",
+      host: host || "localhost",
+      port: port ?? 6379,
+      database: m[4] ? String(Number(m[4])) : "0",
+      username: base.username || urlUser || null,
+      sslMode: tls ? "require" : "disable",
+    };
+    return hadPassword ? { config: cfg, status: "warning", message: "password in URL ignored" } : { config: cfg, status: "ok" };
+  }
+
   // PostgreSQL
-  let m = /^jdbc:postgresql:(?:\/\/)?([^/?]*)(?:\/([^?]*))?(?:\?(.*))?$/i.exec(u);
+  m = /^jdbc:postgresql:(?:\/\/)?([^/?]*)(?:\/([^?]*))?(?:\?(.*))?$/i.exec(u);
   if (m) {
     const { host, port } = splitHostPort(m[1]);
     const params = parseParams(m[3] ?? "", /&/);
@@ -217,6 +243,9 @@ function parseJdbc(url: string, raw: RawSource, base: ConnectionConfig): Parsed 
 
 function toCandidate(raw: RawSource): ImportCandidate {
   const sourceName = raw.name || raw.uuid || "Unnamed data source";
+  if (/kafka/i.test(`${raw.jdbcUrl} ${raw.driverRef} ${raw.product} ${raw.dbms}`)) {
+    return { config: null, sourceName, status: "unsupported", message: "Kafka connections aren't stored in dataSources.xml — add it manually" };
+  }
   if (!raw.jdbcUrl) {
     return { config: null, sourceName, status: "unsupported", message: "no JDBC URL (probably a non-local data source)" };
   }

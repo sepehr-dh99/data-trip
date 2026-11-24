@@ -5,8 +5,12 @@ use crate::db::{self, DbConn};
 use crate::error::{AppError, AppResult};
 use crate::export;
 use crate::model::{
-    ConnectionConfig, DatabaseNode, Driver, ExportFormat, ObjectGroup, QueryResult, RowEdit,
-    SchemaNode, SessionInfo,
+    ConnectionConfig, DatabaseNode, Driver, ExportFormat, ObjectGroup, QueryResult,
+    RedisScanResult, RedisValue, RowEdit, SchemaNode, SessionInfo,
+};
+use crate::model::{
+    KafkaConsumeRequest, KafkaConsumeResult, KafkaGroupDetail, KafkaOverview, KafkaProduceRequest,
+    KafkaProduceResult, KafkaTopicDetail,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -28,6 +32,38 @@ pub enum Job {
     ServerObjects,
     Edits(Vec<RowEdit>),
     Simple(String),
+    RedisScan {
+        pattern: String,
+        cursor: String,
+        count: u32,
+        key_type: Option<String>,
+    },
+    RedisGet {
+        key: String,
+        limit: usize,
+    },
+    RedisDelete(Vec<String>),
+    RedisSetTtl {
+        key: String,
+        ttl: Option<i64>,
+    },
+    KafkaOverview,
+    KafkaTopic(String),
+    KafkaConsume(KafkaConsumeRequest),
+    KafkaProduce(KafkaProduceRequest),
+    KafkaGroup(String),
+    KafkaResetOffsets {
+        group: String,
+        topic: String,
+        to: String,
+        value: Option<i64>,
+    },
+    KafkaCreateTopic {
+        topic: String,
+        partitions: i32,
+        replication: i32,
+    },
+    KafkaDeleteTopic(String),
 }
 
 pub enum JobOut {
@@ -36,6 +72,13 @@ pub enum JobOut {
     Schema(Vec<SchemaNode>),
     Databases(Vec<DatabaseNode>),
     Groups(Vec<ObjectGroup>),
+    RedisScan(RedisScanResult),
+    RedisValue(RedisValue),
+    KafkaOverview(KafkaOverview),
+    KafkaTopic(KafkaTopicDetail),
+    KafkaConsume(KafkaConsumeResult),
+    KafkaProduce(KafkaProduceResult),
+    KafkaGroup(KafkaGroupDetail),
     Unit,
 }
 
@@ -70,6 +113,11 @@ impl Drop for BrokenOnAbort<'_> {
             self.session.broken.store(true, Ordering::SeqCst);
         }
     }
+}
+
+/// Drivers without transactions: BEGIN/COMMIT/ROLLBACK are never issued.
+fn has_no_transactions(d: Driver) -> bool {
+    matches!(d, Driver::Redis | Driver::Kafka)
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -177,6 +225,10 @@ impl Session {
                 None => return Err(AppError::new("Not connected")),
             };
             match job {
+                Job::Execute { sql, max_rows } if has_no_transactions(self.config.driver) => {
+                    // Redis and Kafka have no transactions in DataTrip: skip transaction tracking.
+                    Ok(JobOut::Query(conn.execute(&sql, max_rows).await?))
+                }
                 Job::Execute { sql, max_rows } => {
                     // Track transactions the user opens or ends with typed statements, so that
                     // manual mode re-issues BEGIN after a typed COMMIT/ROLLBACK (instead of
@@ -196,7 +248,9 @@ impl Session {
                     Ok(JobOut::Query(r))
                 }
                 Job::Export { sql, format, path } => {
-                    self.begin_if_needed(conn).await?;
+                    if !has_no_transactions(self.config.driver) {
+                        self.begin_if_needed(conn).await?;
+                    }
                     let n = export::export(conn, &sql, format, &path).await?;
                     Ok(JobOut::Count(n))
                 }
@@ -216,6 +270,49 @@ impl Session {
                 }
                 Job::Simple(sql) => {
                     conn.run_simple(&sql).await?;
+                    Ok(JobOut::Unit)
+                }
+                Job::RedisScan {
+                    pattern,
+                    cursor,
+                    count,
+                    key_type,
+                } => Ok(JobOut::RedisScan(
+                    conn.redis_scan(&pattern, &cursor, count, key_type.as_deref())
+                        .await?,
+                )),
+                Job::RedisGet { key, limit } => {
+                    Ok(JobOut::RedisValue(conn.redis_get(&key, limit).await?))
+                }
+                Job::RedisDelete(keys) => Ok(JobOut::Count(conn.redis_delete(&keys).await?)),
+                Job::RedisSetTtl { key, ttl } => {
+                    conn.redis_set_ttl(&key, ttl).await?;
+                    Ok(JobOut::Unit)
+                }
+                Job::KafkaOverview => Ok(JobOut::KafkaOverview(conn.kafka_overview().await?)),
+                Job::KafkaTopic(t) => Ok(JobOut::KafkaTopic(conn.kafka_topic(&t).await?)),
+                Job::KafkaConsume(r) => Ok(JobOut::KafkaConsume(conn.kafka_consume(r).await?)),
+                Job::KafkaProduce(r) => Ok(JobOut::KafkaProduce(conn.kafka_produce(r).await?)),
+                Job::KafkaGroup(g) => Ok(JobOut::KafkaGroup(conn.kafka_group(&g).await?)),
+                Job::KafkaResetOffsets {
+                    group,
+                    topic,
+                    to,
+                    value,
+                } => Ok(JobOut::Count(
+                    conn.kafka_reset_offsets(&group, &topic, &to, value).await?,
+                )),
+                Job::KafkaCreateTopic {
+                    topic,
+                    partitions,
+                    replication,
+                } => {
+                    conn.kafka_create_topic(&topic, partitions, replication)
+                        .await?;
+                    Ok(JobOut::Unit)
+                }
+                Job::KafkaDeleteTopic(t) => {
+                    conn.kafka_delete_topic(&t).await?;
                     Ok(JobOut::Unit)
                 }
             }
@@ -291,7 +388,145 @@ impl Session {
         }
     }
 
+    pub async fn redis_scan(
+        self: &Arc<Self>,
+        pattern: String,
+        cursor: String,
+        count: u32,
+        key_type: Option<String>,
+    ) -> AppResult<RedisScanResult> {
+        let job = Job::RedisScan {
+            pattern,
+            cursor,
+            count,
+            key_type,
+        };
+        match self.run(job).await? {
+            JobOut::RedisScan(r) => Ok(r),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn redis_get(self: &Arc<Self>, key: String, limit: usize) -> AppResult<RedisValue> {
+        match self.run(Job::RedisGet { key, limit }).await? {
+            JobOut::RedisValue(v) => Ok(v),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn redis_delete(self: &Arc<Self>, keys: Vec<String>) -> AppResult<u64> {
+        match self.run(Job::RedisDelete(keys)).await? {
+            JobOut::Count(n) => Ok(n),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn redis_set_ttl(self: &Arc<Self>, key: String, ttl: Option<i64>) -> AppResult<()> {
+        self.run(Job::RedisSetTtl { key, ttl }).await.map(|_| ())
+    }
+
+    pub async fn kafka_overview(self: &Arc<Self>) -> AppResult<KafkaOverview> {
+        match self.run(Job::KafkaOverview).await? {
+            JobOut::KafkaOverview(o) => Ok(o),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn kafka_topic(self: &Arc<Self>, topic: String) -> AppResult<KafkaTopicDetail> {
+        match self.run(Job::KafkaTopic(topic)).await? {
+            JobOut::KafkaTopic(t) => Ok(t),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn kafka_consume(
+        self: &Arc<Self>,
+        request: KafkaConsumeRequest,
+    ) -> AppResult<KafkaConsumeResult> {
+        match self.run(Job::KafkaConsume(request)).await? {
+            JobOut::KafkaConsume(r) => Ok(r),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn kafka_produce(
+        self: &Arc<Self>,
+        request: KafkaProduceRequest,
+    ) -> AppResult<KafkaProduceResult> {
+        if self.config.read_only {
+            return Err(AppError::new(
+                "This connection is read-only; producing messages is not allowed",
+            ));
+        }
+        match self.run(Job::KafkaProduce(request)).await? {
+            JobOut::KafkaProduce(r) => Ok(r),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn kafka_group(self: &Arc<Self>, group_id: String) -> AppResult<KafkaGroupDetail> {
+        match self.run(Job::KafkaGroup(group_id)).await? {
+            JobOut::KafkaGroup(g) => Ok(g),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn kafka_reset_offsets(
+        self: &Arc<Self>,
+        group: String,
+        topic: String,
+        to: String,
+        value: Option<i64>,
+    ) -> AppResult<u64> {
+        if self.config.read_only {
+            return Err(AppError::new(
+                "This connection is read-only; resetting offsets is not allowed",
+            ));
+        }
+        let job = Job::KafkaResetOffsets {
+            group,
+            topic,
+            to,
+            value,
+        };
+        match self.run(job).await? {
+            JobOut::Count(n) => Ok(n),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn kafka_create_topic(
+        self: &Arc<Self>,
+        topic: String,
+        partitions: i32,
+        replication: i32,
+    ) -> AppResult<()> {
+        if self.config.read_only {
+            return Err(AppError::new(
+                "This connection is read-only; creating topics is not allowed",
+            ));
+        }
+        let job = Job::KafkaCreateTopic {
+            topic,
+            partitions,
+            replication,
+        };
+        self.run(job).await.map(|_| ())
+    }
+
+    pub async fn kafka_delete_topic(self: &Arc<Self>, topic: String) -> AppResult<()> {
+        if self.config.read_only {
+            return Err(AppError::new(
+                "This connection is read-only; deleting topics is not allowed",
+            ));
+        }
+        self.run(Job::KafkaDeleteTopic(topic)).await.map(|_| ())
+    }
+
     pub async fn set_auto_commit(self: &Arc<Self>, on: bool) -> AppResult<()> {
+        if has_no_transactions(self.config.driver) {
+            return Ok(());
+        }
         if on && self.in_tx.load(Ordering::SeqCst) {
             self.run(Job::Simple(db::commit_sql(self.config.driver).to_string()))
                 .await?;
@@ -302,6 +537,9 @@ impl Session {
     }
 
     pub async fn commit(self: &Arc<Self>) -> AppResult<()> {
+        if has_no_transactions(self.config.driver) {
+            return Ok(());
+        }
         if !self.in_tx.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -314,6 +552,9 @@ impl Session {
     }
 
     pub async fn rollback(self: &Arc<Self>) -> AppResult<()> {
+        if has_no_transactions(self.config.driver) {
+            return Ok(());
+        }
         if !self.in_tx.load(Ordering::SeqCst) {
             return Ok(());
         }

@@ -62,6 +62,18 @@ pub fn run() {
             commands::read_text_file,
             commands::test_vault,
             commands::set_vault_token,
+            commands::redis_scan,
+            commands::redis_get,
+            commands::redis_delete,
+            commands::redis_set_ttl,
+            commands::kafka_overview,
+            commands::kafka_topic,
+            commands::kafka_consume,
+            commands::kafka_produce,
+            commands::kafka_group,
+            commands::kafka_reset_offsets,
+            commands::kafka_create_topic,
+            commands::kafka_delete_topic,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DataTrip");

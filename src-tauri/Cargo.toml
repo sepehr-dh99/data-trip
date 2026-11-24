@@ -28,6 +28,9 @@ chrono = { version = "0.4", features = ["serde"] }
 rust_decimal = "1"
 csv = "1"
 hex = "0.4"
+redis = { version = "0.27", default-features = false, features = ["aio", "tokio-comp", "tokio-rustls-comp", "tls-rustls", "tls-rustls-webpki-roots"] }
+# librdkafka is built from source with cmake (needs cmake + a C/C++ toolchain); OpenSSL is vendored. No GSSAPI.
+rdkafka = { version = "0.37", default-features = false, features = ["cmake-build", "ssl-vendored", "libz-static", "zstd", "tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [profile.release]

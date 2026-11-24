@@ -123,3 +123,75 @@ The frontend shows `message`.
   Schemas (always shown for PG/MSSQL; MySQL/SQLite skip the schema level) → Tables / Views / Materialized views /
   Routines / Sequences → Table → Columns / Keys / Foreign keys / Indexes. Each console is bound to
   (connection, database).
+
+## v0.4 additions — compact explorer, folders, visibility scope, navigator
+
+- `ConnectionConfig.folder` (string|null) groups data sources into explorer folders.
+- `ConnectionConfig.scope` (ExplorerScope|null): `databases` (null = all), `schemas` (db → visible schemas;
+  missing = all), `showNew` (databases created later are shown). Stored with the connection; UI-only.
+- Explorer default density is compact (22 px rows) with a Comfortable option persisted in local settings.
+- The capsule shows a breadcrumb navigator `<data source> › <database> › <schema> › Go to…`; each segment opens
+  a searchable switcher (↵ switches the console, ⌘/Ctrl+↵ opens a new console there).
+
+## v0.5 additions — Redis
+
+Driver `"redis"` (default port 6379). Config fields used: host, port, username (ACL user, optional), password
+(keychain or Vault), database = DB index as text ("0"–"15", default "0"), sslMode "require" = TLS (rediss),
+readOnly.
+
+| command | args | returns |
+|---|---|---|
+| redis_scan | sessionId, pattern, cursor, count, keyType: string\|null | RedisScanResult |
+| redis_get | sessionId, key, limit | RedisValue |
+| redis_delete | sessionId, keys: string[] | number |
+| redis_set_ttl | sessionId, key, ttl: number\|null | null |
+
+- `open_session(connectionId, database)` with database "3" selects DB 3. SessionInfo.database = "3"; serverVersion
+  from INFO server (redis_version / valkey_version); defaultSchema = null.
+- `execute(sessionId, text, maxRows)` runs ONE Redis command line (shell-like tokenizing: whitespace separates,
+  "…" and '…' quote with \-escapes in double quotes). Reply → QueryResult: simple/bulk string, integer, nil →
+  one row, column "value" (integer as number); arrays → one row per element, column "value" (nested arrays /
+  maps rendered as JSON text); RESP3 maps / HGETALL-style replies of known commands (HGETALL, CONFIG GET,
+  XRANGE…) may use columns "field","value"; errors → AppError with the Redis error text. `rowsAffected` = integer
+  reply for write commands (DEL, HSET, …). MULTI/EXEC, SUBSCRIBE/PSUBSCRIBE/MONITOR are refused with a clear message.
+  Read-only connections refuse write commands (by command name list). History recorded as for SQL.
+- `list_databases`: CONFIG GET databases (fallback 16) + INFO keyspace counts; DatabaseNode name "0".."N-1",
+  comment = "<keys> keys", is_current for the session DB; sizeBytes null.
+- `list_server_objects`: groups "Server" (version, mode, os, uptime), "Memory" (used/peak/maxmemory/policy),
+  "Clients" (connected, blocked), "Persistence" (rdb/aof) from INFO; ACL-denied → group error.
+- `introspect` for Redis returns [] (the explorer uses redis_scan instead).
+- `export_query` runs the command and exports its QueryResult rows.
+- Transactions: set_auto_commit/commit/rollback are no-ops for Redis; the UI hides them.
+- Cancel aborts the running command task and reconnects.
+- DataGrip import: `jdbc:redis://[user:pass@]host[:port][/db]` (and `jdbc:redis:ssl://`) → redis.
+
+## v0.6 additions — Kafka (rust-rdkafka / librdkafka)
+
+Driver `"kafka"` (default port 9092). `host` = bootstrap servers (comma separated; `port` used only when a server
+lacks one). SASL creds = username + password (keychain or Vault). `kafka: KafkaConfig` holds security protocol,
+SASL mechanism, CA / client cert paths, skip TLS verify, show internal topics. Kerberos (GSSAPI) is not supported.
+
+| command | args | returns |
+|---|---|---|
+| kafka_overview | sessionId | KafkaOverview |
+| kafka_topic | sessionId, topic | KafkaTopicDetail |
+| kafka_consume | sessionId, request: KafkaConsumeRequest | KafkaConsumeResult |
+| kafka_produce | sessionId, request: KafkaProduceRequest | KafkaProduceResult |
+| kafka_group | sessionId, groupId | KafkaGroupDetail |
+| kafka_reset_offsets | sessionId, groupId, topic, to, value | number (partitions reset) |
+| kafka_create_topic | sessionId, topic, partitions, replicationFactor | null |
+| kafka_delete_topic | sessionId, topic | null |
+
+- Consuming never joins or commits a group: manual partition assignment, `enable.auto.commit=false`, a throwaway
+  `group.id` (`datatrip-browser-<uuid>`). "latest" = the newest `limit` messages spread over partitions.
+- Produce / reset offsets / create & delete topic are refused on read-only connections. Reset requires the group
+  to be Empty.
+- `execute` on Kafka runs a small command language (one per line):
+  `topics` · `groups` · `brokers` · `describe topic <t>` · `describe group <g>` ·
+  `consume <t> [--from-beginning|--latest|--from-timestamp <ISO>|--offset <n>] [--partition <n>] [--limit <n>]
+   [--key-contains <s>] [--value-contains <s>]` · `produce <t> [key=<k>] [partition=<n>] [header.<k>=<v>]… value=<v>`
+  (values may be quoted) · `create topic <t> [partitions=<n>] [replication=<n>]` · `delete topic <t>`.
+- `list_databases` → [] ; `list_server_objects` → groups "Cluster" (id, controller, broker count) and "Brokers";
+  `introspect` → []. Transactions are no-ops; cancel aborts the job and reconnects.
+- DataGrip import: `jdbc:kafka://…`-style or Kafka data sources → unsupported for now (DataGrip stores Kafka
+  connections outside dataSources.xml).

@@ -42,10 +42,12 @@ export const CONN_COLORS = [
   "#ff4d6d",
   "#bf5af2",
   "#8e8e93",
+  "#d82c20",
+  "#5b5bd6",
 ];
 
 /** Per-driver badge colors used when a connection has no color of its own. */
-export const DRIVER_COLORS: Record<string, string> = { postgres: "#3b6fd8", mysql: "#c4701f", sqlite: "#2a9d4a", mssql: "#8e44c4" };
+export const DRIVER_COLORS: Record<string, string> = { postgres: "#3b6fd8", mysql: "#c4701f", sqlite: "#2a9d4a", mssql: "#8e44c4", redis: "#d82c20", kafka: "#5b5bd6" };
 
 /** A connection's color: its own, else its driver's default (explorer badge, tab dot). */
 export function connColor(cfg: ConnectionConfig): string {

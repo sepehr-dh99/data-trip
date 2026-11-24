@@ -11,13 +11,14 @@ import { toast } from "./toast";
 
 type Mode = "paste" | "file";
 
-const SHORT: Record<string, string> = { postgres: "PG", mysql: "MY", sqlite: "SQ", mssql: "MS" };
+const SHORT: Record<string, string> = { postgres: "PG", mysql: "MY", sqlite: "SQ", mssql: "MS", redis: "RD", kafka: "KF" };
 
 export function describeTarget(c: ConnectionConfig): string {
   if (c.driver === "sqlite") return c.filePath ?? "";
   const user = c.username ? c.username + "@" : "";
   const port = c.port != null ? ":" + c.port : "";
   const host = c.host && c.host.includes(":") ? `[${c.host}]` : c.host ?? "";
+  if (c.driver === "redis") return `${user}${host}${port} · db${c.database ?? "0"}${c.sslMode === "require" ? " · TLS" : ""}`;
   return `${user}${host}${port}${c.database ? "/" + c.database : ""}`;
 }
 
@@ -30,6 +31,8 @@ export function mergeForImport(cfg: ConnectionConfig, existing: ConnectionConfig
     readOnly: cfg.readOnly === true ? true : existing.readOnly,
     authMethod: existing.authMethod,
     vault: existing.vault,
+    folder: existing.folder ?? null,
+    scope: existing.scope ?? null,
   };
   if (!cfg.username && existing.username) merged.username = existing.username;
   return merged;

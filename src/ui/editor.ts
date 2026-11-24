@@ -13,16 +13,20 @@ import {
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
 import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
-import { HighlightStyle, bracketMatching, indentOnInput, syntaxHighlighting } from "@codemirror/language";
+import { HighlightStyle, StreamLanguage, bracketMatching, indentOnInput, syntaxHighlighting } from "@codemirror/language";
 import { MSSQL, MySQL, PostgreSQL, SQLite, sql } from "@codemirror/lang-sql";
 import { tags as t } from "@lezer/highlight";
 import { splitStatements, statementAt } from "../sqlsplit";
 import type { SplitOptions } from "../sqlsplit";
 import type { Driver } from "../types";
+import { REDIS_COMMANDS, redisLinesAt, splitRedisLines } from "./redis";
+import { CONSUME_FLAGS, KAFKA_COMMANDS, PRODUCE_FIELDS } from "./kafka";
 
 export interface EditorOptions {
   doc?: string;
   driver: Driver;
+  /** Kafka consoles: topic / group names for completion (read lazily on every keystroke). */
+  kafkaNames?: () => { topics: string[]; groups: string[] };
   onRun: () => void;
   onRunAll: () => void;
   onChange?: () => void;
@@ -35,6 +39,160 @@ export interface Runnable {
 }
 
 const DIALECTS = { postgres: PostgreSQL, mysql: MySQL, sqlite: SQLite, mssql: MSSQL } as const;
+
+// ---- Redis: plain-text mode with a tinted command word and command-name completion.
+
+interface RedisStreamState {
+  first: boolean;
+}
+interface StreamLike {
+  sol(): boolean;
+  eatSpace(): boolean;
+  match(re: RegExp): RegExpMatchArray | boolean | null;
+  next(): string | void;
+}
+
+/** One line = one command: comment lines (# or //), the command word, quoted strings and numbers. */
+const redisStream = {
+  name: "redis",
+  startState: (): RedisStreamState => ({ first: true }),
+  token(stream: StreamLike, state: RedisStreamState): string | null {
+    if (stream.sol()) state.first = true;
+    if (stream.eatSpace()) return null;
+    if (state.first && (stream.match(/^#.*/) || stream.match(/^\/\/.*/))) return "comment";
+    if (state.first && stream.match(/^[A-Za-z_][\w.]*/)) {
+      state.first = false;
+      return "typeName";
+    }
+    state.first = false;
+    if (stream.match(/^"(?:[^"\\]|\\.)*"?/) || stream.match(/^'(?:[^'\\]|\\.)*'?/)) return "string";
+    if (stream.match(/^-?\d+(?:\.\d+)?(?=\s|$)/)) return "number";
+    if (stream.match(/^[^\s"']+/)) return null;
+    stream.next();
+    return null;
+  },
+};
+
+const REDIS_COMPLETIONS = REDIS_COMMANDS.map((c) => ({
+  label: c.name,
+  detail: c.group,
+  type: "keyword",
+  info: () => {
+    const box = document.createElement("div");
+    box.className = "rd-sig";
+    const head = document.createElement("b");
+    head.textContent = c.name;
+    box.append(head, document.createTextNode(c.sig.slice(c.name.length)));
+    return box;
+  },
+}));
+
+interface CompletionCtxLike {
+  state: { doc: { lineAt(pos: number): { from: number; text: string } } };
+  pos: number;
+  explicit: boolean;
+}
+
+/** Completes the command word at the start of a line (case-insensitive: CodeMirror's matcher ignores case). */
+function redisCompletionSource(ctx: CompletionCtxLike): { from: number; options: typeof REDIS_COMPLETIONS; validFor: RegExp } | null {
+  const line = ctx.state.doc.lineAt(ctx.pos);
+  const before = line.text.slice(0, ctx.pos - line.from);
+  const m = /^\s*([A-Za-z][\w.]*)?$/.exec(before);
+  if (!m) return null;
+  const word = m[1] ?? "";
+  if (!word && !ctx.explicit) return null;
+  return { from: ctx.pos - word.length, options: REDIS_COMPLETIONS, validFor: /^[\w.]*$/ };
+}
+
+
+// ---- Kafka: line-based command language, plain text with a tinted command word / flags and completion
+// for commands, sub-commands, flags and the topic / group names of the cached cluster overview.
+
+const kafkaStream = {
+  name: "kafka",
+  startState: (): RedisStreamState => ({ first: true }),
+  token(stream: StreamLike, state: RedisStreamState): string | null {
+    if (stream.sol()) state.first = true;
+    if (stream.eatSpace()) return null;
+    if (state.first && (stream.match(/^#.*/) || stream.match(/^\/\/.*/))) return "comment";
+    if (state.first && stream.match(/^[A-Za-z_][\w]*/)) {
+      state.first = false;
+      return "typeName";
+    }
+    state.first = false;
+    if (stream.match(/^--[\w-]+/)) return "keyword";
+    if (stream.match(/^(?:key|value|partition|partitions|replication|header\.[^\s=]+)(?==)/)) return "keyword";
+    if (stream.match(/^"(?:[^"\\]|\\.)*"?/) || stream.match(/^'(?:[^'\\]|\\.)*'?/)) return "string";
+    if (stream.match(/^-?\d+(?:\.\d+)?(?=\s|$)/)) return "number";
+    if (stream.match(/^[^\s"']+/)) return null;
+    stream.next();
+    return null;
+  },
+};
+
+interface KOption {
+  label: string;
+  detail: string;
+  type: string;
+  info: () => HTMLElement;
+}
+
+const kInfo = (text: string, head = ""): (() => HTMLElement) => () => {
+  const box = document.createElement("div");
+  box.className = "rd-sig";
+  if (head) {
+    const b = document.createElement("b");
+    b.textContent = head;
+    box.append(b, document.createTextNode(text.slice(head.length)));
+  } else box.textContent = text;
+  return box;
+};
+
+const KAFKA_CMD_OPTIONS: KOption[] = KAFKA_COMMANDS.map((c) => ({ label: c.name, detail: c.detail, type: "keyword", info: kInfo(c.sig, c.name) }));
+const KAFKA_FLAG_OPTIONS: KOption[] = CONSUME_FLAGS.map((f) => ({ label: f.name, detail: f.detail, type: "property", info: kInfo(f.name + " — " + f.detail) }));
+const KAFKA_FIELD_OPTIONS: KOption[] = PRODUCE_FIELDS.map((f) => ({ label: f.name, detail: f.detail, type: "property", info: kInfo(f.name + " — " + f.detail) }));
+const KAFKA_CREATE_OPTIONS: KOption[] = [
+  { label: "partitions=", detail: "partition count", type: "property", info: kInfo("partitions=<n>") },
+  { label: "replication=", detail: "replication factor", type: "property", info: kInfo("replication=<n>") },
+];
+const kWord = (label: string, detail: string): KOption => ({ label, detail, type: "keyword", info: kInfo(`${label} — ${detail}`) });
+
+function kafkaCompletionSource(names: () => { topics: string[]; groups: string[] }) {
+  return (ctx: CompletionCtxLike): { from: number; options: KOption[]; validFor: RegExp } | null => {
+    const line = ctx.state.doc.lineAt(ctx.pos);
+    const before = line.text.slice(0, ctx.pos - line.from);
+    const word = /(\S*)$/.exec(before)?.[1] ?? "";
+    const head = before.slice(0, before.length - word.length);
+    const toks = head.trim() ? head.trim().split(/\s+/) : [];
+    if (toks.length === 0 && !word && !ctx.explicit) return null;
+    if (/^\s*(#|\/\/)/.test(before)) return null;
+    const n = names();
+    const topics = (): KOption[] => n.topics.map((t) => ({ label: t, detail: "topic", type: "variable", info: kInfo(t) }));
+    const groups = (): KOption[] => n.groups.map((g) => ({ label: g, detail: "group", type: "variable", info: kInfo(g) }));
+    let options: KOption[] = [];
+    const cmd = (toks[0] ?? "").toLowerCase();
+    if (toks.length === 0) options = KAFKA_CMD_OPTIONS;
+    else if (cmd === "describe") {
+      if (toks.length === 1) options = [kWord("topic", "describe a topic"), kWord("group", "describe a consumer group")];
+      else if (toks.length === 2) options = toks[1].toLowerCase() === "group" ? groups() : toks[1].toLowerCase() === "topic" ? topics() : [];
+    } else if (cmd === "create" || cmd === "delete") {
+      if (toks.length === 1) options = [kWord("topic", cmd + " a topic")];
+      else if (toks.length === 2 && cmd === "delete") options = topics();
+      else if (toks.length >= 3 && cmd === "create") options = KAFKA_CREATE_OPTIONS;
+    } else if (cmd === "consume") {
+      const prev = toks[toks.length - 1].toLowerCase();
+      if (toks.length === 1) options = topics();
+      else if (/^--(partition|limit|offset|from-timestamp|key-contains|value-contains)$/.test(prev)) options = [];
+      else options = KAFKA_FLAG_OPTIONS;
+    } else if (cmd === "produce") {
+      options = toks.length === 1 ? topics() : KAFKA_FIELD_OPTIONS;
+    }
+    if (!options.length) return null;
+    return { from: ctx.pos - word.length, options, validFor: /^[\w.\-=:]*$/ };
+  };
+}
+
+const KAFKA_PLACEHOLDER = "Write Kafka commands, one per line — e.g. consume orders.v2 --latest --limit 20. Ctrl/Cmd+Enter runs the line under the cursor.";
 
 function splitOptsFor(driver: Driver): SplitOptions {
   switch (driver) {
@@ -123,9 +281,11 @@ export class SqlEditor {
   private lang = new Compartment();
   private driver: Driver;
   private schema: Record<string, string[]> = {};
+  private kafkaNames: () => { topics: string[]; groups: string[] };
 
   constructor(parent: HTMLElement, opts: EditorOptions) {
     this.driver = opts.driver;
+    this.kafkaNames = opts.kafkaNames ?? (() => ({ topics: [], groups: [] }));
     const onChange = opts.onChange;
     const extensions: Extension[] = [
       lineNumbers(),
@@ -136,10 +296,8 @@ export class SqlEditor {
       indentOnInput(),
       bracketMatching(),
       closeBrackets(),
-      autocompletion({ icons: false }),
       highlightSelectionMatches(),
       syntaxHighlighting(highlight),
-      placeholder("Write SQL here — Ctrl/Cmd+Enter runs the statement at the cursor."),
       this.lang.of(this.langExtension()),
       keymap.of([
         ...closeBracketsKeymap,
@@ -174,11 +332,34 @@ export class SqlEditor {
   }
 
   private langExtension(): Extension {
-    return sql({
-      dialect: DIALECTS[this.driver],
-      schema: this.schema,
-      upperCaseKeywords: true,
-    });
+    if (this.driver === "kafka") {
+      return [
+        StreamLanguage.define(kafkaStream),
+        autocompletion({ icons: false, override: [kafkaCompletionSource(() => this.kafkaNames())] }),
+        placeholder(KAFKA_PLACEHOLDER),
+      ];
+    }
+    if (this.driver === "redis") {
+      return [
+        StreamLanguage.define(redisStream),
+        autocompletion({ icons: false, override: [redisCompletionSource] }),
+        placeholder("Write Redis commands, one per line — Ctrl/Cmd+Enter runs the line under the cursor."),
+      ];
+    }
+    return [
+      sql({
+        dialect: DIALECTS[this.driver],
+        schema: this.schema,
+        upperCaseKeywords: true,
+      }),
+      autocompletion({ icons: false }),
+      placeholder("Write SQL here — Ctrl/Cmd+Enter runs the statement at the cursor."),
+    ];
+  }
+
+  /** Redis and Kafka consoles are line-based: one command per line. */
+  private lineBased(): boolean {
+    return this.driver === "redis" || this.driver === "kafka";
   }
 
   getText(): string {
@@ -205,7 +386,12 @@ export class SqlEditor {
       const raw = st.sliceDoc(sel.from, sel.to);
       const text = raw.trim();
       if (!text) return null;
+      if (this.lineBased()) return { text, from: sel.from, to: sel.to };
       return { text: text.replace(/;\s*$/, ""), from: sel.from, to: sel.to };
+    }
+    if (this.lineBased()) {
+      const l = redisLinesAt(st.doc.toString(), sel.head, sel.head)[0];
+      return l ?? null;
     }
     const s = statementAt(st.doc.toString(), sel.head, splitOptsFor(this.driver));
     return s ? { text: s.text, from: s.start, to: s.end } : null;
@@ -213,10 +399,12 @@ export class SqlEditor {
 
   /** Splits arbitrary text (e.g. a selection) into statements using this editor's dialect. */
   splitText(text: string): string[] {
+    if (this.lineBased()) return splitRedisLines(text).map((l) => l.text);
     return splitStatements(text, splitOptsFor(this.driver)).map((s) => s.text);
   }
 
   getAllStatements(): Runnable[] {
+    if (this.lineBased()) return splitRedisLines(this.getText());
     return splitStatements(this.getText(), splitOptsFor(this.driver)).map((s) => ({
       text: s.text,
       from: s.start,
@@ -228,6 +416,96 @@ export class SqlEditor {
     this.schema = schema;
     this.driver = driver;
     this.view.dispatch({ effects: this.lang.reconfigure(this.langExtension()) });
+  }
+
+  focus(): void {
+    this.view.focus();
+  }
+
+  destroy(): void {
+    this.view.destroy();
+  }
+}
+
+// ---- A small plain / JSON text editor (Kafka produce dialog).
+
+const jsonStream = {
+  name: "json",
+  startState: (): Record<string, never> => ({}),
+  token(stream: StreamLike): string | null {
+    if (stream.eatSpace()) return null;
+    if (stream.match(/^"(?:[^"\\]|\\.)*"(?=\s*:)/)) return "typeName";
+    if (stream.match(/^"(?:[^"\\]|\\.)*"?/)) return "string";
+    if (stream.match(/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/)) return "number";
+    if (stream.match(/^(?:true|false|null)\b/)) return "keyword";
+    stream.next();
+    return null;
+  },
+};
+
+export interface TextEditorOptions {
+  doc?: string;
+  placeholder?: string;
+  onChange?: () => void;
+  /** Ctrl/Cmd+Enter. */
+  onSubmit?: () => void;
+}
+
+export class TextEditor {
+  private view: EditorView;
+  private lang = new Compartment();
+  private json = false;
+
+  constructor(parent: HTMLElement, private opts: TextEditorOptions) {
+    const onChange = opts.onChange;
+    this.view = new EditorView({
+      state: EditorState.create({
+        doc: opts.doc ?? "",
+        extensions: [
+          history(),
+          drawSelection(),
+          closeBrackets(),
+          syntaxHighlighting(highlight),
+          this.lang.of(this.langExtension()),
+          keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, indentWithTab]),
+          theme,
+          EditorView.updateListener.of((u: { docChanged: boolean }) => {
+            if (u.docChanged && onChange) onChange();
+          }),
+        ],
+      }),
+      parent,
+    });
+    parent.addEventListener(
+      "keydown",
+      (e: KeyboardEvent) => {
+        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+          e.preventDefault();
+          e.stopPropagation();
+          opts.onSubmit?.();
+        }
+      },
+      true,
+    );
+  }
+
+  private langExtension(): Extension {
+    return [...(this.json ? [StreamLanguage.define(jsonStream)] : []), ...(this.opts.placeholder ? [placeholder(this.opts.placeholder)] : [])];
+  }
+
+  /** JSON colors on / off (the dialog turns them on while the text parses as JSON). */
+  setJson(on: boolean): void {
+    if (on === this.json) return;
+    this.json = on;
+    this.view.dispatch({ effects: this.lang.reconfigure(this.langExtension()) });
+  }
+
+  getText(): string {
+    return this.view.state.doc.toString();
+  }
+
+  setText(text: string): void {
+    this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
   }
 
   focus(): void {

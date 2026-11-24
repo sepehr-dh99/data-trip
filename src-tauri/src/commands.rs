@@ -2,8 +2,10 @@
 
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    AuthMethod, ConnectionConfig, DatabaseNode, Driver, ExportFormat, HistoryEntry, ObjectGroup,
-    QueryResult, RowEdit, SchemaNode, ServerInfo, SessionInfo, VaultCheck, VaultTokenSource,
+    AuthMethod, ConnectionConfig, DatabaseNode, Driver, ExportFormat, HistoryEntry,
+    KafkaConsumeRequest, KafkaConsumeResult, KafkaGroupDetail, KafkaOverview, KafkaProduceRequest,
+    KafkaProduceResult, KafkaTopicDetail, ObjectGroup, QueryResult, RedisScanResult, RedisValue,
+    RowEdit, SchemaNode, ServerInfo, SessionInfo, VaultCheck, VaultTokenSource,
 };
 use crate::session::Session;
 use crate::{vault, AppState};
@@ -288,4 +290,146 @@ pub async fn read_text_file(path: String) -> AppResult<String> {
         return Err(AppError::new("File is larger than 8 MiB"));
     }
     String::from_utf8(bytes).map_err(|_| AppError::new("File is not valid UTF-8 text"))
+}
+
+/// Redis: one SCAN step on the session's database (keys sorted, with type and TTL).
+#[tauri::command]
+pub async fn redis_scan(
+    state: State<'_, AppState>,
+    session_id: String,
+    pattern: String,
+    cursor: String,
+    count: u32,
+    key_type: Option<String>,
+) -> AppResult<RedisScanResult> {
+    let s = state.sessions.get(&session_id)?;
+    s.redis_scan(pattern, cursor, count, key_type).await
+}
+
+/// Redis: a key's value; collections are limited to the first `limit` elements.
+#[tauri::command]
+pub async fn redis_get(
+    state: State<'_, AppState>,
+    session_id: String,
+    key: String,
+    limit: u32,
+) -> AppResult<RedisValue> {
+    let s = state.sessions.get(&session_id)?;
+    s.redis_get(key, limit as usize).await
+}
+
+/// Redis: deletes keys (UNLINK, falling back to DEL). Returns how many existed.
+#[tauri::command]
+pub async fn redis_delete(
+    state: State<'_, AppState>,
+    session_id: String,
+    keys: Vec<String>,
+) -> AppResult<u64> {
+    let s = state.sessions.get(&session_id)?;
+    s.redis_delete(keys).await
+}
+
+/// Redis: sets a TTL in seconds, or removes the expiry when `ttl` is null.
+#[tauri::command]
+pub async fn redis_set_ttl(
+    state: State<'_, AppState>,
+    session_id: String,
+    key: String,
+    ttl: Option<i64>,
+) -> AppResult<()> {
+    let s = state.sessions.get(&session_id)?;
+    s.redis_set_ttl(key, ttl).await
+}
+
+/// Kafka: brokers, topics and consumer groups.
+#[tauri::command]
+pub async fn kafka_overview(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> AppResult<KafkaOverview> {
+    let s = state.sessions.get(&session_id)?;
+    s.kafka_overview().await
+}
+
+/// Kafka: partitions with watermarks and topic configs.
+#[tauri::command]
+pub async fn kafka_topic(
+    state: State<'_, AppState>,
+    session_id: String,
+    topic: String,
+) -> AppResult<KafkaTopicDetail> {
+    let s = state.sessions.get(&session_id)?;
+    s.kafka_topic(topic).await
+}
+
+/// Kafka: reads messages without joining or committing any consumer group.
+#[tauri::command]
+pub async fn kafka_consume(
+    state: State<'_, AppState>,
+    session_id: String,
+    request: KafkaConsumeRequest,
+) -> AppResult<KafkaConsumeResult> {
+    let s = state.sessions.get(&session_id)?;
+    s.kafka_consume(request).await
+}
+
+/// Kafka: produces one message. Refused on read-only connections.
+#[tauri::command]
+pub async fn kafka_produce(
+    state: State<'_, AppState>,
+    session_id: String,
+    request: KafkaProduceRequest,
+) -> AppResult<KafkaProduceResult> {
+    let s = state.sessions.get(&session_id)?;
+    s.kafka_produce(request).await
+}
+
+/// Kafka: group state, members and per-partition lag.
+#[tauri::command]
+pub async fn kafka_group(
+    state: State<'_, AppState>,
+    session_id: String,
+    group_id: String,
+) -> AppResult<KafkaGroupDetail> {
+    let s = state.sessions.get(&session_id)?;
+    s.kafka_group(group_id).await
+}
+
+/// Kafka: resets a group's committed offsets for a topic (group must be Empty).
+#[tauri::command]
+pub async fn kafka_reset_offsets(
+    state: State<'_, AppState>,
+    session_id: String,
+    group_id: String,
+    topic: String,
+    to: String,
+    value: Option<i64>,
+) -> AppResult<u64> {
+    let s = state.sessions.get(&session_id)?;
+    s.kafka_reset_offsets(group_id, topic, to, value).await
+}
+
+/// Kafka: creates a topic. Refused on read-only connections.
+#[tauri::command]
+pub async fn kafka_create_topic(
+    state: State<'_, AppState>,
+    session_id: String,
+    topic: String,
+    partitions: i32,
+    replication_factor: i32,
+) -> AppResult<()> {
+    let s = state.sessions.get(&session_id)?;
+    s.kafka_create_topic(topic, partitions, replication_factor)
+        .await
+}
+
+/// Kafka: deletes a topic. Refused on read-only connections.
+#[tauri::command]
+pub async fn kafka_delete_topic(
+    state: State<'_, AppState>,
+    session_id: String,
+    topic: String,
+) -> AppResult<()> {
+    let s = state.sessions.get(&session_id)?;
+    s.kafka_delete_topic(topic).await
 }

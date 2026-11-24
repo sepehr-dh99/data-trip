@@ -11,9 +11,11 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
+pub mod kafka;
 pub mod mssql;
 pub mod mysql;
 pub mod postgres;
+pub mod redis;
 pub mod sqlite;
 
 // ---------------------------------------------------------------------------
@@ -99,6 +101,8 @@ pub enum DbConn {
     Mysql(sqlx::MySqlConnection),
     Sqlite(sqlx::SqliteConnection),
     Mssql(tiberius::Client<tokio_util::compat::Compat<tokio::net::TcpStream>>),
+    Redis(self::redis::RedisConn),
+    Kafka(self::kafka::KafkaConn),
 }
 
 pub struct Connected {
@@ -123,6 +127,8 @@ pub fn connect<'a>(
                 Driver::Mysql => mysql::connect(cfg, password).await,
                 Driver::Sqlite => sqlite::connect(cfg).await,
                 Driver::Mssql => mssql::connect(cfg, password).await,
+                Driver::Redis => self::redis::connect(cfg, password).await,
+                Driver::Kafka => self::kafka::connect(cfg, password).await,
             }
         };
         match tokio::time::timeout(Duration::from_secs(15), fut).await {
@@ -160,6 +166,8 @@ impl DbConn {
             DbConn::Mysql(_) => Driver::Mysql,
             DbConn::Sqlite(_) => Driver::Sqlite,
             DbConn::Mssql(_) => Driver::Mssql,
+            DbConn::Redis(_) => Driver::Redis,
+            DbConn::Kafka(_) => Driver::Kafka,
         }
     }
 
@@ -171,6 +179,8 @@ impl DbConn {
                 DbConn::Mysql(c) => mysql::close(c).await,
                 DbConn::Sqlite(c) => sqlite::close(c).await,
                 DbConn::Mssql(c) => drop(c),
+                DbConn::Redis(c) => drop(c),
+                DbConn::Kafka(c) => kafka::close(c).await,
             }
         })
     }
@@ -187,6 +197,8 @@ impl DbConn {
                 DbConn::Mysql(c) => mysql::stream(c, sql, sink).await,
                 DbConn::Sqlite(c) => sqlite::stream(c, sql, sink).await,
                 DbConn::Mssql(c) => mssql::stream(c, sql, sink).await,
+                DbConn::Redis(c) => self::redis::stream(c, sql, sink).await,
+                DbConn::Kafka(c) => self::kafka::stream(c, sql, sink).await,
             }
         })
     }
@@ -233,6 +245,8 @@ impl DbConn {
                 DbConn::Mysql(c) => mysql::run_simple(c, sql).await,
                 DbConn::Sqlite(c) => sqlite::run_simple(c, sql).await,
                 DbConn::Mssql(c) => mssql::run_simple(c, sql).await,
+                // No transactions: BEGIN/COMMIT/ROLLBACK are never issued for Redis.
+                DbConn::Redis(_) | DbConn::Kafka(_) => Ok(()),
             }
         })
     }
@@ -246,6 +260,7 @@ impl DbConn {
                 DbConn::Mysql(c) => mysql::introspect(c).await,
                 DbConn::Sqlite(c) => sqlite::introspect(c).await,
                 DbConn::Mssql(c) => mssql::introspect(c).await,
+                DbConn::Redis(_) | DbConn::Kafka(_) => Ok(Vec::new()),
             }
         })
     }
@@ -254,11 +269,16 @@ impl DbConn {
         &'a mut self,
     ) -> futures::future::BoxFuture<'a, AppResult<Vec<DatabaseNode>>> {
         Box::pin(async move {
+            if let DbConn::Redis(c) = self {
+                // Numeric order, not alphabetical: keep as returned.
+                return self::redis::list_databases(c).await;
+            }
             let mut dbs = match self {
                 DbConn::Postgres(c) => postgres::list_databases(c).await?,
                 DbConn::Mysql(c) => mysql::list_databases(c).await?,
                 DbConn::Sqlite(c) => sqlite::list_databases(c).await?,
                 DbConn::Mssql(c) => mssql::list_databases(c).await?,
+                DbConn::Redis(_) | DbConn::Kafka(_) => Vec::new(),
             };
             sort_databases(&mut dbs);
             Ok(dbs)
@@ -274,7 +294,152 @@ impl DbConn {
                 DbConn::Mysql(c) => mysql::list_server_objects(c).await,
                 DbConn::Sqlite(_) => Ok(Vec::new()),
                 DbConn::Mssql(c) => mssql::list_server_objects(c).await,
+                DbConn::Redis(c) => self::redis::list_server_objects(c).await,
+                DbConn::Kafka(c) => self::kafka::list_server_objects(c).await,
             }
+        })
+    }
+
+    fn redis_conn(&mut self) -> AppResult<&mut self::redis::RedisConn> {
+        match self {
+            DbConn::Redis(c) => Ok(c),
+            _ => Err(AppError::new("This operation is only available for Redis")),
+        }
+    }
+
+    pub fn redis_scan<'a>(
+        &'a mut self,
+        pattern: &'a str,
+        cursor: &'a str,
+        count: u32,
+        key_type: Option<&'a str>,
+    ) -> futures::future::BoxFuture<'a, AppResult<crate::model::RedisScanResult>> {
+        Box::pin(async move {
+            let c = self.redis_conn()?;
+            self::redis::scan(c, pattern, cursor, count, key_type).await
+        })
+    }
+
+    pub fn redis_get<'a>(
+        &'a mut self,
+        key: &'a str,
+        limit: usize,
+    ) -> futures::future::BoxFuture<'a, AppResult<crate::model::RedisValue>> {
+        Box::pin(async move {
+            let c = self.redis_conn()?;
+            self::redis::get(c, key, limit).await
+        })
+    }
+
+    pub fn redis_delete<'a>(
+        &'a mut self,
+        keys: &'a [String],
+    ) -> futures::future::BoxFuture<'a, AppResult<u64>> {
+        Box::pin(async move {
+            let c = self.redis_conn()?;
+            self::redis::delete(c, keys).await
+        })
+    }
+
+    pub fn redis_set_ttl<'a>(
+        &'a mut self,
+        key: &'a str,
+        ttl: Option<i64>,
+    ) -> futures::future::BoxFuture<'a, AppResult<()>> {
+        Box::pin(async move {
+            let c = self.redis_conn()?;
+            self::redis::set_ttl(c, key, ttl).await
+        })
+    }
+
+    fn kafka_conn(&mut self) -> AppResult<&mut self::kafka::KafkaConn> {
+        match self {
+            DbConn::Kafka(c) => Ok(c),
+            _ => Err(AppError::new("This operation is only available for Kafka")),
+        }
+    }
+
+    pub fn kafka_overview<'a>(
+        &'a mut self,
+    ) -> futures::future::BoxFuture<'a, AppResult<crate::model::KafkaOverview>> {
+        Box::pin(async move {
+            let c = self.kafka_conn()?;
+            self::kafka::overview(c).await
+        })
+    }
+
+    pub fn kafka_topic<'a>(
+        &'a mut self,
+        topic: &'a str,
+    ) -> futures::future::BoxFuture<'a, AppResult<crate::model::KafkaTopicDetail>> {
+        Box::pin(async move {
+            let c = self.kafka_conn()?;
+            self::kafka::topic(c, topic).await
+        })
+    }
+
+    pub fn kafka_consume<'a>(
+        &'a mut self,
+        req: crate::model::KafkaConsumeRequest,
+    ) -> futures::future::BoxFuture<'a, AppResult<crate::model::KafkaConsumeResult>> {
+        Box::pin(async move {
+            let c = self.kafka_conn()?;
+            self::kafka::consume(c, req).await
+        })
+    }
+
+    pub fn kafka_produce<'a>(
+        &'a mut self,
+        req: crate::model::KafkaProduceRequest,
+    ) -> futures::future::BoxFuture<'a, AppResult<crate::model::KafkaProduceResult>> {
+        Box::pin(async move {
+            let c = self.kafka_conn()?;
+            self::kafka::produce(c, req).await
+        })
+    }
+
+    pub fn kafka_group<'a>(
+        &'a mut self,
+        group: &'a str,
+    ) -> futures::future::BoxFuture<'a, AppResult<crate::model::KafkaGroupDetail>> {
+        Box::pin(async move {
+            let c = self.kafka_conn()?;
+            self::kafka::group(c, group).await
+        })
+    }
+
+    pub fn kafka_reset_offsets<'a>(
+        &'a mut self,
+        group: &'a str,
+        topic: &'a str,
+        to: &'a str,
+        value: Option<i64>,
+    ) -> futures::future::BoxFuture<'a, AppResult<u64>> {
+        Box::pin(async move {
+            let c = self.kafka_conn()?;
+            self::kafka::reset_offsets(c, group, topic, to, value).await
+        })
+    }
+
+    pub fn kafka_create_topic<'a>(
+        &'a mut self,
+        topic: &'a str,
+        partitions: i32,
+        replication: i32,
+    ) -> futures::future::BoxFuture<'a, AppResult<()>> {
+        Box::pin(async move {
+            let c = self.kafka_conn()?;
+            self::kafka::create_topic(c, topic, partitions, replication).await
+        })
+    }
+
+    pub fn kafka_delete_topic<'a>(
+        &'a mut self,
+        topic: &'a str,
+    ) -> futures::future::BoxFuture<'a, AppResult<()>> {
+        Box::pin(async move {
+            let c = self.kafka_conn()?;
+            self::kafka::delete_topic(c, topic).await
         })
     }
 
@@ -289,6 +454,8 @@ impl DbConn {
                 DbConn::Mysql(c) => mysql::exec_params(c, sql, params).await,
                 DbConn::Sqlite(c) => sqlite::exec_params(c, sql, params).await,
                 DbConn::Mssql(c) => mssql::exec_params(c, sql, params).await,
+                DbConn::Redis(_) => Err(AppError::new("Row edits are not supported for Redis")),
+                DbConn::Kafka(_) => Err(AppError::new("Row edits are not supported for Kafka")),
             }
         })
     }
@@ -360,6 +527,7 @@ pub fn begin_sql(d: Driver) -> &'static str {
         Driver::Mysql => "START TRANSACTION",
         Driver::Sqlite => "BEGIN",
         Driver::Mssql => "BEGIN TRANSACTION",
+        Driver::Redis | Driver::Kafka => "",
     }
 }
 
@@ -406,7 +574,9 @@ pub fn quote_ident(d: Driver, name: &str) -> String {
     match d {
         Driver::Mysql => format!("`{}`", name.replace('`', "``")),
         Driver::Mssql => format!("[{}]", name.replace(']', "]]")),
-        Driver::Postgres | Driver::Sqlite => format!("\"{}\"", name.replace('"', "\"\"")),
+        Driver::Postgres | Driver::Sqlite | Driver::Redis | Driver::Kafka => {
+            format!("\"{}\"", name.replace('"', "\"\""))
+        }
     }
 }
 
@@ -447,7 +617,7 @@ impl ParamBuilder {
                 }
                 _ => format!("${}", n),
             },
-            Driver::Mysql | Driver::Sqlite => "?".to_string(),
+            Driver::Mysql | Driver::Sqlite | Driver::Redis | Driver::Kafka => "?".to_string(),
             Driver::Mssql => format!("@P{}", n),
         })
     }

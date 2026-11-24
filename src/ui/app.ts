@@ -12,6 +12,14 @@ import { brandMark, clear, copyText, errMsg, h, icon } from "./dom";
 import { Explorer } from "./explorer";
 import type { OpenConsoleOpts } from "./explorer";
 import { HistoryPanel } from "./history";
+import { GroupPane } from "./kafkaGroup";
+import { TopicPane } from "./kafkaTopic";
+import { KeyPane } from "./keyView";
+import type { KeyHost } from "./keyView";
+import { dbLabel } from "./redis";
+import type { TabPane } from "./tabs";
+import { Navigator } from "./navigator";
+import { openScopePicker } from "./scopePicker";
 import { store } from "./state";
 import { connColor } from "./sqlutil";
 import { toast } from "./toast";
@@ -20,13 +28,15 @@ const IS_MAC = /Mac/.test(navigator.userAgent);
 const MOD = IS_MAC ? "⌘" : "Ctrl+";
 
 export class App {
-  private tabs: ConsolePane[] = [];
-  private active: ConsolePane | null = null;
+  private tabs: TabPane[] = [];
+  private active: TabPane | null = null;
   private explorer: Explorer;
   private history: HistoryPanel;
   private tabsEl = h("div", { class: "cap-tabs", role: "tablist", "aria-label": "Consoles" });
-  private tabEls = new Map<ConsolePane, HTMLElement>();
+  private tabEls = new Map<TabPane, HTMLElement>();
   private capSep = h("span", { class: "cap-sep", "aria-hidden": "true" });
+  private capSep2 = h("span", { class: "cap-sep", "aria-hidden": "true" });
+  private navigator!: Navigator;
   private capActions = h("div", { class: "cap-actions" });
   private btnAdd!: HTMLButtonElement;
   private stack = h("div", { class: "stack" });
@@ -37,6 +47,9 @@ export class App {
   private prevStatus = new Map<string, string>();
   private btnHistory!: HTMLButtonElement;
   private shell!: HTMLElement;
+  private capsule!: HTMLElement;
+  private sheetEl!: HTMLElement;
+  private capFitQueued = false;
   private sidebarHidden = false;
 
   constructor(private root: HTMLElement) {
@@ -50,16 +63,40 @@ export class App {
       onSelect: (id) => {
         this.selectedConn = id;
       },
+      openKey: (id, db, key, type) => void this.openKey(id, db, key, type),
+      keysDeleted: (id, db, keys) => {
+        const gone = new Set(keys);
+        for (const t of this.tabs) if (t instanceof KeyPane && t.connId === id && t.effectiveDatabase === db && gone.has(t.key)) t.markGone();
+      },
+      keyTouched: (id, db, key) => {
+        for (const t of this.tabs) if (t instanceof KeyPane && t.matches(id, db, key)) void t.load();
+      },
+      openTopic: (id, topic) => void this.openTopic(id, topic),
+      openGroup: (id, group) => void this.openGroup(id, group),
+      produceTo: (id, topic) => void this.openTopic(id, topic, true),
+      topicDeleted: (id, topic) => {
+        for (const t of this.tabs.filter((x) => x instanceof TopicPane && x.matches(id, topic))) void this.closeTab(t);
+      },
+    });
+    this.navigator = new Navigator({
+      sheet: () => this.shell.querySelector<HTMLElement>(".sheet") ?? this.root,
+      openConsole: (id, o) => void this.openConsole(id, o),
+      openKey: (id, db, key, type) => void this.openKey(id, db, key, type),
+      openTopic: (id, topic) => void this.openTopic(id, topic),
+      openGroup: (id, group) => void this.openGroup(id, group),
+      manageScope: (id, r) => openScopePicker(id, { x: r.left, y: r.bottom + 8 }),
     });
     this.history = new HistoryPanel({
       insert: (sql) => {
-        if (!this.active) return toast("Open a console first", "info");
-        this.active.insertSql(sql);
+        const c = this.activeConsole();
+        if (!c) return toast("Open a console first", "info");
+        c.insertSql(sql);
       },
       run: (sql) => {
-        if (!this.active) return toast("Open a console first", "info");
+        const c = this.activeConsole();
+        if (!c) return toast("Open a console first", "info");
         // The first click of the double-click already inserted the SQL.
-        void this.active.runSqlText(sql);
+        void c.runSqlText(sql);
       },
       close: () => {
         if (this.history.isOpen()) this.toggleHistory();
@@ -70,6 +107,10 @@ export class App {
     store.onSchema((id) => this.tabs.filter((t) => t.connId === id).forEach((t) => t.updateSchema()));
     window.addEventListener("keydown", (e) => this.onKey(e));
     window.addEventListener("paste", (e) => this.onPaste(e));
+  }
+
+  private activeConsole(): ConsolePane | null {
+    return this.active instanceof ConsolePane ? this.active : null;
   }
 
   private importDataGrip(initialText = ""): void {
@@ -123,9 +164,12 @@ export class App {
       { class: "capsule", role: "toolbar", "aria-label": "Console" },
       h("div", { class: "cap-tabs-wrap" }, this.tabsEl, this.btnAdd),
       this.capSep,
+      this.navigator.el,
+      this.capSep2,
       this.capActions,
       this.btnHistory,
     );
+    this.capsule = capsule;
     // Translate vertical wheel into horizontal scrolling for the overflowing tab strip.
     this.tabsEl.addEventListener(
       "wheel",
@@ -175,11 +219,26 @@ export class App {
     });
     this.explorer.el.appendChild(resizer);
 
+    this.sheetEl = sheet;
+    new ResizeObserver(() => this.fitCapsule()).observe(sheet);
     this.shell = h("div", { class: "shell" }, this.explorer.el, sheet);
     this.applySidebar();
     clear(this.root);
     this.root.append(ambient, this.shell);
     this.explorer.render();
+  }
+
+  /** Single-line capsule when it fits; otherwise breadcrumb on its own second row. */
+  private fitCapsule(): void {
+    if (this.capFitQueued) return;
+    this.capFitQueued = true;
+    requestAnimationFrame(() => {
+      this.capFitQueued = false;
+      this.capsule.classList.remove("stacked");
+      const over = this.capsule.scrollWidth > this.capsule.clientWidth + 1;
+      this.capsule.classList.toggle("stacked", over);
+      this.sheetEl.classList.toggle("cap-stacked", over);
+    });
   }
 
   private applySidebar(): void {
@@ -214,7 +273,19 @@ export class App {
       this.tabEls.get(c)?.classList.toggle("running", c.isRunning);
     },
     onSchemaChanged: (id) => void store.refresh(id).catch(() => undefined),
-    onDatabase: () => this.renderTabs(),
+    onDatabase: () => {
+      this.renderTabs();
+      this.syncHistoryConn();
+    },
+    ensureConnected: async (id) => {
+      if (store.conns.get(id)?.status === "connected") return true;
+      try {
+        await this.explorer.connect(id);
+      } catch {
+        return false;
+      }
+      return store.conns.get(id)?.status === "connected";
+    },
   };
 
   private async newConsole(): Promise<void> {
@@ -248,10 +319,83 @@ export class App {
     this.tabs.push(pane);
     this.stack.appendChild(pane.el);
     this.activate(pane);
+    if (opts.explicitSchema && opts.schema) void pane.setDefaultSchema(opts.schema);
     if (opts.run && opts.sql) void pane.runSqlText(opts.sql);
   }
 
-  private activate(pane: ConsolePane | null): void {
+  private keyHost: KeyHost = {
+    changed: () => this.renderTabs(),
+    keysDeleted: (id, db, keys) => {
+      this.explorer.redisKeysRemoved(id, db, keys);
+      const gone = new Set(keys);
+      for (const t of this.tabs) if (t instanceof KeyPane && t.connId === id && t.effectiveDatabase === db && gone.has(t.key) && !t.isGone) t.markGone();
+    },
+    ttlChanged: (id, db, key, ttl) => this.explorer.redisTtlChanged(id, db, key, ttl),
+  };
+
+  /** Opens (or focuses) the viewer tab of a Redis key. */
+  private async openKey(connId: string, db: string, key: string, keyType: string): Promise<void> {
+    const entry = store.conns.get(connId);
+    if (!entry) return;
+    if (entry.status !== "connected") {
+      try {
+        await this.explorer.connect(connId);
+      } catch {
+        return;
+      }
+      if (store.conns.get(connId)?.status !== "connected") return;
+    }
+    const existing = this.tabs.find((t) => t instanceof KeyPane && t.matches(connId, db, key));
+    if (existing) {
+      this.activate(existing);
+      return;
+    }
+    const pane = new KeyPane(connId, db, key, this.keyHost, keyType);
+    this.tabs.push(pane);
+    this.stack.appendChild(pane.el);
+    this.activate(pane);
+  }
+
+  /** Connects the data source when needed; true when it is connected. */
+  private async ensureConn(connId: string): Promise<boolean> {
+    const entry = store.conns.get(connId);
+    if (!entry) return false;
+    if (entry.status !== "connected") {
+      try {
+        await this.explorer.connect(connId);
+      } catch {
+        return false;
+      }
+    }
+    return store.conns.get(connId)?.status === "connected";
+  }
+
+  /** Opens (or focuses) the tab of a Kafka topic; `produce` also opens the produce dialog. */
+  private async openTopic(connId: string, topic: string, produce = false): Promise<void> {
+    if (!(await this.ensureConn(connId))) return;
+    let pane = this.tabs.find((t): t is TopicPane => t instanceof TopicPane && t.matches(connId, topic));
+    if (!pane) {
+      pane = new TopicPane(connId, topic);
+      this.tabs.push(pane);
+      this.stack.appendChild(pane.el);
+    }
+    this.activate(pane);
+    if (produce) pane.produce();
+  }
+
+  /** Opens (or focuses) the tab of a Kafka consumer group. */
+  private async openGroup(connId: string, groupId: string): Promise<void> {
+    if (!(await this.ensureConn(connId))) return;
+    let pane = this.tabs.find((t): t is GroupPane => t instanceof GroupPane && t.matches(connId, groupId));
+    if (!pane) {
+      pane = new GroupPane(connId, groupId);
+      this.tabs.push(pane);
+      this.stack.appendChild(pane.el);
+    }
+    this.activate(pane);
+  }
+
+  private activate(pane: TabPane | null): void {
     this.active = pane;
     for (const t of this.tabs) t.el.classList.toggle("hidden", t !== pane);
     clear(this.capActions);
@@ -273,7 +417,7 @@ export class App {
       const color = e ? connColor(e.config) : "var(--accent)";
       const isActive = t === this.active;
       const server = e ? `${DRIVER_LABELS[e.config.driver].split(" / ")[0]}${e.session?.serverVersion ? " " + e.session.serverVersion : ""}` : "";
-      const dbName = t.effectiveDatabase;
+      const dbName = e?.config.driver === "redis" && t.effectiveDatabase !== null ? dbLabel(t.effectiveDatabase) : t.effectiveDatabase;
       const close = h(
         "button",
         { class: "tab-close", type: "button", tabindex: "-1", title: `Close (${MOD}W)`, "aria-label": `Close ${t.title}`, onclick: (ev: Event) => (ev.stopPropagation(), void this.closeTab(t)) },
@@ -289,8 +433,8 @@ export class App {
           title: `${t.title} — ${e?.config.name ?? ""}${dbName ? " · " + dbName : ""}${server ? " (" + server + ")" : ""}`,
           "aria-selected": String(isActive),
         },
-        h("span", { class: "tab-dot", "aria-hidden": "true" }),
-        h("span", { class: "tab-title" }, t.title),
+        t.tabIcon ? h("span", { class: "tab-ico " + t.tabIcon.cls, "aria-hidden": "true" }, icon(t.tabIcon.icon, 13)) : h("span", { class: "tab-dot", "aria-hidden": "true" }),
+        h("span", { class: "tab-title" + (t.kind === "key" || t.kind === "topic" || t.kind === "group" ? " mono" : "") }, t.title),
         isActive && dbName ? h("span", { class: "tab-db" }, "· " + dbName) : null,
         close,
       );
@@ -319,7 +463,10 @@ export class App {
       this.tabsEl.appendChild(tab);
     }
     const has = this.tabs.length > 0;
-    this.capSep.hidden = !this.active;
+    this.navigator.update(this.active);
+    this.fitCapsule();
+    this.capSep.hidden = this.navigator.el.hidden;
+    this.capSep2.hidden = !this.active || this.active.controls.childElementCount === 0;
     this.btnAdd.classList.toggle("labeled", !has);
     clear(this.btnAdd);
     this.btnAdd.append(icon("plus", 15), has ? "" : h("span", null, "New console"));
@@ -337,7 +484,7 @@ export class App {
     }
   }
 
-  private async closeTab(t: ConsolePane): Promise<void> {
+  private async closeTab(t: TabPane): Promise<void> {
     const i = this.tabs.indexOf(t);
     if (i < 0) return;
     this.tabs.splice(i, 1);
@@ -419,8 +566,8 @@ export class App {
           "p",
           null,
           hasConns
-            ? "Double-click a table in the explorer to browse its rows, or start a blank console and write some SQL."
-            : "DataTrip works with PostgreSQL, MySQL / MariaDB, SQLite and SQL Server. Credentials stay in your system keychain.",
+            ? "Double-click a table (or click a Redis key, Kafka topic or group) in the explorer to open it, or start a blank console and write some SQL."
+            : "DataTrip works with PostgreSQL, MySQL / MariaDB, SQLite, SQL Server, Redis and Kafka. Credentials stay in your system keychain.",
         ),
         h(
           "div",
