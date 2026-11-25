@@ -5,7 +5,7 @@ use crate::db::{self, DbConn};
 use crate::error::{AppError, AppResult};
 use crate::export;
 use crate::model::{
-    ConnectionConfig, DatabaseNode, Driver, ExportFormat, ObjectGroup, QueryResult,
+    ConnectionConfig, DatabaseNode, Driver, ExportFormat, ExportOptions, ObjectGroup, QueryResult,
     RedisScanResult, RedisValue, RowEdit, SchemaNode, SessionInfo,
 };
 use crate::model::{
@@ -25,6 +25,11 @@ pub enum Job {
     Export {
         sql: String,
         format: ExportFormat,
+        path: String,
+    },
+    ExportWith {
+        sql: String,
+        options: ExportOptions,
         path: String,
     },
     Introspect,
@@ -258,6 +263,13 @@ impl Session {
                     let n = export::export(conn, &sql, format, &path).await?;
                     Ok(JobOut::Count(n))
                 }
+                Job::ExportWith { sql, options, path } => {
+                    if !has_no_transactions(self.config.driver) {
+                        self.begin_if_needed(conn).await?;
+                    }
+                    let n = export::export_with(conn, &sql, &options, &path).await?;
+                    Ok(JobOut::Count(n))
+                }
                 Job::Introspect => Ok(JobOut::Schema(conn.introspect().await?)),
                 Job::ListDatabases => Ok(JobOut::Databases(conn.list_databases().await?)),
                 Job::ServerObjects => Ok(JobOut::Groups(conn.list_server_objects().await?)),
@@ -359,6 +371,18 @@ impl Session {
         path: String,
     ) -> AppResult<u64> {
         match self.run(Job::Export { sql, format, path }).await? {
+            JobOut::Count(n) => Ok(n),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    pub async fn export_with(
+        self: &Arc<Self>,
+        sql: String,
+        options: ExportOptions,
+        path: String,
+    ) -> AppResult<u64> {
+        match self.run(Job::ExportWith { sql, options, path }).await? {
             JobOut::Count(n) => Ok(n),
             _ => Err(AppError::new("Unexpected result")),
         }

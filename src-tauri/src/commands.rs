@@ -230,6 +230,46 @@ pub async fn export_query(
     res
 }
 
+#[tauri::command]
+pub async fn export_query_with(
+    state: State<'_, AppState>,
+    session_id: String,
+    sql: String,
+    options: crate::model::ExportOptions,
+    path: String,
+) -> AppResult<u64> {
+    if path.trim().is_empty() {
+        return Err(AppError::new("No export path given"));
+    }
+    let s = state.sessions.get(&session_id)?;
+    let started = Instant::now();
+    let res = s.export_with(sql.clone(), options, path).await;
+    let elapsed = started.elapsed().as_millis() as i64;
+    match &res {
+        Ok(n) => {
+            let _ = state
+                .store
+                .add_history(&s.config.id, &sql, elapsed, Some(*n as i64), true, None)
+                .await;
+        }
+        Err(e) => {
+            let _ = state
+                .store
+                .add_history(&s.config.id, &sql, elapsed, None, false, Some(&e.message))
+                .await;
+        }
+    }
+    res
+}
+
+/// Writes already-loaded text (preview / clipboard export) atomically; max 512 MiB.
+#[tauri::command]
+pub async fn write_text_file(path: String, content: String) -> AppResult<()> {
+    tokio::task::spawn_blocking(move || crate::export::write_text_atomic(&path, &content))
+        .await
+        .map_err(|e| AppError::new(format!("Write failed: {}", e)))?
+}
+
 /// Reads the Vault secret for an (possibly unsaved) config and reports what was found.
 /// Never returns the password or token, and does not touch the credential cache.
 #[tauri::command]

@@ -238,3 +238,27 @@ SASL mechanism, CA / client cert paths, skip TLS verify, show internal topics. K
 - `ExplorerLayout` (`<config>/explorer_layout.json`): top-level order (`folder:<name>`, `conn:<id>`), per-folder
   connection order, folder color/icon. Items missing from the layout are appended alphabetically; stale entries
   are dropped on the next save. Renaming a folder must rename its keys; ungrouping removes them.
+
+## v0.9 additions — export with preview, options and clipboard
+
+| command | args | returns |
+|---|---|---|
+| export_query_with | sessionId, sql, options: ExportOptions, path | number (rows) |
+| write_text_file | path, content | null |
+
+Exact output (frontend `src/ui/exportFormat.ts` and backend `export.rs` must match byte for byte).
+Cell → text: NULL → nullText (default ""); bool → `true`/`false`; number → JSON number text as received;
+string → as is. Lines end with lineEnding (default "\n"), including after the last line; an empty result
+with header still writes the header line.
+- **csv**: fields joined by delimiter (default ","). With quote q (default `"`; "" disables quoting), a field
+  is quoted when it contains the delimiter, q, `\r` or `\n`, or starts/ends with a space; inner q is doubled.
+  NULL is never quoted. Header = column names (same quoting rule) when includeHeader.
+- **tsv**: tab-joined, never quoted; in values `\` → `\\`, tab → `\t`, `\n` → `\n` (backslash n), `\r` → `\r`.
+- **json**: includeHeader → `[` + objects `{"col": value, …}` one per line, 2-space indented, separated by
+  `,` + lineEnding, closing `]`; otherwise arrays of values. Values: NULL → null, bool/number native (number
+  text kept verbatim), string → JSON string. Duplicate column names get suffixes `_2`, `_3`. Empty → `[]`.
+- **sql**: one statement per row: `INSERT INTO <tableName> (<cols>) VALUES (<vals>);` — the column list only
+  when includeHeader; columns quoted with the dialect's identifier quotes (PG/SQLite `"`, MySQL backtick,
+  MSSQL `[]`); strings single-quoted with `'` doubled; NULL → `NULL`; bool → `TRUE`/`FALSE` (MSSQL: 1/0).
+- **markdown**: `| a | b |` header + `| --- | --- |` (header required: if includeHeader is false, use
+  `col1…colN`), cells with `|` → `\|` and newlines → `<br>`, NULL → nullText.

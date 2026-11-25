@@ -717,3 +717,35 @@ pub struct ExplorerLayout {
     #[serde(default)]
     pub folders: Vec<FolderMeta>,
 }
+
+// ── Export with options ──────────────────────────────────────────────────────
+
+/// Text export options. The exact output format is specified in CONTRACT.md ("v0.9 — export") and must be
+/// byte-identical between the backend (export_query_with) and the frontend formatter (preview / clipboard).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportOptions {
+    /// "csv" | "tsv" | "json" | "sql" | "markdown"
+    pub format: String,
+    #[serde(default = "default_true")]
+    pub include_header: bool,
+    /// CSV only. Default ",".
+    #[serde(default)]
+    pub delimiter: Option<String>,
+    /// CSV only. Default "\"". Empty string = never quote.
+    #[serde(default)]
+    pub quote: Option<String>,
+    /// Text written for NULL (CSV, TSV, Markdown). Default "".
+    #[serde(default)]
+    pub null_text: Option<String>,
+    /// "\n" (default) or "\r\n".
+    #[serde(default)]
+    pub line_ending: Option<String>,
+    /// SQL INSERT target, e.g. "public.orders" (already quoted/qualified by the UI). Default "my_table".
+    #[serde(default)]
+    pub table_name: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}

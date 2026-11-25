@@ -350,3 +350,23 @@ export interface ExplorerLayout {
   folderOrder: Record<string, string[]>;
   folders: FolderMeta[];
 }
+
+// ── Export with options ─────────────────────────────────────────────────────
+
+export type ExportTextFormat = "csv" | "tsv" | "json" | "sql" | "markdown";
+
+/** Must produce byte-identical output in src/ui/exportFormat.ts and src-tauri/src/export.rs (CONTRACT "v0.9"). */
+export interface ExportOptions {
+  format: ExportTextFormat;
+  includeHeader: boolean;
+  /** CSV only. Default ",". */
+  delimiter?: string | null;
+  /** CSV only. Default "\"". "" = never quote. */
+  quote?: string | null;
+  /** NULL text for CSV/TSV/Markdown. Default "". */
+  nullText?: string | null;
+  /** "\n" (default) | "\r\n" */
+  lineEnding?: string | null;
+  /** SQL INSERT target, already qualified/quoted. Default "my_table". */
+  tableName?: string | null;
+}

@@ -72,6 +72,8 @@ pub fn run() {
             commands::apply_edits,
             commands::list_history,
             commands::export_query,
+            commands::export_query_with,
+            commands::write_text_file,
             commands::read_text_file,
             commands::test_vault,
             commands::set_vault_token,

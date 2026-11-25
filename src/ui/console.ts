@@ -1,7 +1,6 @@
 // A console tab: SQL editor on top, results below (grid / message / error).
 // Its run controls (Run / Cancel, Run all, transaction pill) are mounted by the shell into the
 // floating capsule while this console is active.
-import { save } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import type { Driver, QueryResult, RowEdit, SchemaNode, SessionInfo } from "../types";
 import { clear, errMsg, h, icon } from "./dom";
@@ -12,7 +11,8 @@ import { SqlEditor } from "./editor";
 import { kafkaNames, loadOverview } from "./kafka";
 import { ResultGrid } from "./grid";
 import { store } from "./state";
-import { buildCompletionSchema, buildFilteredSql, detectEditContext, nextOrder, orderMarks, parseFilterable, quoteIdent } from "./sqlutil";
+import { buildCompletionSchema, buildFilteredSql, detectEditContext, nextOrder, orderMarks, parseFilterable, qualifiedName, quoteIdent } from "./sqlutil";
+import { openExportDialog } from "./exportDialog";
 import { FilterBar } from "./filterBar";
 import type { FilterState } from "./filterBar";
 import { toast } from "./toast";
@@ -568,7 +568,7 @@ export class ConsolePane implements TabPane {
         it.maxRows *= 2;
         void this.rerun(it);
       },
-      onExport: () => void this.exportItem(item()),
+      onExport: (fromMenu) => this.exportItem(item(), fromMenu === true),
       onHeaderSort: (col, append) => this.headerSort(item(), col, append),
     });
   }
@@ -625,6 +625,7 @@ export class ConsolePane implements TabPane {
     // Prefer the statement we sent when the backend echoes nothing useful.
     const det2 = det.ctx || !e ? det : detectEditContext(this.lastSql(grid), res.columns, schemas, def, e.config.readOnly === true);
     grid.setResult(res, det2.ctx, det2.reason, maxRows);
+    grid.setExportInfo(this.driver, this.exportTable(res.statement || this.lastSql(grid)));
     grid.setMeta(`${res.elapsedMs.toLocaleString()} ms${this.serverLabel() ? " · " + this.serverLabel() : ""}`);
   }
 
@@ -791,29 +792,37 @@ export class ConsolePane implements TabPane {
     await this.rerun(item);
   }
 
-  private async exportItem(item: ResultItem): Promise<void> {
-    if (!this.session) return;
-    try {
-      const path = await save({
-        title: "Export result",
-        defaultPath: "result.csv",
-        filters: [
-          { name: "CSV", extensions: ["csv"] },
-          { name: "JSON", extensions: ["json"] },
-        ],
-      });
-      if (!path) return;
-      const fmt = /\.json$/i.test(path) ? "json" : "csv";
-      this.status.text = "Exporting…";
-      this.host.onStatus(this);
-      const n = await api.exportQuery(this.session.sessionId, item.sql, fmt, path);
-      toast(`Exported ${n.toLocaleString()} rows to ${path}`, "ok");
-    } catch (e) {
-      toast(`Export failed: ${errMsg(e)}`, "error");
-    } finally {
-      this.status.text = "Done";
-      this.host.onStatus(this);
+  private exportItem(item: ResultItem, fromMenu: boolean): void {
+    const grid = item.grid;
+    if (!grid) return;
+    const snap = grid.exportSnapshot();
+    const driver = this.driver;
+    let reason = "";
+    let sql: string | null = item.sql;
+    if (driver === "redis" || driver === "kafka") {
+      sql = null;
+      reason = "Redis and Kafka results export the loaded rows only";
+    } else if (!/^\s*(?:(?:--[^\n]*\n|\/\*[\s\S]*?\*\/|\s)*)(select|with|values|table)\b/i.test(item.sql)) {
+      sql = null;
+      reason = "Only a SELECT result can be re-run for all rows";
     }
+    openExportDialog({
+      driver,
+      columns: snap.columns,
+      rows: snap.rows,
+      selection: snap.selection,
+      tableName: this.exportTable(item.sql),
+      sql,
+      allDisabledReason: reason,
+      getSessionId: async () => (await this.ensureSession()).sessionId,
+      preferSelection: fromMenu,
+    });
+  }
+
+  /** Qualified, dialect-quoted table of a simple single-table SELECT, else null. */
+  private exportTable(sql: string): string | null {
+    const p = this.isLineBased ? null : parseFilterable(sql, this.driver);
+    return p ? qualifiedName(this.driver, p.schema, p.table) : null;
   }
 
   // ---------------------------------------------------------------- layout

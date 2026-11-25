@@ -24,6 +24,7 @@ import type {
   VaultProfile,
   VaultTokenInfo,
   ExplorerLayout,
+  ExportOptions,
   SshProfile,
   SshCheck,
 } from "./types";
@@ -129,6 +130,12 @@ export const api = {
   /** Stores host:port → fingerprint as trusted (after the user confirms it). */
   trustSshHost: (host: string, port: number, fingerprint: string) =>
     call<null>("trust_ssh_host", { host, port, fingerprint }),
+
+  /** Re-runs `sql` without a row limit and streams it to `path` in the chosen text format. Returns rows written. */
+  exportQueryWith: (sessionId: string, sql: string, options: ExportOptions, path: string) =>
+    call<number>("export_query_with", { sessionId, sql, options, path }),
+  /** Writes UTF-8 text to a user-chosen path (max 512 MiB). Used to save already-loaded results. */
+  writeTextFile: (path: string, content: string) => call<null>("write_text_file", { path, content }),
 
   /** Reads a UTF-8 text file chosen by the user (max 8 MiB). Used by importers. */
   readTextFile: (path: string) => call<string>("read_text_file", { path }),

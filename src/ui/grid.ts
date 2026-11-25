@@ -1,9 +1,12 @@
 // Virtualized result grid: fixed row height, windowed rendering, client-side sort/filter,
 // range selection, TSV copy and (optionally) pending cell edits.
-import type { Cell, ColumnMeta, QueryResult, RowEdit } from "../types";
+import type { Cell, ColumnMeta, Driver, ExportTextFormat, QueryResult, RowEdit } from "../types";
 import type { EditContext } from "./sqlutil";
 import { clear, copyText, debounce, h, icon } from "./dom";
+import { rememberedOptions } from "./exportDialog";
+import { FORMAT_LABEL, formatRows } from "./exportFormat";
 import { showMenu } from "./menu";
+import { toast } from "./toast";
 
 const ROW_H = 34;
 const RN_MIN = 44;
@@ -20,7 +23,8 @@ const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "bas
 export interface GridCallbacks {
   onSubmit(edits: RowEdit[]): Promise<void>;
   onLoadMore(): void;
-  onExport(): void;
+  /** `fromMenu`: opened from the cell context menu (start on the selection scope). */
+  onExport(fromMenu?: boolean): void;
   /**
    * Header click. Return true when the click was handled (server-side sort) so the grid skips
    * its own client-side sort. `append` is true for shift-click.
@@ -168,7 +172,7 @@ export class ResultGrid {
     this.btnLoadMore = h("button", { class: "pill-link", type: "button", onclick: () => this.cb.onLoadMore() }, "Load more");
     this.roChip = h("span", { class: "pill-chip" }, "read-only");
     const btn = (label: string, fn: () => void, cls = "", title = label): HTMLButtonElement => h("button", { class: "pill-btn " + cls, type: "button", title, onclick: fn }, label);
-    const btnExport = btn("Export", () => this.cb.onExport(), "", "Export result to CSV or JSON");
+    const btnExport = btn("Export", () => this.cb.onExport(), "", `Export result… (${MODK}⇧E)`);
     this.btnExport = btnExport;
     this.btnAdd = btn("+ Row", () => this.addRow(), "", "Add a row");
     this.pendingEl = h("span", { class: "pill-pending" });
@@ -718,7 +722,10 @@ export class ResultGrid {
     if (this.editor) return;
     const mod = e.metaKey || e.ctrlKey;
     const k = e.key;
-    if (mod && (k === "a" || k === "A")) {
+    if (mod && e.shiftKey && (k === "e" || k === "E")) {
+      e.preventDefault();
+      if (this.opts.hideExport !== true) this.cb.onExport(false);
+    } else if (mod && (k === "a" || k === "A")) {
       e.preventDefault();
       this.selectAll();
     } else if (mod && (k === "c" || k === "C")) {
@@ -742,6 +749,41 @@ export class ResultGrid {
         this.startEdit(this.head);
       }
     }
+  }
+
+  private exportInfo: { driver: Driver; tableName: string | null } | null = null;
+
+  /** Dialect and detected table, used by "Copy as" (SQL INSERT). */
+  setExportInfo(driver: Driver, tableName: string | null): void {
+    this.exportInfo = { driver, tableName };
+  }
+
+  /** Loaded rows in display order (filter / sort / pending edits applied) and the multi-cell selection. */
+  exportSnapshot(): { columns: string[]; rows: Cell[][]; selection: { columns: string[]; rows: Cell[][] } | null } {
+    const columns = this.cols.map((c) => c.name);
+    const rows = this.order.map((ri) => columns.map((_, c) => this.getCell(ri, c)));
+    const sel = this.selRect();
+    let selection: { columns: string[]; rows: Cell[][] } | null = null;
+    if (sel && (sel.r1 > sel.r0 || sel.c1 > sel.c0)) {
+      selection = { columns: columns.slice(sel.c0, sel.c1 + 1), rows: rows.slice(sel.r0, sel.r1 + 1).map((r) => r.slice(sel.c0, sel.c1 + 1)) };
+    }
+    return { columns, rows, selection };
+  }
+
+  private async copyAs(format: ExportTextFormat): Promise<void> {
+    const sel = this.selRect();
+    if (!sel) return;
+    const info = this.exportInfo ?? { driver: "postgres" as Driver, tableName: null };
+    const columns = this.cols.slice(sel.c0, sel.c1 + 1).map((c) => c.name);
+    const rows: Cell[][] = [];
+    for (let r = sel.r0; r <= sel.r1; r++) {
+      const ri = this.order[r];
+      const out: Cell[] = [];
+      for (let c = sel.c0; c <= sel.c1; c++) out.push(this.getCell(ri, c));
+      rows.push(out);
+    }
+    await copyText(formatRows(columns, rows, rememberedOptions(format, info.tableName), info.driver));
+    toast(`Copied ${rows.length.toLocaleString()} row${rows.length === 1 ? "" : "s"} as ${FORMAT_LABEL[format]}`, "ok");
   }
 
   private async copySelection(withHeader: boolean): Promise<void> {
@@ -821,6 +863,12 @@ export class ResultGrid {
     showMenu(e.clientX, e.clientY, [
       { label: "Copy", icon: "copy", hint: MODK + "C", onClick: () => void this.copySelection(false) },
       { label: "Copy with header", icon: "copy", hint: MODK + "⇧C", onClick: () => void this.copySelection(true) },
+      { label: "Copy as CSV", icon: "copy", onClick: () => void this.copyAs("csv") },
+      { label: "Copy as JSON", icon: "copy", onClick: () => void this.copyAs("json") },
+      { label: "Copy as SQL INSERT", icon: "copy", onClick: () => void this.copyAs("sql") },
+      { label: "Copy as Markdown", icon: "copy", onClick: () => void this.copyAs("markdown") },
+      { sep: true },
+      { label: "Export…", icon: "download", hint: MODK + "⇧E", onClick: () => this.cb.onExport(true) },
       { sep: true },
       { label: "Edit cell", icon: "pencil", hint: "↵", disabled: !canEditCell, onClick: () => cell && this.startEdit(cell) },
       { label: "Set NULL", icon: "x", disabled: !editable, onClick: () => this.nullSelected() },
