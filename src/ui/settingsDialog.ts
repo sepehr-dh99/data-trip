@@ -1,6 +1,10 @@
 // Settings window (board I): sections Editor, Appearance, Results grid, Console tabs, Keymap, Data & history.
 // Every control writes through updateSettings(), so changes apply instantly and are saved to settings.json.
-import { clear, h } from "./dom";
+import { api } from "../api";
+import { confirmDialog } from "./confirm";
+import { clear, errMsg, h } from "./dom";
+import { HISTORY_CHANGED } from "./history";
+import { toast } from "./toast";
 import { ACTIONS, PRESETS, PRESET_LABELS, bindingOf, conflictFor, eventToBinding, formatBinding, setBinding } from "./keymap";
 import type { ActionId } from "./keymap";
 import { FONT_LABELS, FONT_STACKS, defaultSettings, effectiveTokenColors, getSettings, lineHeightPx, onSettingsChange, updateSettings } from "./settings";
@@ -138,6 +142,9 @@ class SettingsWindow {
       return;
     }
     if (e.key === "Escape") {
+      // A confirm dialog opened from here handles its own Escape.
+      const top = [...document.querySelectorAll(".overlay:not(.leaving)")].pop();
+      if (top && top !== this.overlay) return;
       e.stopPropagation();
       e.preventDefault();
       this.close();
@@ -551,10 +558,38 @@ class SettingsWindow {
   private buildData(): void {
     const S = (): AppSettings => getSettings();
     const keep = this.row("Keep query history for", "Searchable from the History panel", this.seg<number>("History", [[30, "30 days"], [90, "90 days"], [365, "1 year"], [0, "Forever"]], () => S().data.historyDays, (v) => updateSettings((s) => (s.data.historyDays = v as 30 | 90 | 365 | 0))));
-    const restore = this.row("Restore consoles on launch", "Reopen tabs with their text and undo history", this.toggle("Restore consoles", () => S().data.restoreConsoles, (v) => updateSettings((s) => (s.data.restoreConsoles = v))));
+    const restore = this.row("Restore consoles on launch", "Reopen tabs in their order with their text and cursor; data sources connect when a tab is used", this.toggle("Restore consoles", () => S().data.restoreConsoles, (v) => updateSettings((s) => (s.data.restoreConsoles = v))));
     const confirm = this.row("Confirm risky statements", "Ask before UPDATE or DELETE without WHERE, DROP, TRUNCATE", this.toggle("Confirm risky statements", () => S().data.confirmRisky, (v) => updateSettings((s) => (s.data.confirmRisky = v))));
     const auto = this.row("Auto-reconnect", "Reconnect silently when a connection drops or Vault credentials expire", this.toggle("Auto-reconnect", () => S().data.autoReconnect, (v) => updateSettings((s) => (s.data.autoReconnect = v))));
-    this.section("data", [keep, restore, confirm, auto]);
+    const clearBtn = h("button", { class: "st-pill", type: "button", onclick: () => void this.clearHistory(clearBtn) }, "Clear history…");
+    const wipe = this.row("Clear query history", "Delete every entry of every data source from the History panel", clearBtn, "delete remove history");
+    this.section("data", [keep, restore, confirm, auto, wipe]);
+  }
+
+  private async clearHistory(btn: HTMLButtonElement): Promise<void> {
+    btn.disabled = true;
+    try {
+      let n: number | null = null;
+      try {
+        n = await api.countHistory(null);
+      } catch {
+        n = null;
+      }
+      if (n === 0) {
+        toast("Query history is already empty", "info");
+        return;
+      }
+      const what = n === null ? "Every query in the history" : `All ${n.toLocaleString()} ${n === 1 ? "query" : "queries"} in the history`;
+      const ok = await confirmDialog("Clear query history?", `${what} will be deleted for every data source. This can't be undone.`, "Clear history", true);
+      if (!ok) return;
+      const deleted = await api.clearHistory(null);
+      window.dispatchEvent(new CustomEvent(HISTORY_CHANGED));
+      toast(`Deleted ${deleted.toLocaleString()} history ${deleted === 1 ? "entry" : "entries"}`, "ok");
+    } catch (e) {
+      toast(`Could not clear history: ${errMsg(e)}`, "error");
+    } finally {
+      btn.disabled = false;
+    }
   }
 }
 

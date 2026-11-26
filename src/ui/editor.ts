@@ -13,7 +13,7 @@ import {
   lineNumbers,
   placeholder,
 } from "@codemirror/view";
-import { defaultKeymap, history, historyKeymap, indentWithTab, redo, toggleComment, undo } from "@codemirror/commands";
+import { defaultKeymap, history, historyKeymap, indentWithTab, isolateHistory, redo, toggleComment, undo } from "@codemirror/commands";
 import { highlightSelectionMatches, openSearchPanel, searchKeymap } from "@codemirror/search";
 import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
 import type { Completion, CompletionContext, CompletionResult } from "@codemirror/autocomplete";
@@ -37,6 +37,8 @@ export interface EditorOptions {
   onRun: () => void;
   onRunAll: () => void;
   onChange?: () => void;
+  /** The caret / selection moved (restore-on-launch keeps the cursor position). */
+  onCursor?: () => void;
 }
 
 export interface Runnable {
@@ -428,6 +430,7 @@ export class SqlEditor {
     this.driver = opts.driver;
     this.kafkaNames = opts.kafkaNames ?? (() => ({ topics: [], groups: [] }));
     const onChange = opts.onChange;
+    const onCursor = opts.onCursor;
     const extensions: Extension[] = [
       lineNumbers(),
       runGutterExtensions(opts.driver, this.runHolder),
@@ -443,8 +446,9 @@ export class SqlEditor {
       this.lang.of(this.langExtension()),
       this.keys.of(this.keymapExtension()),
       theme,
-      EditorView.updateListener.of((u: { docChanged: boolean }) => {
+      EditorView.updateListener.of((u: { docChanged: boolean; selectionSet: boolean }) => {
         if (u.docChanged && onChange) onChange();
+        if ((u.selectionSet || u.docChanged) && onCursor) onCursor();
       }),
     ];
     this.view = new EditorView({
@@ -610,6 +614,47 @@ export class SqlEditor {
 
   redo(): boolean {
     return redo(this.view);
+  }
+
+  /** Caret offset (head of the main selection). */
+  get cursor(): number {
+    return this.view.state.selection.main.head;
+  }
+
+  /** Puts the caret at `pos` (clamped to the document) and scrolls it into view. */
+  setCursor(pos: number): void {
+    const p = Math.max(0, Math.min(this.view.state.doc.length, Math.floor(pos) || 0));
+    this.view.dispatch({ selection: { anchor: p }, scrollIntoView: true });
+  }
+
+  /**
+   * What Format SQL works on: the selection (surrounding whitespace excluded), else the statement at the
+   * cursor (its terminating `;` excluded, so it stays). Null for Redis / Kafka consoles or nothing there.
+   */
+  formatTarget(): { from: number; to: number; text: string } | null {
+    if (this.lineBased()) return null;
+    const st = this.view.state;
+    const sel = st.selection.main;
+    if (!sel.empty) {
+      const raw = st.sliceDoc(sel.from, sel.to);
+      const lead = raw.length - raw.trimStart().length;
+      const text = raw.trim();
+      if (!text) return null;
+      return { from: sel.from + lead, to: sel.from + lead + text.length, text };
+    }
+    const s = statementAt(st.doc.toString(), sel.head, splitOptsFor(this.driver));
+    return s ? { from: s.start, to: s.end, text: s.text } : null;
+  }
+
+  /** Replaces [from, to) with `text` as one undoable step and selects the replacement's end. */
+  replaceRange(from: number, to: number, text: string): void {
+    this.view.dispatch({
+      changes: { from, to, insert: text },
+      selection: { anchor: from + text.length },
+      scrollIntoView: true,
+      userEvent: "input.format",
+      annotations: isolateHistory.of("full"),
+    });
   }
 
   getSelectionOrStatementAtCursor(): Runnable | null {

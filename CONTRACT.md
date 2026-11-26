@@ -309,3 +309,60 @@ Approved designs (read them, they are the spec for look and behavior): `/home/cl
   (inner trailing `;` removed; inner ORDER BY kept for PG/MySQL/SQLite; MSSQL with inner ORDER BY and no TOP →
   page 1 only, pager disabled with a tooltip). n+1 rows fetched → "more available". Count rows:
   `SELECT COUNT(*) FROM (<sql>) AS _dt_count`. Other statements and Redis/Kafka: no pager.
+
+## v0.11 additions — restore consoles, tab order, auto-reconnect, history retention, Format SQL, source databases
+
+| command | args | returns |
+|---|---|---|
+| get_workspace | – | object (raw JSON; `{}` when none) |
+| save_workspace | workspace: object | null |
+| prune_history | days: number (u32) | number (entries deleted; `0` days = keep forever → no-op, returns 0) |
+| clear_history | connectionId: string\|null | number (entries deleted; null = all history) |
+| count_history | connectionId: string\|null | number (entries; null = all history) |
+
+- **Workspace** (`<config>/workspace.json`, same atomic write and file lock as settings.json; refused unless a JSON
+  object). The frontend owns the shape (`src/ui/workspace.ts`): `{ version: 1, tabs: WsTab[], active: number }`,
+  `tabs` in **manual order** (the order drag-reordering in the rail / top strip produces), `active` = index or -1.
+  `WsTab { kind: "console"|"key"|"topic"|"group", key, name, connId, title, database, console?, keyType? }` —
+  `key` is the TabStrip's stable tab key at save time (pinned tabs and custom-group members refer to it; a restored
+  tab adopts it, so pins/groups match before the data source is connected), `name` the manual tab name (null =
+  automatic), `title` the console title / Redis key / topic / group id, `database` the Redis DB index for key tabs.
+  `console: { sql, cursor, database, dbHint, schema, schemaExplicit, table, ownAlias, ownDb, sources: {alias,
+  connId, database}[], fedShown }` (`dbHint` = effective database when saved, used for tab names until connected;
+  `ownAlias` only when edited; `ownDb` = database of the console's own cross-source source, null = the console's).
+- Saving (only while `data.restoreConsoles` is on, and never before the saved workspace was restored): debounced
+  1 s after tab open / close / activate / reorder / rename, editor text or cursor changes, database / schema /
+  source changes; flushed on `beforeunload`, `pagehide`, window blur and `visibilitychange: hidden`. Turning the
+  setting off cancels pending saves and writes an empty workspace. If the connection list can't be loaded at start,
+  nothing is restored or saved in that session.
+- Restoring (at start, when the setting is on): tabs whose connection no longer exists are skipped, the rest are
+  recreated in saved order **without connecting**. Consoles get text, cursor, bindings and attached sources (sources
+  of deleted / unsupported connections dropped) and connect their data source (explorer connect, with the usual
+  Vault / SSH recovery) on first activation or first run. Redis key / Kafka topic / group tabs are placeholders
+  until activated, then replaced in place by the real tab (same key, name and position). The saved active tab is
+  activated (so only its data source connects at launch).
+- **Auto-reconnect** (frontend; `data.autoReconnect`): a SQL console statement failing with a connection-lost error
+  (conservative match: connection closed/reset/lost/aborted, broken pipe, terminating connection, server closed the
+  connection, lost connection, server has gone away, unexpected EOF, not connected, pool timed out, connection/IO
+  "timed out"; never VAULT_/SSH_/OIDC_ errors) while auto-commit is on → `reconnect_connection` silently and re-run
+  once, only for read-only statements (first keyword SELECT / WITH / SHOW / EXPLAIN / DESCRIBE / DESC and no
+  data-changing keyword anywhere outside literals/comments: INSERT, UPDATE, DELETE, MERGE, INTO, ANALYZE, SET, …).
+  Not retried when the reconnect reports 0 sessions or skipped sessions in a transaction. Otherwise (setting off,
+  manual transaction, writing statement, Redis/Kafka, retry failed) the error view shows "Connection lost" with a
+  **Reconnect** button (explorer reconnect). A statement inside a manual transaction is never retried.
+- **History retention** (`data.historyDays` 30 | 90 | 365 | 0): the frontend calls `prune_history` at start and
+  whenever the setting changes. Deletion is by `executed_at < now − days` (RFC 3339 UTC text compares in time
+  order); index `idx_history_time (executed_at)`. Settings › Data & history › "Clear history…" asks for
+  confirmation (showing `count_history(null)`), calls `clear_history(null)` and refreshes the History panel
+  (window event `dt-history-changed`). The 5000-entry cap stays.
+- **Format SQL** (action `formatSql`, DataTrip/DataGrip preset ⌥⌘L / Ctrl+Alt+L, VS Code preset ⇧⌥F; frontend only,
+  npm `sql-formatter` ^15.4): formats the selection (surrounding whitespace kept) or else the statement at the
+  cursor (its terminating `;` stays outside the replaced range) with `{ language: postgresql|mysql|sqlite|transactsql,
+  keywordCase: "upper", tabWidth: 2, linesBetweenQueries: 1 }`, as one isolated undo step. Formatter errors → toast
+  "Couldn't format: …", text untouched. No-op in Redis / Kafka consoles. Works with focus in the console editor or
+  outside any text field.
+- **Cross-source source databases**: each Sources chip of a server-type source (PostgreSQL, MySQL, SQL Server) has a
+  database picker listing the data source's databases (`list_databases` via the explorer's connection entry; the
+  source is connected in the explorer first when needed). Attached sources: null = the connection's default
+  database. The console's own source: null = the console's current database. Sent as `FedSource.database` and
+  persisted in the workspace.

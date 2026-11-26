@@ -19,7 +19,8 @@
     "@codemirror/view": "^6.34.0",
     "@lezer/highlight": "^1.2.0",
     "@tauri-apps/api": "^2.0.0",
-    "@tauri-apps/plugin-dialog": "^2.0.0"
+    "@tauri-apps/plugin-dialog": "^2.0.0",
+    "sql-formatter": "^15.4.0"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",

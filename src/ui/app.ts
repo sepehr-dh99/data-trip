@@ -26,6 +26,9 @@ import { loadLayout, onLookChange } from "./layout";
 import { toast } from "./toast";
 import { VAULT_TOKEN_RE, vaults } from "./vault";
 import { showTokenPastePrompt } from "./vaultChips";
+import { getSettings, onSettingsChange } from "./settings";
+import { RestoredPane, WorkspaceSaver, loadWorkspace } from "./workspace";
+import type { Workspace, WsTab } from "./workspace";
 
 const IS_MAC = /Mac/.test(navigator.userAgent);
 const MOD = IS_MAC ? "⌘" : "Ctrl+";
@@ -42,6 +45,13 @@ interface ClosedTab {
   name: string | null;
 }
 const MAX_CLOSED = 25;
+
+/** Another tab is already connecting this data source: wait for that connect (up to a minute). */
+async function waitWhileConnecting(id: string): Promise<void> {
+  for (let i = 0; i < 600 && store.conns.get(id)?.status === "connecting"; i++) {
+    await new Promise<void>((r) => window.setTimeout(r, 100));
+  }
+}
 
 export class App {
   private tabs: TabPane[] = [];
@@ -67,6 +77,12 @@ export class App {
   private sheetEl!: HTMLElement;
   private capFitQueued = false;
   private sidebarHidden = false;
+  /** Restore on launch: saves the open tabs (debounced). */
+  private saver = new WorkspaceSaver(() => this.collectWorkspace());
+  /** False until the saved workspace was restored: nothing is saved before (it would overwrite it). */
+  private wsReady = false;
+  /** Restored Redis key / Kafka tabs being opened. */
+  private materializing = new Set<RestoredPane>();
 
   constructor(private root: HTMLElement) {
     this.explorer = new Explorer({
@@ -129,11 +145,13 @@ export class App {
         newConsole: () => void this.newConsole(),
         setOrder: (list) => {
           if (list.length === this.tabs.length && list.every((t) => this.tabs.includes(t))) this.tabs = list;
+          this.saveWorkspaceSoon();
         },
         changed: () => {
           this.navigator.update(this.active);
           this.fitCapsule();
           this.syncCapSeps();
+          this.saveWorkspaceSoon();
         },
       },
       this.btnAdd,
@@ -184,9 +202,11 @@ export class App {
   }
 
   async start(): Promise<void> {
+    let loaded = true;
     try {
       await Promise.all([store.load(), loadLayout()]);
     } catch (e) {
+      loaded = false;
       toast(`Could not load connections: ${errMsg(e)}`, "error");
     }
     this.renderEmpty();
@@ -194,6 +214,140 @@ export class App {
     // Shared Vault profiles: load them, look the tokens up, keep the sidebar chips counting down.
     vaults.start();
     void vaults.load();
+    // Restore consoles on launch (without the connection list every tab would be dropped: then don't restore
+    // and don't save either, so the saved workspace survives for the next start).
+    if (loaded && getSettings().data.restoreConsoles) await this.restoreWorkspace();
+    this.wsReady = loaded;
+    this.pruneHistory();
+    let prev = getSettings().data;
+    onSettingsChange((st) => {
+      const d = st.data;
+      if (d.historyDays !== prev.historyDays) this.pruneHistory();
+      if (d.restoreConsoles !== prev.restoreConsoles) {
+        if (d.restoreConsoles) this.saveWorkspaceSoon();
+        else {
+          // Off: stop saving and forget what was saved (console text may be sensitive).
+          this.saver.cancel();
+          if (this.wsReady) void api.saveWorkspace({ version: 1, tabs: [], active: -1 }).catch(() => undefined);
+        }
+      }
+      prev = d;
+    });
+  }
+
+  // ------------------------------------------------------------------ history retention
+
+  /** Settings › Data › Keep query history for: drops older entries (at start and when the setting changes). */
+  private pruneHistory(): void {
+    const days = getSettings().data.historyDays;
+    if (days <= 0) return;
+    void api
+      .pruneHistory(days)
+      .then((n) => {
+        if (n > 0) void this.history.refresh();
+      })
+      .catch(() => undefined);
+  }
+
+  // ------------------------------------------------------------------ restore on launch
+
+  private saveWorkspaceSoon(): void {
+    if (this.wsReady && getSettings().data.restoreConsoles) this.saver.schedule();
+  }
+
+  /** The open tabs in manual order, for workspace.json (null = restore on launch is off). */
+  private collectWorkspace(): Workspace | null {
+    if (!this.wsReady || !getSettings().data.restoreConsoles) return null;
+    const tabs: WsTab[] = [];
+    for (const t of this.tabs) {
+      const key = this.strip.keyFor(t);
+      const name = this.strip.manualName(t);
+      if (t instanceof RestoredPane) tabs.push({ ...t.saved, key, name });
+      else if (t instanceof ConsolePane) tabs.push({ kind: "console", key, name, connId: t.connId, title: t.title, database: t.database, console: t.snapshot() });
+      else if (t instanceof KeyPane) tabs.push({ kind: "key", key, name, connId: t.connId, title: t.key, database: t.effectiveDatabase, keyType: t.keyType });
+      else if (t instanceof TopicPane) tabs.push({ kind: "topic", key, name, connId: t.connId, title: t.topic, database: null });
+      else if (t instanceof GroupPane) tabs.push({ kind: "group", key, name, connId: t.connId, title: t.groupId, database: null });
+    }
+    // Every open tab has an entry, so indexes match this.tabs.
+    const active = this.active && tabs.length === this.tabs.length ? this.tabs.indexOf(this.active) : -1;
+    return { version: 1, tabs, active };
+  }
+
+  /**
+   * Reopens the saved tabs in their manual order without connecting anything: consoles get their text, cursor,
+   * bindings and attached sources and connect on first activation / run; Redis key and Kafka tabs are placeholders
+   * until activated. Tabs of data sources that no longer exist are skipped.
+   */
+  private async restoreWorkspace(): Promise<void> {
+    const ws = await loadWorkspace();
+    let active: TabPane | null = null;
+    for (let i = 0; i < ws.tabs.length; i++) {
+      const t = ws.tabs[i];
+      if (!store.conns.has(t.connId)) continue;
+      let pane: TabPane;
+      try {
+        pane = this.restoreTab(t);
+      } catch {
+        continue;
+      }
+      pane.el.classList.add("hidden");
+      this.tabs.push(pane);
+      this.stack.appendChild(pane.el);
+      if (i === ws.active) active = pane;
+    }
+    if (this.tabs.length === 0) return;
+    this.activate(active ?? this.strip.ordered()[0] ?? this.tabs[0]);
+  }
+
+  private restoreTab(t: WsTab): TabPane {
+    if (t.kind === "console") {
+      const c = t.console;
+      const pane = new ConsolePane(t.connId, t.title, this.host, c?.sql ?? "", c?.database ?? null, c?.schema ?? null, c?.table ?? null);
+      this.strip.adopt(pane, t.key, t.name);
+      if (c) pane.restoreState(c);
+      return pane;
+    }
+    const pane = new RestoredPane(t.kind, t);
+    this.strip.adopt(pane, t.key, t.name);
+    return pane;
+  }
+
+  /** A restored placeholder for that key / topic / group that was not opened yet. */
+  private findRestored(kind: "key" | "topic" | "group", connId: string, title: string, db: string | null = null): RestoredPane | null {
+    const p = this.tabs.find((t): t is RestoredPane => t instanceof RestoredPane && t.kind === kind && t.connId === connId && t.title === title && (kind !== "key" || t.database === db));
+    return p ?? null;
+  }
+
+  /** Opens the real tab behind a restored placeholder (connecting its data source first). */
+  private async materialize(p: RestoredPane): Promise<void> {
+    if (this.materializing.has(p)) return;
+    this.materializing.add(p);
+    let ok = false;
+    try {
+      ok = await this.ensureConn(p.connId);
+    } finally {
+      this.materializing.delete(p);
+    }
+    const i = this.tabs.indexOf(p);
+    if (i < 0) return;
+    if (!ok) {
+      p.showError(`Couldn't connect to ${store.conns.get(p.connId)?.config.name ?? "the data source"}. Activate the tab again to retry.`);
+      return;
+    }
+    const s = p.saved;
+    let next: TabPane;
+    if (p.kind === "key") next = new KeyPane(p.connId, s.database ?? store.conns.get(p.connId)?.defaultDb ?? "0", s.title, this.keyHost, s.keyType ?? "");
+    else if (p.kind === "topic") next = new TopicPane(p.connId, s.title);
+    else next = new GroupPane(p.connId, s.title);
+    this.tabs[i] = next;
+    this.strip.replace(p, next);
+    p.el.replaceWith(next.el);
+    void p.dispose();
+    if (this.active === p) this.activate(next);
+    else {
+      next.el.classList.add("hidden");
+      this.renderTabs();
+    }
   }
 
   // ------------------------------------------------------------------ layout
@@ -325,8 +479,12 @@ export class App {
     onDatabase: () => {
       this.renderTabs();
       this.syncHistoryConn();
+      this.saveWorkspaceSoon();
     },
+    onWorkspace: () => this.saveWorkspaceSoon(),
+    reconnect: (id) => this.explorer.reconnect(id),
     ensureConnected: async (id) => {
+      await waitWhileConnecting(id);
       if (store.conns.get(id)?.status === "connected") return true;
       try {
         await this.explorer.connect(id);
@@ -402,7 +560,7 @@ export class App {
       }
       if (store.conns.get(connId)?.status !== "connected") return;
     }
-    const existing = this.tabs.find((t) => t instanceof KeyPane && t.matches(connId, db, key));
+    const existing = this.tabs.find((t) => t instanceof KeyPane && t.matches(connId, db, key)) ?? this.findRestored("key", connId, key, db);
     if (existing) {
       this.activate(existing);
       return;
@@ -415,6 +573,7 @@ export class App {
 
   /** Connects the data source when needed; true when it is connected. */
   private async ensureConn(connId: string): Promise<boolean> {
+    await waitWhileConnecting(connId);
     const entry = store.conns.get(connId);
     if (!entry) return false;
     if (entry.status !== "connected") {
@@ -430,6 +589,12 @@ export class App {
   /** Opens (or focuses) the tab of a Kafka topic; `produce` also opens the produce dialog. */
   private async openTopic(connId: string, topic: string, produce = false): Promise<void> {
     if (!(await this.ensureConn(connId))) return;
+    const restored = this.findRestored("topic", connId, topic);
+    if (restored && !produce) {
+      this.activate(restored);
+      return;
+    }
+    if (restored) await this.materialize(restored);
     let pane = this.tabs.find((t): t is TopicPane => t instanceof TopicPane && t.matches(connId, topic));
     if (!pane) {
       pane = new TopicPane(connId, topic);
@@ -443,6 +608,11 @@ export class App {
   /** Opens (or focuses) the tab of a Kafka consumer group. */
   private async openGroup(connId: string, groupId: string): Promise<void> {
     if (!(await this.ensureConn(connId))) return;
+    const restored = this.findRestored("group", connId, groupId);
+    if (restored) {
+      this.activate(restored);
+      return;
+    }
     let pane = this.tabs.find((t): t is GroupPane => t instanceof GroupPane && t.matches(connId, groupId));
     if (!pane) {
       pane = new GroupPane(connId, groupId);
@@ -465,6 +635,10 @@ export class App {
       pane.focus();
     }
     this.syncHistoryConn();
+    // Restored on launch: connect / open on first activation.
+    if (pane instanceof RestoredPane) void this.materialize(pane);
+    else if (pane instanceof ConsolePane) void pane.wake();
+    this.saveWorkspaceSoon();
   }
 
   private renderTabs(): void {
@@ -496,6 +670,7 @@ export class App {
     this.dirtySeen.delete(t);
     t.el.remove();
     void t.dispose();
+    this.saveWorkspaceSoon();
     if (this.active === t) {
       this.activate(nextActive && this.tabs.includes(nextActive) ? nextActive : (this.tabs[Math.min(i, this.tabs.length - 1)] ?? null));
       this.renderEmpty();
@@ -666,8 +841,15 @@ export class App {
         return;
       case "toggleComment":
       case "find":
-      case "formatSql":
         return;
+      case "formatSql": {
+        // In the console's editor or with focus outside any text field (grid, tab strip); not in other inputs.
+        const inEditor = e.target instanceof HTMLElement && c !== null && c.el.contains(e.target) && e.target.closest(".c-editor") !== null;
+        if (!c || (editable && !inEditor) || c.isLineBased) return;
+        e.preventDefault();
+        c.formatSql();
+        return;
+      }
       case "runStatement":
       case "runAll":
         // The editor handles these itself while it has focus; elsewhere (grid, tab strip) they still run.

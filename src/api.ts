@@ -163,4 +163,15 @@ export const api = {
   vaultOidcLogin: (profileId: string, role: string | null) =>
     call<VaultTokenInfo>("vault_oidc_login", { profileId, role }),
   vaultOidcCancel: () => call<null>("vault_oidc_cancel"),
+
+  // ── v0.11 ──
+  /** Raw workspace object from <config>/workspace.json ({} when none). Shape owned by src/ui/workspace.ts. */
+  getWorkspace: () => call<Record<string, unknown>>("get_workspace"),
+  saveWorkspace: (workspace: Record<string, unknown>) => call<null>("save_workspace", { workspace }),
+  /** Deletes history older than `days` days (0 = keep forever, no-op). Returns the deleted count. */
+  pruneHistory: (days: number) => call<number>("prune_history", { days }),
+  /** Deletes the history of one connection, or all history when null. Returns the deleted count. */
+  clearHistory: (connectionId: string | null) => call<number>("clear_history", { connectionId }),
+  /** Number of history entries (one connection, or all when null). */
+  countHistory: (connectionId: string | null) => call<number>("count_history", { connectionId }),
 };

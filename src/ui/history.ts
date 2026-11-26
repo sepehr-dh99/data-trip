@@ -2,6 +2,9 @@ import { api } from "../api";
 import type { HistoryEntry } from "../types";
 import { clear, debounce, errMsg, h, icon } from "./dom";
 
+/** Window event fired after history entries were deleted elsewhere (Settings › Clear history): panels refresh. */
+export const HISTORY_CHANGED = "dt-history-changed";
+
 export interface HistoryHost {
   insert(sql: string): void;
   run(sql: string): void;
@@ -58,6 +61,7 @@ export class HistoryPanel {
       }
     });
     this.updateScope();
+    window.addEventListener(HISTORY_CHANGED, () => void this.refresh());
   }
 
   private updateScope(): void {

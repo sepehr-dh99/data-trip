@@ -100,6 +100,7 @@ pub struct Profiles {
     ssh_path: PathBuf,
     layout_path: PathBuf,
     settings_path: PathBuf,
+    workspace_path: PathBuf,
     file_lock: tokio::sync::Mutex<()>,
     vault_tokens: SecretStore,
     ssh_secrets: SecretStore,
@@ -113,6 +114,7 @@ impl Profiles {
             ssh_path: config_dir.join("ssh_profiles.json"),
             layout_path: config_dir.join("explorer_layout.json"),
             settings_path: config_dir.join("settings.json"),
+            workspace_path: config_dir.join("workspace.json"),
             file_lock: tokio::sync::Mutex::new(()),
             vault_tokens: SecretStore::new(VAULT_PROFILE_SERVICE),
             ssh_secrets: SecretStore::new(SSH_SERVICE),
@@ -162,6 +164,28 @@ impl Profiles {
         }
         let _g = self.file_lock.lock().await;
         write_json_atomic(&self.settings_path, settings)
+    }
+
+    // ----- Workspace: open console tabs to restore on launch (shape owned by the frontend) -----
+
+    /// `<config>/workspace.json` as raw JSON; `{}` when missing, unreadable or not an object.
+    pub async fn get_workspace(&self) -> serde_json::Value {
+        let _g = self.file_lock.lock().await;
+        let parsed = std::fs::read_to_string(&self.workspace_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        match parsed {
+            Some(v) if v.is_object() => v,
+            _ => serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    pub async fn save_workspace(&self, workspace: &serde_json::Value) -> AppResult<()> {
+        if !workspace.is_object() {
+            return Err(AppError::new("Workspace must be a JSON object."));
+        }
+        let _g = self.file_lock.lock().await;
+        write_json_atomic(&self.workspace_path, workspace)
     }
 
     // ----- Vault profiles -----

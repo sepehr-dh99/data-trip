@@ -48,6 +48,10 @@ impl Store {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_history_conn ON history (connection_id, id)")
             .execute(&pool)
             .await?;
+        // Retention pruning deletes by age.
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_history_time ON history (executed_at)")
+            .execute(&pool)
+            .await?;
         Ok(Store {
             connections_path: config_dir.join("connections.json"),
             file_lock: tokio::sync::Mutex::new(()),
@@ -253,6 +257,61 @@ impl Store {
         .execute(&self.history)
         .await?;
         Ok(())
+    }
+
+    /// Deletes history entries older than `days` days; 0 keeps everything. Returns the deleted count.
+    /// `executed_at` is always written as RFC 3339 UTC with milliseconds, so text order is time order.
+    pub async fn prune_history(&self, days: u32) -> AppResult<u64> {
+        if days == 0 {
+            return Ok(0);
+        }
+        let span = chrono::Duration::days(i64::from(days.min(100_000)));
+        let cutoff = match chrono::Utc::now().checked_sub_signed(span) {
+            Some(t) => t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            None => return Ok(0),
+        };
+        let res = sqlx::query("DELETE FROM history WHERE executed_at < ?")
+            .bind(cutoff)
+            .execute(&self.history)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    /// Deletes the history of one connection, or all history when `connection_id` is None / empty.
+    pub async fn clear_history(&self, connection_id: Option<String>) -> AppResult<u64> {
+        let res = match connection_id.filter(|c| !c.is_empty()) {
+            Some(c) => {
+                sqlx::query("DELETE FROM history WHERE connection_id = ?")
+                    .bind(c)
+                    .execute(&self.history)
+                    .await?
+            }
+            None => {
+                sqlx::query("DELETE FROM history")
+                    .execute(&self.history)
+                    .await?
+            }
+        };
+        Ok(res.rows_affected())
+    }
+
+    /// Number of history entries of one connection, or of all connections when None / empty.
+    pub async fn count_history(&self, connection_id: Option<String>) -> AppResult<u64> {
+        let row = match connection_id.filter(|c| !c.is_empty()) {
+            Some(c) => {
+                sqlx::query("SELECT COUNT(*) AS n FROM history WHERE connection_id = ?")
+                    .bind(c)
+                    .fetch_one(&self.history)
+                    .await?
+            }
+            None => {
+                sqlx::query("SELECT COUNT(*) AS n FROM history")
+                    .fetch_one(&self.history)
+                    .await?
+            }
+        };
+        let n = row.try_get::<i64, _>("n")?;
+        Ok(u64::try_from(n).unwrap_or(0))
     }
 
     pub async fn list_history(

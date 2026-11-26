@@ -198,6 +198,30 @@ pub async fn list_history(
     state.store.list_history(connection_id, search, limit).await
 }
 
+/// Deletes history older than `days` days (0 = keep forever: no-op). Returns the deleted count.
+#[tauri::command]
+pub async fn prune_history(state: State<'_, AppState>, days: u32) -> AppResult<u64> {
+    state.store.prune_history(days).await
+}
+
+/// Deletes the history of one connection, or all history when `connection_id` is null.
+#[tauri::command]
+pub async fn clear_history(
+    state: State<'_, AppState>,
+    connection_id: Option<String>,
+) -> AppResult<u64> {
+    state.store.clear_history(connection_id).await
+}
+
+/// Number of history entries (one connection, or all when null).
+#[tauri::command]
+pub async fn count_history(
+    state: State<'_, AppState>,
+    connection_id: Option<String>,
+) -> AppResult<u64> {
+    state.store.count_history(connection_id).await
+}
+
 #[tauri::command]
 pub async fn export_query(
     state: State<'_, AppState>,
@@ -618,6 +642,22 @@ pub async fn save_settings(
     settings: serde_json::Value,
 ) -> AppResult<()> {
     state.profiles.save_settings(&settings).await
+}
+
+// ----- v0.11: workspace (restore consoles on launch) -----
+
+/// Raw workspace object from `<config>/workspace.json` (`{}` when none).
+#[tauri::command]
+pub async fn get_workspace(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
+    Ok(state.profiles.get_workspace().await)
+}
+
+#[tauri::command]
+pub async fn save_workspace(
+    state: State<'_, AppState>,
+    workspace: serde_json::Value,
+) -> AppResult<()> {
+    state.profiles.save_workspace(&workspace).await
 }
 
 /// Drops and re-opens the physical connection of every open session of the connection

@@ -150,6 +150,10 @@ export class KeyPane implements TabPane {
   get isRunning(): boolean {
     return false;
   }
+  /** Last known key type ("" until loaded): restore on launch shows the right tab icon before loading. */
+  get keyType(): string {
+    return this.value?.keyType ?? this.hintType;
+  }
   get tabIcon(): { icon: string; cls: string } {
     const t = typeInfo(this.value?.keyType ?? this.hintType);
     return { icon: t.icon, cls: t.cls };

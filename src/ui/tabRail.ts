@@ -366,6 +366,32 @@ export class TabStrip {
     this.els.delete(t);
   }
 
+  /** Stable key of a tab (pinned tabs, custom groups, restore on launch). */
+  keyFor(t: TabPane): string {
+    return this.keyOf(t);
+  }
+
+  /**
+   * A tab restored on launch keeps the key it was saved with, so pinned tabs and custom-group membership still
+   * match before its data source is connected again (the automatic key would lack the database then).
+   */
+  adopt(t: TabPane, key: string, name: string | null): void {
+    if (this.meta.has(t)) return;
+    const taken = new Set([...this.meta.values()].map((x) => x.key));
+    const base = key || tabKey(t);
+    let k = base;
+    for (let i = 2; taken.has(k); i++) k = `${base}#${i}`;
+    this.meta.set(t, { key: k, name: name && name.trim() ? name.trim() : (this.savedNames[k] ?? null), used: Date.now() });
+  }
+
+  /** `next` takes over `old`'s place, key, name and last use (a restored placeholder became the real tab). */
+  replace(old: TabPane, next: TabPane): void {
+    const m = this.meta.get(old);
+    this.meta.delete(old);
+    this.els.delete(old);
+    if (m) this.meta.set(next, m);
+  }
+
   private keyOf(t: TabPane): string {
     return this.metaOf(t).key;
   }

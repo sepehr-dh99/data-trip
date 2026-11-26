@@ -16,6 +16,8 @@ import { buildCompletionSchema, buildFilteredSql, connColor, countSql, detectEdi
 import { getSettings } from "./settings";
 import { handleActionError } from "./recovery";
 import { FED_DRIVERS, aliasSlug, isAlias, uniqueAlias } from "./federation";
+import { canFormat, formatSql as formatSqlText } from "./sqlFormat";
+import type { WsConsole } from "./workspace";
 import { openExportDialog } from "./exportDialog";
 import { FilterBar } from "./filterBar";
 import type { FilterState } from "./filterBar";
@@ -43,6 +45,10 @@ export interface ConsoleHost {
   onDatabase(c: ConsolePane): void;
   /** Connects the data source if needed; resolves true when it is connected. */
   ensureConnected(connId: string): Promise<boolean>;
+  /** Text, cursor, bindings or attached sources changed (restore on launch saves the workspace). */
+  onWorkspace(): void;
+  /** Reconnects the data source like the explorer does (toasts the outcome). */
+  reconnect(connId: string): Promise<void>;
 }
 
 interface ResultItem {
@@ -67,6 +73,9 @@ interface FedAttach {
   database: string | null;
 }
 
+/** Server-type drivers: an attached source can pick which database it reads from. */
+const SERVER_DRIVERS: ReadonlySet<Driver> = new Set<Driver>(["postgres", "mysql", "mssql"]);
+
 const MSSQL_PAGE_REASON = "SQL Server can't page a query that has ORDER BY without TOP — only the first page is shown";
 
 /** Strips leading comments so the statement's first keyword can be checked. */
@@ -85,6 +94,57 @@ function riskOf(sql: string): string | null {
   if (kw === "truncate") return "TRUNCATE";
   if ((kw === "delete" || kw === "update") && !/\bwhere\b/i.test(t)) return `${kw.toUpperCase()} without WHERE`;
   return null;
+}
+
+/** Text with string literals, quoted identifiers and comments blanked out (keyword checks). */
+function codeOnly(sql: string): string {
+  return sql
+    .replace(/'(?:[^']|'')*'/g, "''")
+    .replace(/"(?:[^"]|"")*"/g, '""')
+    .replace(/`(?:[^`]|``)*`/g, "``")
+    .replace(/\[[^\]]*\]/g, "[]")
+    .replace(/--[^\n]*/g, " ")
+    .replace(/\/\*[\s\S]*?\*\//g, " ");
+}
+
+/**
+ * A statement that only reads, so re-running it after a reconnect is harmless: SELECT / WITH / SHOW / EXPLAIN /
+ * DESCRIBE without any data-changing keyword anywhere (WITH … DELETE, EXPLAIN ANALYZE UPDATE, SELECT … INTO,
+ * SELECT … FOR UPDATE are all refused).
+ */
+export function isReadOnlyStatement(sql: string): boolean {
+  const t = codeOnly(headOf(sql)).trim();
+  const kw = /^([A-Za-z]+)/.exec(t)?.[1]?.toLowerCase();
+  if (!kw || !["select", "with", "show", "explain", "describe", "desc"].includes(kw)) return false;
+  return !/\b(insert|update|delete|merge|upsert|replace|into|drop|truncate|alter|create|grant|revoke|call|exec|execute|lock|set|copy|vacuum|analyze|do)\b/i.test(t.slice(kw.length));
+}
+
+/** Conservative check for "the connection is gone" errors (worth a reconnect), not SQL errors. */
+export function isConnectionLost(message: string): boolean {
+  const m = message.toLowerCase();
+  // Vault / SSH recovery errors have their own flows.
+  if (/^[a-z_]+:/.test(m) && /^(vault_|ssh_|oidc_)/.test(m)) return false;
+  return (
+    /\bconnection (?:was )?(?:closed|reset|lost|aborted)\b/.test(m) ||
+    /\bconnection is closed\b/.test(m) ||
+    m.includes("broken pipe") ||
+    m.includes("connection reset") ||
+    m.includes("terminating connection") ||
+    m.includes("server closed the connection") ||
+    m.includes("lost connection") ||
+    m.includes("server has gone away") ||
+    m.includes("unexpected eof") ||
+    /\beof\b.*\b(?:connection|socket|stream|reading|read)\b|\b(?:connection|socket|stream|reading|read)\b.*\beof\b/.test(m) ||
+    /^\s*(?:io error: )?eof\s*$/.test(m) ||
+    /\bnot connected\b/.test(m) ||
+    m.includes("pool timed out") ||
+    /\b(?:connection|socket|read|write|i\/o|io)\b.*\btimed out\b/.test(m)
+  );
+}
+
+/** The error's raw message (before humanMsg strips recovery prefixes). */
+function rawMsg(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 let counter = 0;
@@ -125,6 +185,13 @@ export class ConsolePane implements TabPane {
   private fedShown = false;
   private ownAlias = "";
   private ownAliasEdited = false;
+  /** Cross-source: database of the console's own source; null = the console's database. */
+  private fedOwnDb: string | null = null;
+  /** Restored on launch and not connected yet: the data source connects on first activation / run. */
+  private needsConnect = false;
+  private waking: Promise<boolean> | null = null;
+  /** Effective database when the workspace was saved (tab names until the data source is connected). */
+  private dbHint: string | null = null;
 
   constructor(
     public connId: string,
@@ -168,6 +235,7 @@ export class ConsolePane implements TabPane {
       kafkaNames: () => kafkaNames(this.connId),
       onRun: () => void this.runCurrent(),
       onRunAll: () => void this.runAll(),
+      onCursor: () => this.host.onWorkspace(),
     });
     // Gutter ▶: run just that statement (Alt/Option-click: keep the current results, add a result tab).
     this.editor.onRunStatement((r, o) => {
@@ -226,6 +294,104 @@ export class ConsolePane implements TabPane {
     return this.editor.getText();
   }
 
+  // ---------------------------------------------------------------- restore on launch
+
+  /** What restore on launch saves for this console. */
+  snapshot(): WsConsole {
+    return {
+      sql: this.editor.getText(),
+      cursor: this.editor.cursor,
+      database: this.database,
+      dbHint: this.effectiveDatabase,
+      schema: this.schema,
+      schemaExplicit: this.schemaExplicit,
+      table: this.table,
+      ownAlias: this.ownAliasEdited ? this.ownAlias : null,
+      ownDb: this.fedOwnDb,
+      sources: this.fed.map((f) => ({ alias: f.alias, connId: f.connId, database: f.database })),
+      fedShown: this.fedShown,
+    };
+  }
+
+  /**
+   * Applies the rest of a saved console (the constructor already got text, database, schema and table). The data
+   * source is not connected here: `wake()` does that on first activation or run. Sources whose data source no
+   * longer exists are dropped.
+   */
+  restoreState(ws: WsConsole): void {
+    this.needsConnect = store.conns.get(this.connId)?.status !== "connected";
+    this.dbHint = ws.dbHint;
+    this.schemaExplicit = ws.schemaExplicit && this.schema !== null;
+    this.editor.setCursor(Math.min(ws.cursor, ws.sql.length));
+    if (!this.isLineBased && FED_DRIVERS.has(this.driver)) {
+      if (ws.ownAlias && isAlias(ws.ownAlias)) {
+        this.ownAlias = ws.ownAlias;
+        this.ownAliasEdited = true;
+      }
+      this.fedOwnDb = ws.ownDb;
+      const taken = [this.ownAlias];
+      this.fed = [];
+      for (const src of ws.sources) {
+        const e = store.conns.get(src.connId);
+        if (!e || src.connId === this.connId || !FED_DRIVERS.has(e.config.driver) || this.fed.some((f) => f.connId === src.connId)) continue;
+        const alias = isAlias(src.alias) ? uniqueAlias(src.alias, taken) : uniqueAlias(aliasSlug(e.config.name), taken);
+        taken.push(alias);
+        this.fed.push({ alias, connId: src.connId, database: SERVER_DRIVERS.has(e.config.driver) ? src.database : null });
+      }
+      this.fedShown = ws.fedShown || this.fed.length > 0;
+      this.syncFedUi();
+    }
+    this.updateSchema();
+  }
+
+  /**
+   * A restored console connects its data source the first time it is activated or run (explorer connect, with
+   * the usual recovery for expired Vault tokens / unknown SSH hosts), then loads completion. True when connected.
+   */
+  wake(): Promise<boolean> {
+    if (!this.needsConnect) return Promise.resolve(true);
+    if (this.waking) return this.waking;
+    const connId = this.connId;
+    this.waking = this.host
+      .ensureConnected(connId)
+      .catch(() => false)
+      .then((ok) => {
+        this.waking = null;
+        if (!ok || !this.alive || connId !== this.connId) return ok;
+        this.needsConnect = false;
+        this.status.serverVersion = store.conns.get(connId)?.session?.serverVersion ?? "";
+        this.updateSchema();
+        this.loadSchema();
+        if (this.isKafka) void loadOverview(connId);
+        this.syncFedUi();
+        this.host.onDatabase(this);
+        return true;
+      });
+    return this.waking;
+  }
+
+  // ---------------------------------------------------------------- format
+
+  /** Format SQL: the selection, else the statement at the cursor (one undo step; the trailing `;` stays). */
+  formatSql(): void {
+    if (this.isLineBased || !canFormat(this.driver)) return;
+    const t = this.editor.formatTarget();
+    if (!t) {
+      toast("Nothing to format at the cursor", "info");
+      return;
+    }
+    let out: string;
+    try {
+      out = formatSqlText(t.text, this.driver).trim();
+    } catch (e) {
+      const msg = errMsg(e).split("\n")[0].trim();
+      toast(`Couldn't format: ${msg.length > 140 ? msg.slice(0, 140) + "…" : msg}`, "error");
+      return;
+    }
+    if (out && out !== t.text) this.editor.replaceRange(t.from, t.to, out);
+    this.editor.focus();
+  }
+
   /** Cancel shortcut. */
   cancelRun(): void {
     void this.cancel();
@@ -263,7 +429,7 @@ export class ConsolePane implements TabPane {
 
   /** Effective database name: the bound one, else the connection's default. */
   get effectiveDatabase(): string | null {
-    return this.database ?? store.conns.get(this.connId)?.defaultDb ?? null;
+    return this.database ?? store.conns.get(this.connId)?.defaultDb ?? this.dbHint;
   }
 
   updateSchema(): void {
@@ -301,10 +467,13 @@ export class ConsolePane implements TabPane {
     }
     this.autoCommit = true;
     this.database = target;
+    this.dbHint = null;
+    if (this.fedOwnDb !== null && this.fedOwnDb === (target ?? e?.defaultDb ?? null)) this.fedOwnDb = null;
     this.schema = null;
     this.table = null;
     this.schemaExplicit = false;
     this.syncTxUi();
+    this.syncFedUi();
     this.updateSchema();
     this.loadSchema();
     this.host.onDatabase(this);
@@ -338,6 +507,9 @@ export class ConsolePane implements TabPane {
     await this.releaseSession();
     this.connId = connId;
     this.database = null;
+    this.dbHint = null;
+    this.fedOwnDb = null;
+    this.needsConnect = false;
     this.schema = null;
     this.table = null;
     this.schemaExplicit = false;
@@ -589,11 +761,14 @@ export class ConsolePane implements TabPane {
         }
         return;
       }
+      // A console restored on launch connects its data source on first use.
+      if (this.needsConnect) await this.wake();
       const sess = await this.ensureSession();
       for (let i = 0; i < stmts.length; i++) {
         const sql = stmts[i];
         this.setRunning(true, stmts.length > 1 ? `Running ${i + 1} of ${stmts.length}…` : "Running…");
-        try {
+        /** Runs the statement; returns its result when it should get an automatic row count. */
+        const runOne = async (): Promise<ResultItem | null> => {
           const size = stmts.length === 1 ? this.pageSizeFor(sql) : 0;
           if (size > 0) {
             // A single SELECT: run its first page (n + 1 rows tell whether more exist).
@@ -601,15 +776,29 @@ export class ConsolePane implements TabPane {
             const firstOnly = pagingFirstPageOnly(this.driver, sql);
             const paging: PagingState = { offset: 0, pageSize: size, hasMore: pg.hasMore, total: null, enabled: !firstOnly, disabledReason: firstOnly ? MSSQL_PAGE_REASON : undefined };
             const item = this.addResult(sql, pg.res, size, base + i + 1, total, paging);
-            if (item && getSettings().results.countRows && !firstOnly) autoCount = item;
-          } else {
-            const res = await api.execute(sess.sessionId, sql, DEFAULT_MAX_ROWS);
-            this.addResult(sql, res, DEFAULT_MAX_ROWS, base + i + 1, total);
+            return item && getSettings().results.countRows && !firstOnly ? item : null;
           }
+          const res = await api.execute(sess.sessionId, sql, DEFAULT_MAX_ROWS);
+          this.addResult(sql, res, DEFAULT_MAX_ROWS, base + i + 1, total);
+          return null;
+        };
+        try {
+          let counted: ResultItem | null;
+          try {
+            counted = await runOne();
+          } catch (e) {
+            // Connection dropped (idle timeout, server restart…): reconnect silently and run a read-only
+            // statement once more (Settings › Data › Auto-reconnect). Anything else surfaces the error.
+            if (!this.alive || !(await this.reconnectForRetry(sql, e))) throw e;
+            this.setRunning(true, "Reconnected · running again…");
+            counted = await runOne();
+          }
+          if (counted) autoCount = counted;
           if (!this.isLineBased && /^\s*(create|alter|drop|rename)\b/i.test(sql)) schemaTouched = true;
           if (this.isKafka && /^\s*(create|delete)\s+topic\b/i.test(sql)) void loadOverview(this.connId, true);
         } catch (e) {
-          this.addError(sql, errMsg(e), base + i + 1, total);
+          if (!this.alive) return;
+          this.addError(sql, errMsg(e), base + i + 1, total, isConnectionLost(rawMsg(e)));
           toast(errMsg(e), "error");
           break;
         }
@@ -625,6 +814,23 @@ export class ConsolePane implements TabPane {
       if (schemaTouched) this.host.onSchemaChanged(this.connId);
     }
     if (autoCount && this.alive) await this.countRows(autoCount);
+  }
+
+  /**
+   * After a connection-lost error: when Auto-reconnect is on, the console is not in a manual transaction and the
+   * statement only reads, reconnects the data source's sessions silently. True when the statement may run again.
+   */
+  private async reconnectForRetry(sql: string, err: unknown): Promise<boolean> {
+    if (!getSettings().data.autoReconnect || this.isLineBased || !this.autoCommit) return false;
+    if (!isConnectionLost(rawMsg(err)) || !isReadOnlyStatement(sql)) return false;
+    this.setRunning(true, "Connection lost · reconnecting…");
+    try {
+      const r = await api.reconnectConnection(this.connId);
+      // A session skipped because of an open transaction (typed BEGIN) must not be retried blindly.
+      return r.sessions > 0 && r.skippedInTx === 0 && this.alive;
+    } catch {
+      return false;
+    }
   }
 
   // ---------------------------------------------------------------- paging
@@ -936,17 +1142,30 @@ export class ConsolePane implements TabPane {
     return this.items.find((i) => i.grid === grid)?.sql ?? "";
   }
 
-  private addError(sql: string, msg: string, n: number, total: number): void {
+  /** `reconnect`: the connection was lost — offer a Reconnect button. */
+  private addError(sql: string, msg: string, n: number, total: number, reconnect = false): void {
     this.status.text = "Error";
     this.status.rows = null;
     this.status.affected = null;
+    let btn: HTMLButtonElement | null = null;
+    if (reconnect) {
+      const b = h("button", { class: "btn sm", type: "button", title: "Reconnect this data source, then run the statement again" }, icon("refresh", 13), "Reconnect");
+      b.addEventListener("click", () => {
+        b.disabled = true;
+        void this.host.reconnect(this.connId).finally(() => {
+          b.disabled = false;
+        });
+      });
+      btn = b;
+    }
     const view = h(
       "div",
       { class: "r-message err", role: "alert" },
       icon("alert", 20),
-      h("div", { class: "r-message-title" }, this.isLineBased ? "Command failed" : "Statement failed"),
+      h("div", { class: "r-message-title" }, reconnect ? "Connection lost" : this.isLineBased ? "Command failed" : "Statement failed"),
       h("div", { class: "r-error-text" }, msg),
       sql ? h("pre", { class: "r-sql" }, sql) : null,
+      btn,
     );
     this.addItem(total > 1 ? `Error · ${n}` : "Error", sql, view, "err");
   }
@@ -1170,7 +1389,7 @@ export class ConsolePane implements TabPane {
   /** The console's own data source first (with its alias), then the attached ones. */
   private fedSources(): FedSource[] {
     return [
-      { alias: this.ownAlias, connectionId: this.connId, database: this.database },
+      { alias: this.ownAlias, connectionId: this.connId, database: this.fedOwnDb ?? this.database },
       ...this.fed.map((f) => ({ alias: f.alias, connectionId: f.connId, database: f.database })),
     ];
   }
@@ -1221,7 +1440,58 @@ export class ConsolePane implements TabPane {
     this.syncFedUi();
   }
 
-  private fedChip(alias: string, connId: string, onAlias: (v: string) => void, onDetach: (() => void) | null): HTMLElement {
+  /**
+   * Database picker of a Sources chip (server-type sources only). `value` null = the default: the connection's
+   * default database for attached sources, the console's own database for the console's source (`fallback`).
+   */
+  private fedDbPicker(connId: string, value: string | null, fallback: string | null, set: (v: string | null) => void): HTMLElement | null {
+    const e = store.conns.get(connId);
+    if (!e || !SERVER_DRIVERS.has(e.config.driver)) return null;
+    const shown = (): string => value ?? fallback ?? e.defaultDb ?? "default database";
+    const btn = h(
+      "button",
+      { class: "fed-db mono", type: "button", "aria-haspopup": "menu", title: "Database this source reads from", "aria-label": `Database of ${e.config.name}: ${shown()}` },
+      h("span", { class: "fed-db-name" }, shown()),
+      h("span", { class: "tx-caret", "aria-hidden": "true" }, "▾"),
+    );
+    btn.addEventListener("click", () => void this.openFedDbMenu(btn, connId, value, fallback, set));
+    return btn;
+  }
+
+  /** Lists the source's databases (connecting it in the explorer first when needed) and picks one. */
+  private async openFedDbMenu(anchor: HTMLElement, connId: string, value: string | null, fallback: string | null, set: (v: string | null) => void): Promise<void> {
+    let relabel = false;
+    if (store.conns.get(connId)?.status !== "connected") {
+      anchor.classList.add("busy");
+      const ok = await this.host.ensureConnected(connId).catch(() => false);
+      anchor.classList.remove("busy");
+      if (!ok || !anchor.isConnected || !this.alive) return;
+      relabel = true;
+    }
+    const e = store.conns.get(connId);
+    if (!e) return;
+    const def = fallback ?? e.defaultDb;
+    const cur = value ?? def;
+    const r = anchor.getBoundingClientRect();
+    // Now that the default database is known, the chips can show it.
+    if (relabel) this.syncFedUi();
+    const list = [...e.databases].sort((a, b) => Number(a.isSystem) - Number(b.isSystem));
+    showMenu(
+      r.left,
+      r.bottom + 6,
+      list.length
+        ? list.map((d) => ({
+            label: d.name,
+            checked: d.name === cur,
+            hint: d.name === def ? "default" : d.isSystem ? "system" : undefined,
+            onClick: () => set(d.name === def ? null : d.name),
+          }))
+        : [{ label: "No databases listed", disabled: true }],
+      { minWidth: 200 },
+    );
+  }
+
+  private fedChip(alias: string, connId: string, onAlias: (v: string) => void, onDetach: (() => void) | null, dbPicker: HTMLElement | null = null): HTMLElement {
     const e = store.conns.get(connId);
     const name = e?.config.name ?? "(removed data source)";
     const color = e ? connColor(e.config) : "var(--text-3)";
@@ -1257,6 +1527,7 @@ export class ConsolePane implements TabPane {
       h("span", { class: "fed-dot", "aria-hidden": "true" }),
       input,
       h("span", { class: "fed-name" }, name),
+      dbPicker,
       onDetach ? h("button", { class: "fed-x", type: "button", title: `Detach ${name}`, "aria-label": `Detach ${name}`, onclick: onDetach }, icon("x", 10)) : null,
     );
   }
@@ -1273,20 +1544,40 @@ export class ConsolePane implements TabPane {
     this.fedEl.hidden = !show;
     this.el?.classList.toggle("fed-on", show);
     clear(this.fedEl);
+    // Attached sources are part of the restored workspace.
+    this.host.onWorkspace();
     if (!show) return;
     const add = h("button", { class: "fed-add", type: "button", "aria-haspopup": "menu", onclick: (ev: MouseEvent) => this.openAttachMenu(ev.currentTarget as HTMLElement) }, icon("plus", 12), "Attach source");
     this.fedEl.append(
       h("span", { class: "fed-label" }, "Sources"),
-      this.fedChip(this.ownAlias, this.connId, (v) => {
-        this.ownAlias = v;
-        this.ownAliasEdited = true;
-        this.syncFedUi();
-      }, null),
-      ...this.fed.map((f, i) =>
-        this.fedChip(f.alias, f.connId, (v) => {
-          f.alias = v;
+      this.fedChip(
+        this.ownAlias,
+        this.connId,
+        (v) => {
+          this.ownAlias = v;
+          this.ownAliasEdited = true;
           this.syncFedUi();
-        }, () => this.detachSource(i)),
+        },
+        null,
+        this.fedDbPicker(this.connId, this.fedOwnDb, this.effectiveDatabase, (v) => {
+          this.fedOwnDb = v;
+          this.syncFedUi();
+        }),
+      ),
+      ...this.fed.map((f, i) =>
+        this.fedChip(
+          f.alias,
+          f.connId,
+          (v) => {
+            f.alias = v;
+            this.syncFedUi();
+          },
+          () => this.detachSource(i),
+          this.fedDbPicker(f.connId, f.database, null, (v) => {
+            f.database = v;
+            this.syncFedUi();
+          }),
+        ),
       ),
       add,
       h("span", { class: "fed-hint" }, this.fed.length ? "Query them as alias.schema.table · results are read-only" : "Attach another data source to join across sources"),
