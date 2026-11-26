@@ -1,17 +1,20 @@
 // ALL CodeMirror usage lives here, behind the small SqlEditor interface.
-import { Compartment, EditorState, Prec } from "@codemirror/state";
+import { Compartment, EditorState, Prec, StateEffect, StateField } from "@codemirror/state";
 import type { Extension, Transaction, TransactionSpec } from "@codemirror/state";
 import {
+  Decoration,
   EditorView,
+  GutterMarker,
   drawSelection,
+  gutter,
   highlightActiveLine,
   highlightActiveLineGutter,
   keymap,
   lineNumbers,
   placeholder,
 } from "@codemirror/view";
-import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
+import { defaultKeymap, history, historyKeymap, indentWithTab, redo, toggleComment, undo } from "@codemirror/commands";
+import { highlightSelectionMatches, openSearchPanel, searchKeymap } from "@codemirror/search";
 import { autocompletion, closeBrackets, closeBracketsKeymap, completionKeymap } from "@codemirror/autocomplete";
 import type { Completion, CompletionContext, CompletionResult } from "@codemirror/autocomplete";
 import { HighlightStyle, StreamLanguage, bracketMatching, indentOnInput, syntaxHighlighting } from "@codemirror/language";
@@ -20,7 +23,9 @@ import { tags as t } from "@lezer/highlight";
 import { splitStatements, statementAt } from "../sqlsplit";
 import type { SplitOptions } from "../sqlsplit";
 import type { Driver } from "../types";
-import { filterCompletions } from "./sqlutil";
+import { filterCompletions, splitOptionsFor } from "./sqlutil";
+import { codeMirrorKey, matchAction, shortcutLabel } from "./keymap";
+import { onSettingsChange } from "./settings";
 import { REDIS_COMMANDS, redisLinesAt, splitRedisLines } from "./redis";
 import { CONSUME_FLAGS, KAFKA_COMMANDS, PRODUCE_FIELDS } from "./kafka";
 
@@ -196,21 +201,12 @@ function kafkaCompletionSource(names: () => { topics: string[]; groups: string[]
 
 const KAFKA_PLACEHOLDER = "Write Kafka commands, one per line — e.g. consume orders.v2 --latest --limit 20. Ctrl/Cmd+Enter runs the line under the cursor.";
 
-function splitOptsFor(driver: Driver): SplitOptions {
-  switch (driver) {
-    case "postgres":
-      return { brackets: false, dollarQuotes: true };
-    case "mysql":
-      return { brackets: false, dollarQuotes: false, backslashEscapes: true };
-    default:
-      return { brackets: true, dollarQuotes: false };
-  }
-}
+const splitOptsFor = splitOptionsFor;
 
 // Syntax colors from the spec (C3): keywords #ff7088, strings #8fd9a8, comments #6e6e76.
 const highlight = HighlightStyle.define([
   { tag: [t.keyword, t.operatorKeyword], color: "var(--syn-keyword)", fontWeight: "500" },
-  { tag: [t.typeName, t.standard(t.name)], color: "var(--syn-type)" },
+  { tag: [t.typeName, t.standard(t.name), t.function(t.variableName), t.function(t.propertyName)], color: "var(--syn-type)" },
   { tag: [t.string, t.special(t.string)], color: "var(--syn-string)" },
   { tag: [t.number, t.bool, t.null], color: "var(--syn-number)" },
   { tag: [t.comment, t.lineComment, t.blockComment], color: "var(--syn-comment)" },
@@ -220,11 +216,12 @@ const highlight = HighlightStyle.define([
 
 const theme = EditorView.theme(
   {
-    "&": { height: "100%", backgroundColor: "transparent", color: "var(--text-code)", fontSize: "13.5px" },
+    "&": { height: "100%", backgroundColor: "transparent", color: "var(--syn-text, var(--text-code))", fontSize: "var(--editor-font-size, 13px)" },
     "&.cm-focused": { outline: "none" },
     ".cm-scroller": {
-      fontFamily: "var(--font-mono)",
-      lineHeight: "23px",
+      fontFamily: "var(--editor-font, var(--font-mono))",
+      lineHeight: "var(--editor-line-height, 22px)",
+      fontVariantLigatures: "var(--editor-ligatures, normal)",
       overflow: "auto",
     },
     ".cm-content": { caretColor: "var(--accent)", padding: "8px 0" },
@@ -236,7 +233,10 @@ const theme = EditorView.theme(
       border: "none",
     },
     // 58px gutter, numbers right-aligned with 20px before the code (spec)
-    ".cm-lineNumbers .cm-gutterElement": { boxSizing: "border-box", minWidth: "58px", padding: "0 20px 0 8px", textAlign: "right" },
+    ".cm-lineNumbers .cm-gutterElement": { boxSizing: "border-box", minWidth: "46px", padding: "0 6px 0 8px", textAlign: "right" },
+    ".cm-runGutter": { width: "26px" },
+    ".cm-runGutter .cm-gutterElement": { display: "flex", alignItems: "center", justifyContent: "center", padding: "0" },
+    ".cm-run-active": { backgroundColor: "rgba(255, 255, 255, 0.045)" },
     ".cm-activeLine": { backgroundColor: "var(--editor-active-line)" },
     ".cm-activeLineGutter": { backgroundColor: "var(--editor-active-line)", color: "var(--text-3)" },
     ".cm-selectionBackground": { backgroundColor: "var(--accent-sel-blur) !important" },
@@ -278,12 +278,151 @@ const theme = EditorView.theme(
   { dark: true },
 );
 
+// ---- Run gutter: a ▶ on the first line of every statement (one per command line for Redis / Kafka). The
+// statement under the caret gets a soft line highlight and an accent-colored ▶.
+
+interface RunStmt {
+  text: string;
+  from: number;
+  /** End of the statement text (terminator excluded). */
+  to: number;
+  /** End including the terminating `;` (the caret counts as inside up to here). */
+  reach: number;
+  /** Offset of the start of the statement's first line (the line that carries the ▶). */
+  lineFrom: number;
+}
+
+interface RunState {
+  driver: Driver;
+  stmts: RunStmt[];
+  byLine: Map<number, number>;
+  /** Index into stmts of the statement holding the caret, or -1. */
+  active: number;
+}
+
+const setRunDriver = StateEffect.define<Driver>();
+
+function computeRunStmts(state: EditorState, driver: Driver): { stmts: RunStmt[]; byLine: Map<number, number> } {
+  const doc = state.doc;
+  const text = doc.toString();
+  const stmts: RunStmt[] = [];
+  const byLine = new Map<number, number>();
+  const lineBased = driver === "redis" || driver === "kafka";
+  const raw: { text: string; from: number; to: number; reach: number }[] = lineBased
+    ? splitRedisLines(text).map((l) => ({ text: l.text, from: l.from, to: l.to, reach: l.to }))
+    : splitStatements(text, splitOptsFor(driver)).map((x) => ({ text: x.text, from: x.start, to: x.end, reach: x.endWithTerminator }));
+  for (const r of raw) {
+    const lineFrom = doc.lineAt(r.from).from;
+    byLine.set(lineFrom, stmts.length);
+    stmts.push({ text: r.text, from: r.from, to: r.to, reach: r.reach, lineFrom });
+  }
+  return { stmts, byLine };
+}
+
+function activeStmt(state: EditorState, stmts: RunStmt[]): number {
+  const head = state.selection.main.head;
+  const lineEnd = state.doc.lineAt(head).to;
+  for (let i = 0; i < stmts.length; i++) {
+    const s = stmts[i];
+    if (head < s.from) break;
+    if (head <= s.reach || (head <= lineEnd && lineEnd <= s.reach)) return i;
+  }
+  return -1;
+}
+
+function makeRunField(initial: Driver): StateField<RunState> {
+  return StateField.define<RunState>({
+    create(state: EditorState): RunState {
+      const c = computeRunStmts(state, initial);
+      return { driver: initial, stmts: c.stmts, byLine: c.byLine, active: activeStmt(state, c.stmts) };
+    },
+    update(v: RunState, tr: Transaction): RunState {
+      let driver = v.driver;
+      for (const e of tr.effects) if (e.is(setRunDriver)) driver = e.value;
+      if (tr.docChanged || driver !== v.driver) {
+        const c = computeRunStmts(tr.state, driver);
+        return { driver, stmts: c.stmts, byLine: c.byLine, active: activeStmt(tr.state, c.stmts) };
+      }
+      if (tr.selection) return { ...v, active: activeStmt(tr.state, v.stmts) };
+      return v;
+    },
+  });
+}
+
+class RunMarker extends GutterMarker {
+  constructor(private readonly on: boolean) {
+    super();
+  }
+  eq(other: GutterMarker): boolean {
+    return other instanceof RunMarker && other.on === this.on;
+  }
+  toDOM(): Node {
+    const el = document.createElement("span");
+    el.className = "cm-run-btn" + (this.on ? " on" : "");
+    el.title = `Run statement ${shortcutLabel("runStatement")} · ${/Mac/.test(navigator.userAgent) ? "⌥" : "Alt+"}click: new result tab`;
+    el.innerHTML = '<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2 1.2v7.6L8.6 5z" fill="currentColor"/></svg>';
+    return el;
+  }
+}
+const RUN_OFF = new RunMarker(false);
+const RUN_ON = new RunMarker(true);
+
+interface RunHolder {
+  cb: ((r: Runnable, opts: { newTab: boolean }) => void) | null;
+}
+
+function runGutterExtensions(initial: Driver, holder: RunHolder): Extension {
+  const field = makeRunField(initial);
+  return [
+    field,
+    gutter({
+      class: "cm-runGutter",
+      renderEmptyElements: false,
+      lineMarker(view: EditorView, line: { from: number }): GutterMarker | null {
+        const st = view.state.field(field);
+        const i = st.byLine.get(line.from);
+        if (i === undefined) return null;
+        return i === st.active ? RUN_ON : RUN_OFF;
+      },
+      lineMarkerChange: (u: { docChanged: boolean; selectionSet: boolean; transactions: readonly Transaction[] }): boolean =>
+        u.docChanged || u.selectionSet || u.transactions.some((tr) => tr.effects.some((e) => e.is(setRunDriver))),
+      initialSpacer: (): GutterMarker => RUN_OFF,
+      domEventHandlers: {
+        mousedown(view: EditorView, line: { from: number }, event: Event): boolean {
+          const st = view.state.field(field);
+          const i = st.byLine.get(line.from);
+          if (i === undefined) return false;
+          const s = st.stmts[i];
+          event.preventDefault();
+          view.dispatch({ selection: { anchor: s.from }, scrollIntoView: true });
+          view.focus();
+          if (holder.cb) holder.cb({ text: s.text, from: s.from, to: s.to }, { newTab: (event as MouseEvent).altKey });
+          return true;
+        },
+      },
+    }),
+    EditorView.decorations.compute([field], (state: EditorState) => {
+      const st = state.field(field);
+      if (st.active < 0) return Decoration.none;
+      const s = st.stmts[st.active];
+      const deco = Decoration.line({ class: "cm-run-active" });
+      const ranges: ReturnType<typeof deco.range>[] = [];
+      const last = state.doc.lineAt(Math.min(s.to, state.doc.length)).number;
+      for (let n = state.doc.lineAt(s.from).number; n <= last; n++) ranges.push(deco.range(state.doc.line(n).from));
+      return Decoration.set(ranges);
+    }),
+  ];
+}
+
 export class SqlEditor {
   private view: EditorView;
   private lang = new Compartment();
   private driver: Driver;
   private schema: Record<string, string[]> = {};
   private kafkaNames: () => { topics: string[]; groups: string[] };
+  private runHolder: RunHolder = { cb: null };
+  private keys = new Compartment();
+  private offSettings: (() => void) | null = null;
 
   constructor(parent: HTMLElement, opts: EditorOptions) {
     this.driver = opts.driver;
@@ -291,6 +430,7 @@ export class SqlEditor {
     const onChange = opts.onChange;
     const extensions: Extension[] = [
       lineNumbers(),
+      runGutterExtensions(opts.driver, this.runHolder),
       highlightActiveLineGutter(),
       highlightActiveLine(),
       history(),
@@ -301,14 +441,7 @@ export class SqlEditor {
       highlightSelectionMatches(),
       syntaxHighlighting(highlight),
       this.lang.of(this.langExtension()),
-      keymap.of([
-        ...closeBracketsKeymap,
-        ...defaultKeymap,
-        ...searchKeymap,
-        ...historyKeymap,
-        ...completionKeymap,
-        indentWithTab,
-      ]),
+      this.keys.of(this.keymapExtension()),
       theme,
       EditorView.updateListener.of((u: { docChanged: boolean }) => {
         if (u.docChanged && onChange) onChange();
@@ -318,19 +451,49 @@ export class SqlEditor {
       state: EditorState.create({ doc: opts.doc ?? "", extensions }),
       parent,
     });
-    // Capture on the container so Mod-Enter wins over CodeMirror's own bindings.
+    // Shortcuts follow the keymap settings (preset + overrides).
+    this.offSettings = onSettingsChange(() => this.view.dispatch({ effects: this.keys.reconfigure(this.keymapExtension()) }));
+    // Capture on the container so the run shortcuts win over CodeMirror's own bindings.
     parent.addEventListener(
       "keydown",
       (e: KeyboardEvent) => {
-        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+        const a = matchAction(e);
+        if (a === "runStatement" || a === "runAll") {
           e.preventDefault();
           e.stopPropagation();
-          if (e.shiftKey) opts.onRunAll();
+          if (a === "runAll") opts.onRunAll();
           else opts.onRun();
         }
       },
       true,
     );
+  }
+
+  /** CodeMirror keymap: the editor-handled actions of the app keymap (comment, find, undo, redo) + the defaults. */
+  private keymapExtension(): Extension {
+    const bind = (id: "toggleComment" | "find" | "undo" | "redo", run: (v: EditorView) => boolean): { key: string; run: (v: EditorView) => boolean; preventDefault: boolean }[] => {
+      const key = codeMirrorKey(id);
+      return key ? [{ key, run, preventDefault: true }] : [];
+    };
+    return [
+      Prec.high(
+        keymap.of([
+          ...bind("toggleComment", toggleComment),
+          ...bind("find", openSearchPanel),
+          ...bind("undo", undo),
+          ...bind("redo", redo),
+        ]),
+      ),
+      keymap.of([...closeBracketsKeymap, ...defaultKeymap, ...searchKeymap, ...historyKeymap, ...completionKeymap, indentWithTab]),
+    ];
+  }
+
+  /**
+   * Clicking a gutter ▶ moves the caret into that statement and calls `cb` with it (`newTab`: Alt/Option-click,
+   * run into a new result tab).
+   */
+  onRunStatement(cb: (r: Runnable, opts: { newTab: boolean }) => void): void {
+    this.runHolder.cb = cb;
   }
 
   private langExtension(): Extension {
@@ -379,6 +542,74 @@ export class SqlEditor {
       changes: { from: sel.from, to: sel.to, insert: text },
       selection: { anchor: sel.from + text.length },
     });
+  }
+
+  /**
+   * Inserts `text` as a statement of its own: replaces a selection, otherwise goes on a new line
+   * at the cursor (`atEnd`: after the last line), terminating the previous statement and this one
+   * with `;` in SQL consoles so the two never run together. The caret ends inside the new statement.
+   */
+  insertStatement(text: string, atEnd = false): void {
+    const st = this.view.state;
+    const sel = st.selection.main;
+    const doc = st.doc.toString();
+    const lineBased = this.lineBased();
+    let body = text.trim();
+    if (!body) return;
+    if (!lineBased && !body.endsWith(";")) body += ";";
+    const back = lineBased ? 0 : 1; // caret lands before the trailing ";"
+    if (!atEnd && !sel.empty) {
+      this.view.dispatch({
+        changes: { from: sel.from, to: sel.to, insert: body },
+        selection: { anchor: sel.from + body.length - back },
+        scrollIntoView: true,
+        userEvent: "input",
+      });
+      return;
+    }
+    // Where to insert: the end of the document, the cursor when it sits on an empty line, or
+    // else right after the statement (SQL) / line (Redis, Kafka) under the cursor.
+    let pos = atEnd ? doc.length : sel.head;
+    if (!atEnd && st.doc.lineAt(pos).text.trim() !== "") {
+      pos = st.doc.lineAt(pos).to;
+      if (!lineBased) {
+        const cur = statementAt(doc, sel.head, splitOptsFor(this.driver));
+        if (cur && sel.head >= cur.start && sel.head <= cur.endWithTerminator) {
+          pos = Math.max(cur.endWithTerminator, st.doc.lineAt(cur.endWithTerminator).to);
+        }
+      }
+    }
+    const changes: { from: number; to: number; insert: string }[] = [];
+    const tail = doc.slice(0, pos).trimEnd();
+    let prefix = "";
+    let shift = 0;
+    if (tail) {
+      // Close an unterminated previous statement (not when it ends in a line comment).
+      const lastLine = tail.slice(tail.lastIndexOf("\n") + 1);
+      if (!lineBased && !tail.endsWith(";") && !lastLine.includes("--")) {
+        changes.push({ from: tail.length, to: tail.length, insert: ";" });
+        shift = 1;
+      }
+      const lineSoFar = doc.slice(doc.lastIndexOf("\n", pos - 1) + 1, pos);
+      if (lineSoFar.trim()) prefix = lineBased ? "\n" : "\n\n";
+    }
+    const rest = doc.slice(pos);
+    const suffix = rest.length > 0 && !/^[ \t]*(\n|$)/.test(rest) ? "\n" : "";
+    changes.push({ from: pos, to: pos, insert: prefix + body + suffix });
+    this.view.dispatch({
+      changes,
+      selection: { anchor: pos + shift + prefix.length + body.length - back },
+      scrollIntoView: true,
+      userEvent: "input",
+    });
+  }
+
+  undo(): boolean {
+    return undo(this.view);
+  }
+
+  redo(): boolean {
+    return redo(this.view);
   }
 
   getSelectionOrStatementAtCursor(): Runnable | null {
@@ -434,7 +665,7 @@ export class SqlEditor {
   setSchema(schema: Record<string, string[]>, driver: Driver): void {
     this.schema = schema;
     this.driver = driver;
-    this.view.dispatch({ effects: this.lang.reconfigure(this.langExtension()) });
+    this.view.dispatch({ effects: [this.lang.reconfigure(this.langExtension()), setRunDriver.of(driver)] });
   }
 
   focus(): void {
@@ -442,6 +673,8 @@ export class SqlEditor {
   }
 
   destroy(): void {
+    this.offSettings?.();
+    this.offSettings = null;
     this.view.destroy();
   }
 }

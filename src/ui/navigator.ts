@@ -707,9 +707,10 @@ export class Navigator {
     const cp = pane && pane.kind === "console" ? (pane as ConsolePane) : null;
     if (kind === "table" || kind === "view" || kind === "materialized") {
       const sql = `SELECT * FROM ${qualifiedName(driver, s.name, name)} `;
-      if (newConsole || !cp) this.host.openConsole(id, { sql, run: true, title: name, database: consoleDb, schema: s.name });
+      if (newConsole || !cp) this.host.openConsole(id, { sql, run: true, title: name, table: name, database: consoleDb, schema: s.name });
       else {
-        cp.setSql(sql);
+        // Keep the user's work: add the query as a new statement instead of replacing the text.
+        cp.insertStatement(sql, true);
         void cp.runSqlText(sql);
         cp.focus();
       }
@@ -722,7 +723,7 @@ export class Navigator {
       sql = r ? routineSkeleton(driver, s.name, r) : `${kind === "procedure" ? "CALL" : "SELECT"} ${qualifiedName(driver, s.name, name)}()`;
     }
     if (newConsole || !cp) this.host.openConsole(id, { sql, title: name, database: consoleDb, schema: s.name });
-    else cp.insertSql(sql);
+    else cp.insertStatement(sql);
   }
 }
 

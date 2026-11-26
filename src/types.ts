@@ -49,7 +49,7 @@ export interface ExplorerScope {
 export type AuthMethod = "password" | "vault";
 
 /** file = ~/.vault-token (as written by `vault login`), env = VAULT_TOKEN, keychain = set via setVaultToken */
-export type VaultTokenSource = "file" | "env" | "keychain";
+export type VaultTokenSource = "file" | "env" | "keychain" | "oidc";
 
 /** HashiCorp Vault credential source: KV v1, KV v2 (<mount>/data/<path>) or dynamic engines (database/creds/<role>). */
 export interface VaultConfig {
@@ -78,6 +78,10 @@ export interface VaultProfile {
   caCertPath?: string | null;
   skipTlsVerify?: boolean;
   color?: string | null;
+  /** OIDC sign-in (tokenSource "oidc"): auth mount, default "oidc". */
+  oidcMount?: string | null;
+  /** OIDC role; null = the mount's default role. */
+  oidcRole?: string | null;
 }
 
 export interface VaultTokenInfo {
@@ -369,4 +373,31 @@ export interface ExportOptions {
   lineEnding?: string | null;
   /** SQL INSERT target, already qualified/quoted. Default "my_table". */
   tableName?: string | null;
+}
+
+// ── v0.10: reconnect, cross-source queries ──
+export interface ReconnectResult {
+  sessions: number;
+  skippedInTx: number;
+  elapsedMs: number;
+}
+
+export interface FedSource {
+  alias: string;
+  connectionId: string;
+  database: string | null;
+}
+
+export interface FedStep {
+  alias: string;
+  connectionId: string;
+  sourceName: string;
+  sql: string;
+  rows: number;
+  elapsedMs: number;
+}
+
+export interface FedResult {
+  result: QueryResult;
+  plan: FedStep[];
 }

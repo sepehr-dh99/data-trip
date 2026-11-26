@@ -107,6 +107,8 @@ pub enum VaultTokenSource {
     Env,
     /// Token stored in the OS keychain via `set_vault_token`.
     Keychain,
+    /// Token obtained by an OIDC browser sign-in (`vault_oidc_login`), stored in the keychain.
+    Oidc,
 }
 
 /// HashiCorp Vault credential source. Works with KV v1, KV v2 (`<mount>/data/<path>`)
@@ -169,6 +171,12 @@ pub struct VaultProfile {
     /// Accent shown in the UI.
     #[serde(default)]
     pub color: Option<String>,
+    /// OIDC auth mount (token source "oidc"); None = "oidc".
+    #[serde(default)]
+    pub oidc_mount: Option<String>,
+    /// OIDC role; None = the mount's default role.
+    #[serde(default)]
+    pub oidc_role: Option<String>,
 }
 
 /// From `auth/token/lookup-self`. Never contains the token.
@@ -748,4 +756,47 @@ pub struct ExportOptions {
 
 fn default_true() -> bool {
     true
+}
+
+// ----- v0.10: reconnect, cross-source queries -----
+
+/// Result of `reconnect_connection`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconnectResult {
+    /// Sessions that were reconnected.
+    pub sessions: u32,
+    /// Sessions skipped because a transaction is open.
+    pub skipped_in_tx: u32,
+    pub elapsed_ms: u64,
+}
+
+/// A data source attached to a cross-source query under `alias`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FedSource {
+    pub alias: String,
+    pub connection_id: String,
+    /// Database to connect to instead of the connection's default (ignored for SQLite).
+    #[serde(default)]
+    pub database: Option<String>,
+}
+
+/// One step of a cross-source query plan: a pull from a source, or the final in-memory join.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FedStep {
+    pub alias: String,
+    pub connection_id: String,
+    pub source_name: String,
+    pub sql: String,
+    pub rows: u64,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FedResult {
+    pub result: QueryResult,
+    pub plan: Vec<FedStep>,
 }

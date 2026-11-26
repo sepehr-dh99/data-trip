@@ -2,7 +2,6 @@
 // capsule (console tabs + run controls + history), consoles, history drawer, shortcuts.
 import { api } from "../api";
 import type { ConnectionConfig } from "../types";
-import { DRIVER_LABELS } from "../types";
 import { confirmDialog } from "./confirm";
 import { ConsolePane } from "./console";
 import type { ConsoleHost } from "./console";
@@ -16,12 +15,13 @@ import { GroupPane } from "./kafkaGroup";
 import { TopicPane } from "./kafkaTopic";
 import { KeyPane } from "./keyView";
 import type { KeyHost } from "./keyView";
-import { dbLabel } from "./redis";
 import type { TabPane } from "./tabs";
+import { TabStrip } from "./tabRail";
+import { matchAction, shortcutLabel } from "./keymap";
+import { openSettings } from "./settingsDialog";
 import { Navigator } from "./navigator";
 import { openScopePicker } from "./scopePicker";
 import { store } from "./state";
-import { connColor } from "./sqlutil";
 import { loadLayout, onLookChange } from "./layout";
 import { toast } from "./toast";
 import { VAULT_TOKEN_RE, vaults } from "./vault";
@@ -30,13 +30,27 @@ import { showTokenPastePrompt } from "./vaultChips";
 const IS_MAC = /Mac/.test(navigator.userAgent);
 const MOD = IS_MAC ? "⌘" : "Ctrl+";
 
+/** What "Reopen closed tab" needs to bring a tab back. */
+interface ClosedTab {
+  kind: TabPane["kind"];
+  connId: string;
+  database: string | null;
+  title: string;
+  table: string | null;
+  schema: string | null;
+  sql: string;
+  name: string | null;
+}
+const MAX_CLOSED = 25;
+
 export class App {
   private tabs: TabPane[] = [];
   private active: TabPane | null = null;
   private explorer: Explorer;
   private history: HistoryPanel;
-  private tabsEl = h("div", { class: "cap-tabs", role: "tablist", "aria-label": "Consoles" });
-  private tabEls = new Map<TabPane, HTMLElement>();
+  private strip!: TabStrip;
+  private closed: ClosedTab[] = [];
+  private dirtySeen = new Map<TabPane, boolean>();
   private capSep = h("span", { class: "cap-sep", "aria-hidden": "true" });
   private capSep2 = h("span", { class: "cap-sep", "aria-hidden": "true" });
   private navigator!: Navigator;
@@ -46,7 +60,6 @@ export class App {
   private empty = h("div", { class: "empty-state" });
   private sidebarW = Number(localStorage.getItem("dt.sidebarW")) || 288;
   private selectedConn: string | null = null;
-  private counts = new Map<string, number>();
   private prevStatus = new Map<string, string>();
   private btnHistory!: HTMLButtonElement;
   private shell!: HTMLElement;
@@ -93,7 +106,7 @@ export class App {
       insert: (sql) => {
         const c = this.activeConsole();
         if (!c) return toast("Open a console first", "info");
-        c.insertSql(sql);
+        c.insertStatement(sql);
       },
       run: (sql) => {
         const c = this.activeConsole();
@@ -105,6 +118,26 @@ export class App {
         if (this.history.isOpen()) this.toggleHistory();
       },
     });
+    this.btnAdd = h("button", { class: "cap-icon cap-add", type: "button", title: `New console (${shortcutLabel("newConsole")})`, "aria-label": "New console", onclick: () => void this.newConsole() }, icon("plus", 15));
+    this.strip = new TabStrip(
+      {
+        tabs: () => this.tabs,
+        active: () => this.active,
+        activate: (t) => this.activate(t),
+        close: (t) => void this.closeTab(t),
+        closeMany: (list) => void this.closeMany(list),
+        newConsole: () => void this.newConsole(),
+        setOrder: (list) => {
+          if (list.length === this.tabs.length && list.every((t) => this.tabs.includes(t))) this.tabs = list;
+        },
+        changed: () => {
+          this.navigator.update(this.active);
+          this.fitCapsule();
+          this.syncCapSeps();
+        },
+      },
+      this.btnAdd,
+    );
     this.build();
     store.subscribe(() => this.onStoreChange());
     onLookChange(() => {
@@ -114,6 +147,10 @@ export class App {
     store.onSchema((id) => this.tabs.filter((t) => t.connId === id).forEach((t) => t.updateSchema()));
     window.addEventListener("keydown", (e) => this.onKey(e));
     window.addEventListener("paste", (e) => this.onPaste(e));
+  }
+
+  private inEditable(t: EventTarget | null): boolean {
+    return t instanceof HTMLElement && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName) || t.closest(".cm-editor") !== null);
   }
 
   private activeConsole(): ConsolePane | null {
@@ -169,7 +206,6 @@ export class App {
       ["b1", "b2", "b3", "b4", "b5", "b6"].map((b) => h("div", { class: "blob " + b })),
     );
 
-    this.btnAdd = h("button", { class: "cap-icon cap-add", type: "button", title: `New console (${MOD}N)`, "aria-label": "New console", onclick: () => void this.newConsole() }, icon("plus", 15));
     this.btnHistory = h(
       "button",
       { class: "cap-icon", type: "button", title: `Query history (${MOD}Shift+H)`, "aria-label": "Query history", "aria-pressed": "false", onclick: () => this.toggleHistory() },
@@ -178,7 +214,7 @@ export class App {
     const capsule = h(
       "div",
       { class: "capsule", role: "toolbar", "aria-label": "Console" },
-      h("div", { class: "cap-tabs-wrap" }, this.tabsEl, this.btnAdd),
+      this.strip.topEl,
       this.capSep,
       this.navigator.el,
       this.capSep2,
@@ -186,17 +222,6 @@ export class App {
       this.btnHistory,
     );
     this.capsule = capsule;
-    // Translate vertical wheel into horizontal scrolling for the overflowing tab strip.
-    this.tabsEl.addEventListener(
-      "wheel",
-      (e) => {
-        if (Math.abs(e.deltaY) > Math.abs(e.deltaX) && this.tabsEl.scrollWidth > this.tabsEl.clientWidth) {
-          this.tabsEl.scrollLeft += e.deltaY;
-          e.preventDefault();
-        }
-      },
-      { passive: false },
-    );
 
     // macOS: the strip above the content can move the window (there is no native title bar).
     const dragStrip = h("div", { class: "sheet-drag", "aria-hidden": "true", ...(IS_MAC ? { "data-tauri-drag-region": "" } : {}) });
@@ -236,6 +261,7 @@ export class App {
     this.explorer.el.appendChild(resizer);
 
     this.sheetEl = sheet;
+    this.strip.mount(sheet);
     new ResizeObserver(() => this.fitCapsule()).observe(sheet);
     this.shell = h("div", { class: "shell" }, this.explorer.el, sheet);
     this.applySidebar();
@@ -254,6 +280,8 @@ export class App {
       const over = this.capsule.scrollWidth > this.capsule.clientWidth + 1;
       this.capsule.classList.toggle("stacked", over);
       this.sheetEl.classList.toggle("cap-stacked", over);
+      // Tabs on top: show the ones that fit, the rest go behind "+N more".
+      this.strip.fitTop();
     });
   }
 
@@ -286,7 +314,12 @@ export class App {
   private host: ConsoleHost = {
     onExecuted: () => void this.history.refresh(),
     onStatus: (c) => {
-      this.tabEls.get(c)?.classList.toggle("running", c.isRunning);
+      this.strip.setRunning(c);
+      const d = c.dirty;
+      if ((this.dirtySeen.get(c) ?? false) !== d) {
+        this.dirtySeen.set(c, d);
+        this.renderTabs();
+      }
     },
     onSchemaChanged: (id) => void store.refresh(id).catch(() => undefined),
     onDatabase: () => {
@@ -317,27 +350,34 @@ export class App {
     await this.openConsole(id);
   }
 
-  private async openConsole(connId: string, opts: OpenConsoleOpts = {}): Promise<void> {
+  private async openConsole(connId: string, opts: OpenConsoleOpts = {}, name: string | null = null): Promise<ConsolePane | null> {
     const entry = store.conns.get(connId);
-    if (!entry) return;
+    if (!entry) return null;
     if (entry.status !== "connected") {
       try {
         // On a recoverable failure (expired Vault token…) the explorer retries the connect after the fix and opens the console then.
-        await this.explorer.connect(connId, () => void this.openConsole(connId, opts));
+        await this.explorer.connect(connId, () => void this.openConsole(connId, opts, name));
       } catch {
-        return;
+        return null;
       }
-      if (store.conns.get(connId)?.status !== "connected") return;
+      if (store.conns.get(connId)?.status !== "connected") return null;
     }
-    const n = (this.counts.get(connId) ?? 0) + 1;
-    this.counts.set(connId, n);
-    const title = opts.title ?? (n === 1 ? "console" : `console ${n}`);
-    const pane = new ConsolePane(connId, title, this.host, opts.sql ?? "", opts.database ?? null, opts.schema ?? null);
+    let title = opts.title;
+    if (!title) {
+      // "console", "console 2"… — the lowest number not used by an open console of this data source.
+      const used = new Set(this.tabs.filter((t) => t.kind === "console" && t.connId === connId).map((t) => t.title));
+      let n = 1;
+      while (used.has(n === 1 ? "console" : `console ${n}`)) n++;
+      title = n === 1 ? "console" : `console ${n}`;
+    }
+    const pane = new ConsolePane(connId, title, this.host, opts.sql ?? "", opts.database ?? null, opts.schema ?? null, opts.table ?? null);
     this.tabs.push(pane);
     this.stack.appendChild(pane.el);
+    if (name) this.strip.setManualName(pane, name);
     this.activate(pane);
     if (opts.explicitSchema && opts.schema) void pane.setDefaultSchema(opts.schema);
     if (opts.run && opts.sql) void pane.runSqlText(opts.sql);
+    return pane;
   }
 
   private keyHost: KeyHost = {
@@ -414,6 +454,7 @@ export class App {
 
   private activate(pane: TabPane | null): void {
     this.active = pane;
+    if (pane) this.strip.touch(pane);
     for (const t of this.tabs) t.el.classList.toggle("hidden", t !== pane);
     clear(this.capActions);
     if (pane) this.capActions.appendChild(pane.controls);
@@ -427,89 +468,78 @@ export class App {
   }
 
   private renderTabs(): void {
-    clear(this.tabsEl);
-    this.tabEls.clear();
-    for (const t of this.tabs) {
-      const e = store.conns.get(t.connId);
-      const color = e ? connColor(e.config) : "var(--accent)";
-      const isActive = t === this.active;
-      const server = e ? `${DRIVER_LABELS[e.config.driver].split(" / ")[0]}${e.session?.serverVersion ? " " + e.session.serverVersion : ""}` : "";
-      const dbName = e?.config.driver === "redis" && t.effectiveDatabase !== null ? dbLabel(t.effectiveDatabase) : t.effectiveDatabase;
-      const close = h(
-        "button",
-        { class: "tab-close", type: "button", tabindex: "-1", title: `Close (${MOD}W)`, "aria-label": `Close ${t.title}`, onclick: (ev: Event) => (ev.stopPropagation(), void this.closeTab(t)) },
-        icon("x", 11),
-      );
-      const tab = h(
-        "div",
-        {
-          class: "tab" + (isActive ? " active" : "") + (t.isRunning ? " running" : ""),
-          role: "tab",
-          tabindex: isActive ? "0" : "-1",
-          style: `--c:${color}`,
-          title: `${t.title} — ${e?.config.name ?? ""}${dbName ? " · " + dbName : ""}${server ? " (" + server + ")" : ""}`,
-          "aria-selected": String(isActive),
-        },
-        t.tabIcon ? h("span", { class: "tab-ico " + t.tabIcon.cls, "aria-hidden": "true" }, icon(t.tabIcon.icon, 13)) : h("span", { class: "tab-dot", "aria-hidden": "true" }),
-        h("span", { class: "tab-title" + (t.kind === "key" || t.kind === "topic" || t.kind === "group" ? " mono" : "") }, t.title),
-        isActive && dbName ? h("span", { class: "tab-db" }, "· " + dbName) : null,
-        close,
-      );
-      tab.addEventListener("click", () => {
-        if (t !== this.active) this.activate(t);
-      });
-      tab.addEventListener("auxclick", (ev) => {
-        if (ev.button === 1) void this.closeTab(t);
-      });
-      tab.addEventListener("keydown", (ev) => {
-        const i = this.tabs.indexOf(t);
-        if (ev.key === "ArrowRight" || ev.key === "ArrowLeft") {
-          ev.preventDefault();
-          const next = this.tabs[(i + (ev.key === "ArrowRight" ? 1 : -1) + this.tabs.length) % this.tabs.length];
-          this.activate(next);
-          this.tabEls.get(next)?.focus();
-        } else if (ev.key === "Enter" || ev.key === " ") {
-          ev.preventDefault();
-          this.activate(t);
-        } else if (ev.key === "Delete") {
-          ev.preventDefault();
-          void this.closeTab(t);
-        }
-      });
-      this.tabEls.set(t, tab);
-      this.tabsEl.appendChild(tab);
-    }
+    this.strip.render();
     const has = this.tabs.length > 0;
     this.navigator.update(this.active);
     this.fitCapsule();
-    this.capSep.hidden = this.navigator.el.hidden;
-    this.capSep2.hidden = !this.active || this.active.controls.childElementCount === 0;
+    this.syncCapSeps();
     this.btnAdd.classList.toggle("labeled", !has);
     clear(this.btnAdd);
     this.btnAdd.append(icon("plus", 15), has ? "" : h("span", null, "New console"));
-    // Keep the active tab visible inside the horizontally scrolling strip (without scrollIntoView,
-    // which would also scroll the overflow-hidden sheet).
-    const at = this.active ? this.tabEls.get(this.active) : undefined;
-    if (at) {
-      requestAnimationFrame(() => {
-        const strip = this.tabsEl;
-        const l = at.offsetLeft;
-        const r = l + at.offsetWidth;
-        if (l < strip.scrollLeft) strip.scrollLeft = l - 4;
-        else if (r > strip.scrollLeft + strip.clientWidth) strip.scrollLeft = r - strip.clientWidth + 4;
-      });
-    }
+  }
+
+  private syncCapSeps(): void {
+    this.capSep.hidden = this.navigator.el.hidden || this.strip.vertical;
+    this.capSep2.hidden = !this.active || this.active.controls.childElementCount === 0;
   }
 
   private async closeTab(t: TabPane): Promise<void> {
     const i = this.tabs.indexOf(t);
     if (i < 0) return;
+    this.rememberClosed(t);
+    // The next tab in display order (rail groups / pinned first) takes over, like the strip shows it.
+    const ordered = this.strip.ordered();
+    const oi = ordered.indexOf(t);
+    const nextActive = ordered[oi + 1] ?? ordered[oi - 1] ?? null;
     this.tabs.splice(i, 1);
+    this.strip.forget(t);
+    this.dirtySeen.delete(t);
     t.el.remove();
     void t.dispose();
-    if (this.active === t) this.activate(this.tabs[Math.min(i, this.tabs.length - 1)] ?? null);
-    else this.renderTabs();
+    if (this.active === t) {
+      this.activate(nextActive && this.tabs.includes(nextActive) ? nextActive : (this.tabs[Math.min(i, this.tabs.length - 1)] ?? null));
+      this.renderEmpty();
+      return;
+    }
+    this.renderTabs();
     this.renderEmpty();
+  }
+
+  private async closeMany(list: TabPane[]): Promise<void> {
+    for (const t of [...list]) await this.closeTab(t);
+  }
+
+  private rememberClosed(t: TabPane): void {
+    const c = t instanceof ConsolePane ? t : null;
+    this.closed.push({
+      kind: t.kind,
+      connId: t.connId,
+      database: t.kind === "key" ? t.effectiveDatabase : t.database,
+      title: t.title,
+      table: c?.table ?? null,
+      schema: c ? c.schema : null,
+      sql: c ? c.sqlText : "",
+      name: this.strip.manualName(t),
+    });
+    if (this.closed.length > MAX_CLOSED) this.closed.shift();
+  }
+
+  /** Reopen closed tab: consoles come back with their text (results are not kept). */
+  private async reopenTab(): Promise<void> {
+    const c = this.closed.pop();
+    if (!c) {
+      toast("No closed tab to reopen", "info");
+      return;
+    }
+    if (!store.conns.has(c.connId)) return this.reopenTab();
+    if (c.kind === "console") {
+      await this.openConsole(c.connId, { sql: c.sql, title: c.title, table: c.table ?? undefined, database: c.database, schema: c.schema }, c.name);
+      return;
+    }
+    if (c.kind === "key") await this.openKey(c.connId, c.database ?? store.conns.get(c.connId)?.defaultDb ?? "0", c.title, "");
+    else if (c.kind === "topic") await this.openTopic(c.connId, c.title);
+    else await this.openGroup(c.connId, c.title);
+    if (c.name && this.active) this.strip.setManualName(this.active, c.name);
   }
 
   // ------------------------------------------------------------------ connections
@@ -597,10 +627,11 @@ export class App {
         h(
           "div",
           { class: "kbd-list" },
-          h("span", null, h("kbd", null, MOD + "↵"), " run statement"),
-          h("span", null, h("kbd", null, MOD + "⇧↵"), " run all"),
-          h("span", null, h("kbd", null, MOD + "N"), " new console"),
+          h("span", null, h("kbd", null, shortcutLabel("runStatement")), " run statement"),
+          h("span", null, h("kbd", null, shortcutLabel("runAll")), " run all"),
+          h("span", null, h("kbd", null, shortcutLabel("newConsole")), " new console"),
           h("span", null, h("kbd", null, MOD + "⇧H"), " history"),
+          h("span", null, h("kbd", null, shortcutLabel("settings")), " settings"),
         ),
       ),
     );
@@ -609,21 +640,88 @@ export class App {
   // ------------------------------------------------------------------ shortcuts
 
   private onKey(e: KeyboardEvent): void {
-    const mod = e.metaKey || e.ctrlKey;
-    if (!mod) return;
-    const k = e.key.toLowerCase();
-    if (k === "n" && !e.shiftKey) {
-      e.preventDefault();
-      void this.newConsole();
-    } else if (k === "w" && !e.shiftKey) {
-      e.preventDefault();
-      if (this.active) void this.closeTab(this.active);
-    } else if (k === "h" && e.shiftKey) {
-      e.preventDefault();
-      this.toggleHistory();
-    } else if (k === "b" && !e.shiftKey) {
-      e.preventDefault();
-      this.toggleSidebar();
+    if (e.defaultPrevented) return;
+    const editable = this.inEditable(e.target);
+    const overlay = document.querySelector(".overlay:not(.leaving)") !== null;
+    const a = matchAction(e);
+    if (!a) {
+      // Query history keeps its fixed shortcut.
+      if ((e.metaKey || e.ctrlKey) && e.shiftKey && !e.altKey && e.key.toLowerCase() === "h" && !overlay) {
+        e.preventDefault();
+        this.toggleHistory();
+      }
+      return;
+    }
+    if (overlay && a !== "settings") return;
+    const c = this.activeConsole();
+    switch (a) {
+      case "undo":
+      case "redo":
+        // With focus outside any text field (after clicking a result cell or a tab) undo / redo go to the
+        // active console's editor instead of doing nothing.
+        if (editable || !c) return;
+        e.preventDefault();
+        if (a === "redo") c.redo();
+        else c.undo();
+        return;
+      case "toggleComment":
+      case "find":
+      case "formatSql":
+        return;
+      case "runStatement":
+      case "runAll":
+        // The editor handles these itself while it has focus; elsewhere (grid, tab strip) they still run.
+        if (editable || !c) return;
+        e.preventDefault();
+        if (a === "runAll") void c.runAll();
+        else void c.runCurrent();
+        return;
+      case "cancel":
+        if (!c || !c.isRunning) return;
+        e.preventDefault();
+        c.cancelRun();
+        return;
+      case "newConsole":
+        e.preventDefault();
+        void this.newConsole();
+        return;
+      case "closeTab":
+        e.preventDefault();
+        if (this.active) void this.closeTab(this.active);
+        return;
+      case "reopenTab":
+        e.preventDefault();
+        void this.reopenTab();
+        return;
+      case "reconnect": {
+        e.preventDefault();
+        const id = this.active?.connId ?? this.selectedConn;
+        if (id) void this.explorer.reconnect(id);
+        else toast("Select a data source to reconnect", "info");
+        return;
+      }
+      case "settings":
+        e.preventDefault();
+        if (!overlay) openSettings();
+        return;
+      case "nextTab":
+      case "prevTab": {
+        const list = this.strip.ordered();
+        if (list.length < 2 && this.active) return;
+        e.preventDefault();
+        const i = this.active ? list.indexOf(this.active) : -1;
+        const next = list[(i + (a === "nextTab" ? 1 : -1) + list.length) % list.length];
+        if (next) this.activate(next);
+        return;
+      }
+      case "jumpToTab":
+        e.preventDefault();
+        this.strip.jump();
+        return;
+      case "toggleSidebar":
+        e.preventDefault();
+        this.toggleSidebar();
+        return;
     }
   }
 }

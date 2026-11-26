@@ -55,10 +55,19 @@ class VaultStore {
   get(id: string): VaultProfile | undefined {
     return this.profiles.find((p) => p.id === id);
   }
-  /** Profiles whose token is pasted by the user (kept in the keychain): the ones that show chips. */
+  /** Profiles whose token is pasted by the user (kept in the keychain). */
   keychainProfiles(): VaultProfile[] {
     return this.profiles.filter((p) => (p.tokenSource ?? "keychain") === "keychain");
   }
+  /** Profiles with a token DataTrip keeps and tracks (pasted or from an OIDC sign-in): the ones that show chips. */
+  tokenProfiles(): VaultProfile[] {
+    return this.profiles.filter((p) => tracksToken(p));
+  }
+  /** Profile id of the browser sign-in that is waiting for its callback, or null. */
+  oidcPending: string | null = null;
+  /** Largest TTL seen per profile since the last sign-in / renewal: the "creation TTL" for auto-renewal. */
+  private fullTtl = new Map<string, number>();
+  private renewTimer: number | undefined;
   state(id: string): TokState {
     return this.states.get(id) ?? { status: "unknown", info: null, at: 0, error: null };
   }
@@ -108,6 +117,7 @@ class VaultStore {
     try {
       const info = await api.vaultTokenInfo(p, token);
       next = { status: "valid", info, at: performance.now(), error: null };
+      this.noteTtl(id, info, false);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       next = { status: /expired|ttl/i.test(msg) ? "expired" : "invalid", info: null, at: performance.now(), error: msg };
@@ -172,8 +182,66 @@ class VaultStore {
   async renew(id: string): Promise<VaultTokenInfo> {
     const info = await api.renewVaultToken(id);
     this.states.set(id, { status: "valid", info, at: performance.now(), error: null });
+    this.noteTtl(id, info, true);
     this.emit();
     return info;
+  }
+
+  private noteTtl(id: string, info: VaultTokenInfo, reset: boolean): void {
+    if (info.ttlSecs <= 0) {
+      this.fullTtl.delete(id);
+      return;
+    }
+    const prev = reset ? 0 : (this.fullTtl.get(id) ?? 0);
+    this.fullTtl.set(id, Math.max(prev, info.ttlSecs));
+  }
+
+  /**
+   * Browser sign-in (OIDC) for a saved profile: opens the browser, resolves when Vault's callback arrived and the
+   * token was stored. Rejects with "OIDC_CANCELLED…" after cancelOidc().
+   */
+  async oidcLogin(id: string): Promise<VaultTokenInfo> {
+    const p = this.get(id);
+    if (!p) throw new Error("Vault profile not found");
+    if (this.oidcPending && this.oidcPending !== id) await this.cancelOidc();
+    this.oidcPending = id;
+    this.emit();
+    try {
+      const info = await api.vaultOidcLogin(id, p.oidcRole?.trim() || null);
+      this.states.set(id, { status: "valid", info, at: performance.now(), error: null });
+      this.noteTtl(id, info, true);
+      return info;
+    } finally {
+      if (this.oidcPending === id) this.oidcPending = null;
+      this.emit();
+    }
+  }
+
+  async cancelOidc(): Promise<void> {
+    if (!this.oidcPending) return;
+    await api.vaultOidcCancel().catch(() => undefined);
+  }
+
+  /** Signs an OIDC profile out: the stored token is cleared. */
+  async signOut(id: string): Promise<void> {
+    const p = this.get(id);
+    if (!p) return;
+    await this.save(p, "");
+    this.fullTtl.delete(id);
+    this.states.set(id, { status: "invalid", info: null, at: performance.now(), error: "no token" });
+    this.emit();
+  }
+
+  /** OIDC tokens: renew a renewable token once less than a third of its TTL is left. */
+  private async autoRenew(): Promise<void> {
+    for (const p of this.profiles) {
+      if (p.tokenSource !== "oidc" || this.effective(p.id) !== "valid") continue;
+      const info = this.state(p.id).info;
+      const left = this.remaining(p.id);
+      const full = this.fullTtl.get(p.id) ?? 0;
+      if (!info?.renewable || left === null || left === Infinity || full <= 0) continue;
+      if (left < full / 3) await this.renew(p.id).catch(() => undefined);
+    }
   }
 
   /** Starts the 30 s countdown tick, the 10 min re-lookup and the re-lookup on window focus. */
@@ -181,6 +249,7 @@ class VaultStore {
     if (this.timer !== undefined) return;
     this.timer = window.setInterval(() => this.emit(), 30_000);
     this.relookup = window.setInterval(() => void this.refreshAll(), 10 * 60_000);
+    this.renewTimer = window.setInterval(() => void this.autoRenew(), 5 * 60_000);
     window.addEventListener("focus", () => {
       for (const p of this.profiles) if (performance.now() - this.state(p.id).at > 60_000) void this.lookup(p.id);
     });
@@ -193,8 +262,21 @@ class VaultStore {
 
 export const vaults = new VaultStore();
 
+/** True for profiles whose token DataTrip stores and tracks (pasted token or OIDC sign-in). */
+export function tracksToken(p: VaultProfile): boolean {
+  const src = p.tokenSource ?? "keychain";
+  return src === "keychain" || src === "oidc";
+}
+
+export const OIDC_REDIRECT_URI = "http://localhost:8250/oidc/callback";
+
+export function isOidcCancel(e: unknown): boolean {
+  return /OIDC_CANCELLED/.test(e instanceof Error ? e.message : String(e));
+}
+
 /** One-line status used by lists and summaries ("expires in 2h 14m", "expired", "never expires"). */
 export function statusText(id: string): string {
+  if (vaults.oidcPending === id) return "signing in…";
   const eff = vaults.effective(id);
   const st = vaults.state(id);
   if (eff === "valid") {

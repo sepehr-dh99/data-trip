@@ -97,7 +97,8 @@ fn non_empty(s: &Option<String>) -> Option<&str> {
 /// "b1,b2:9093" + default port -> "b1:9092,b2:9093".
 fn bootstrap_servers(host: &str, port: u16) -> AppResult<String> {
     let mut out: Vec<String> = Vec::new();
-    for entry in host.split(',') {
+    // Accept the separators people paste from configs: commas, spaces, semicolons, newlines.
+    for entry in host.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
         let e = entry.trim();
         if e.is_empty() {
             continue;
@@ -303,12 +304,67 @@ fn offsets_for_ts(
 // Connect / close
 // ---------------------------------------------------------------------------
 
+/// Turns a failed first metadata fetch into an actionable message: probes each bootstrap
+/// server with a plain TCP connect to tell "network can't reach it" (VPN, firewall, a broker
+/// only reachable through a jump host) from "reachable, but the handshake failed" (wrong
+/// security protocol, TLS or SASL settings).
+fn connect_error(servers: &str, protocol: &str, e: KafkaError) -> AppError {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let mut unreachable: Vec<String> = Vec::new();
+    let mut reachable: Vec<String> = Vec::new();
+    for s in servers.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let addr = s.rsplit("://").next().unwrap_or(s);
+        let resolved = match addr.to_socket_addrs() {
+            Ok(mut it) => it.next(),
+            Err(_) => {
+                unreachable.push(format!("{} (host name not found)", addr));
+                continue;
+            }
+        };
+        match resolved {
+            Some(sa) => match TcpStream::connect_timeout(&sa, Duration::from_secs(3)) {
+                Ok(_) => reachable.push(addr.to_string()),
+                Err(err) => unreachable.push(format!("{} ({})", addr, err)),
+            },
+            None => unreachable.push(format!("{} (host name not found)", addr)),
+        }
+    }
+    let base = format!("Could not connect to Kafka: {}.", e);
+    if reachable.is_empty() && !unreachable.is_empty() {
+        AppError::new(format!(
+            "{} None of the bootstrap servers can be reached from this computer: {}. \
+             Check that you are on the right network or VPN; brokers that are only reachable \
+             through an SSH jump host are not supported yet.",
+            base,
+            unreachable.join(", ")
+        ))
+    } else if !reachable.is_empty() {
+        AppError::new(format!(
+            "{} {} accepts connections, but the Kafka handshake failed. Check the security \
+             protocol (currently {}): a PLAINTEXT listener rejects SSL/SASL clients and vice versa.",
+            base,
+            reachable.join(", "),
+            protocol.to_uppercase()
+        ))
+    } else {
+        AppError::new(format!(
+            "{} Check the bootstrap servers, security protocol and credentials.",
+            base
+        ))
+    }
+}
+
 pub fn connect<'a>(
     cfg: &'a ConnectionConfig,
     password: Option<&'a str>,
 ) -> BoxFuture<'a, AppResult<Connected>> {
     Box::pin(async move {
         let base = build_config(cfg, password)?;
+        let servers = base.get("bootstrap.servers").unwrap_or("").to_string();
+        let protocol = base
+            .get("security.protocol")
+            .unwrap_or("plaintext")
+            .to_string();
         let read_only = cfg.read_only;
         let show_internal = cfg.kafka.as_ref().map(|k| k.show_internal).unwrap_or(false);
         let (conn, brokers) = blocking(move || {
@@ -319,12 +375,9 @@ pub fn connect<'a>(
             let consumer = consumer_config(&base, &group)
                 .create::<BaseConsumer>()
                 .map_err(|e| kctx("Could not create Kafka consumer", e))?;
-            let md = consumer.fetch_metadata(None, CALL_TIMEOUT).map_err(|e| {
-                AppError::new(format!(
-                    "Could not connect to Kafka: {}. Check the bootstrap servers, security protocol and credentials.",
-                    e
-                ))
-            })?;
+            let md = consumer
+                .fetch_metadata(None, CALL_TIMEOUT)
+                .map_err(|e| connect_error(&servers, &protocol, e))?;
             let n = md.brokers().len();
             Ok((
                 KafkaConn {

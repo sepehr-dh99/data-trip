@@ -8,7 +8,7 @@ import type { PmItem } from "./pmDialog";
 import { store } from "./state";
 import { CONN_COLORS } from "./sqlutil";
 import { toast } from "./toast";
-import { fmtRemaining, statusText, statusTone, vaults } from "./vault";
+import { OIDC_REDIRECT_URI, fmtRemaining, isOidcCancel, statusText, statusTone, tracksToken, vaults } from "./vault";
 import { openAssignDialog, usersOf } from "./vaultAssign";
 import { tokenInput } from "./vaultChips";
 import type { TokenInput } from "./vaultChips";
@@ -23,6 +23,7 @@ export interface VaultDialogOpts {
 
 const SOURCES: [VaultTokenSource, string][] = [
   ["keychain", "Paste token"],
+  ["oidc", "OIDC"],
   ["file", "Token file"],
   ["env", "VAULT_TOKEN env"],
 ];
@@ -43,14 +44,16 @@ export function openVaultProfilesDialog(opts: VaultDialogOpts = {}): void {
     opts.onClose?.();
   };
   let renderStatus: (() => void) | null = null;
+  /** Last OIDC sign-in error (kept across editor re-renders). */
+  let oidcErr = "";
 
   const items = (): PmItem[] => {
     const l: PmItem[] = vaults.profiles.map((p) => ({
       id: p.id,
       name: p.name,
       color: p.color,
-      sub: (p.tokenSource ?? "keychain") === "keychain" ? statusText(p.id) : p.tokenSource === "file" ? "token file" : "VAULT_TOKEN env",
-      tone: (p.tokenSource ?? "keychain") === "keychain" ? statusTone(p.id) : "idle",
+      sub: tracksToken(p) ? (p.tokenSource === "oidc" ? "OIDC · " : "") + statusText(p.id) : p.tokenSource === "file" ? "token file" : "VAULT_TOKEN env",
+      tone: tracksToken(p) ? statusTone(p.id) : "idle",
     }));
     if (!draft.id) l.push({ id: "", name: draft.name || "New profile", color: draft.color, sub: "not saved yet", tone: "idle" });
     return l;
@@ -58,6 +61,7 @@ export function openVaultProfilesDialog(opts: VaultDialogOpts = {}): void {
   const renderList = (): void => shell.setList(items(), draft.id);
 
   const select = (id: string): void => {
+    oidcErr = "";
     const p = id ? vaults.get(id) : undefined;
     draft = p ? { ...p } : blank();
     renderEditor();
@@ -82,6 +86,8 @@ export function openVaultProfilesDialog(opts: VaultDialogOpts = {}): void {
     const inNs = h("input", { class: "input", type: "text", placeholder: "optional", value: d.namespace ?? "", spellcheck: false, "aria-label": "Namespace" });
     const inFile = h("input", { class: "input", type: "text", placeholder: "~/.vault-token", value: d.tokenFile ?? "", spellcheck: false, "aria-label": "Token file" });
     const inCa = h("input", { class: "input", type: "text", placeholder: "/path/to/ca.pem", value: d.caCertPath ?? "", spellcheck: false, "aria-label": "CA certificate" });
+    const inMount = h("input", { class: "input mono", type: "text", placeholder: "oidc", value: d.oidcMount ?? "oidc", spellcheck: false, "aria-label": "OIDC mount path" });
+    const inRole = h("input", { class: "input mono", type: "text", placeholder: "default role", value: d.oidcRole ?? "", spellcheck: false, "aria-label": "OIDC role" });
     const chkSkip = h("input", { type: "checkbox", checked: d.skipTlsVerify === true });
     const err = h("div", { class: "test-result", role: "alert" });
     const showErr = (m: string): void => {
@@ -130,6 +136,8 @@ export function openVaultProfilesDialog(opts: VaultDialogOpts = {}): void {
       caCertPath: inCa.value.trim() || null,
       skipTlsVerify: chkSkip.checked,
       color,
+      oidcMount: inMount.value.trim().replace(/^\/+|\/+$/g, "") || "oidc",
+      oidcRole: inRole.value.trim() || null,
     });
     const problem = (p: VaultProfile): string | null => (!p.name ? "Give the profile a name." : !p.address ? "Enter the Vault address." : source === "file" && !p.tokenFile ? "Choose the token file." : null);
     inName.addEventListener("input", () => {
@@ -147,7 +155,7 @@ export function openVaultProfilesDialog(opts: VaultDialogOpts = {}): void {
       b.dataset.v = v;
       return b;
     });
-    const seg = h("div", { class: "seg", role: "radiogroup", "aria-label": "Token source" }, segBtns);
+    const seg = h("div", { class: "seg", role: "radiogroup", "aria-label": "Sign-in method" }, segBtns);
 
     // paste pane
     const statusCard = h("div", { class: "vstat", "aria-live": "polite" });
@@ -185,6 +193,98 @@ export function openVaultProfilesDialog(opts: VaultDialogOpts = {}): void {
     const filePane = h("div", { class: "vault-stack" }, h("div", { class: "row2 tight" }, inFile, browse(inFile, "Choose Vault token file")), h("span", { class: "vault-hint" }, "Re-read on every connection — keep your script writing the file."));
     const envPane = h("div", { class: "vault-note" }, "Reads VAULT_TOKEN from the environment DataTrip was started in.");
 
+    // OIDC pane: mount + role, the redirect URI note and the sign-in state box (idle / waiting / signed in / expired).
+    const oidcBox = h("div", { class: "oidc-box", "aria-live": "polite" });
+    const oidcPane = h(
+      "div",
+      { class: "vault-stack" },
+      h("div", { class: "row2" }, field("Mount path", inMount), field("Role (optional)", inRole)),
+      h("span", { class: "vault-hint" }, "Redirect URI ", h("span", { class: "mono oidc-uri" }, OIDC_REDIRECT_URI), " must be in the role’s allowed_redirect_uris (same as the vault CLI)."),
+      oidcBox,
+    );
+    const signIn = async (): Promise<void> => {
+      const p = collect();
+      const bad = problem(p);
+      if (bad) {
+        showErr(bad);
+        return;
+      }
+      err.className = "test-result";
+      clear(err);
+      oidcErr = "";
+      try {
+        // The backend signs in a saved profile (it reads address / mount from it): save first when needed.
+        const cur = d.id ? vaults.get(d.id) : undefined;
+        const changed = !cur || JSON.stringify({ ...cur, ...p }) !== JSON.stringify(cur);
+        let id = d.id;
+        if (changed) {
+          const saved = await vaults.save({ ...p, tokenSource: "oidc" }, null);
+          id = saved.id;
+          selectedAfterSave(saved);
+        }
+        await vaults.oidcLogin(id);
+        toast(`Signed in to ${vaults.get(id)?.name ?? "Vault"}`, "ok");
+      } catch (e) {
+        if (!isOidcCancel(e)) {
+          oidcErr = errMsg(e);
+          renderStatus?.();
+        }
+      }
+    };
+    const renderOidc = (): void => {
+      clear(oidcBox);
+      const saved = d.id ? vaults.get(d.id) : undefined;
+      const isOidcSaved = saved?.tokenSource === "oidc";
+      const pending = !!d.id && vaults.oidcPending === d.id;
+      const eff = isOidcSaved ? vaults.effective(d.id) : "unknown";
+      const st = d.id ? vaults.state(d.id) : null;
+      const btn = (label: string, cls: string, onclick: () => void): HTMLButtonElement => h("button", { class: "btn " + cls, type: "button", onclick }, label);
+      const errLine = oidcErr ? h("div", { class: "oidc-err" }, icon("alert", 13), h("span", null, oidcErr)) : null;
+      if (pending) {
+        oidcBox.className = "oidc-box waiting";
+        oidcBox.append(
+          h("div", { class: "oidc-state" }, h("span", { class: "spinner oidc-spin", "aria-hidden": "true" }), h("div", null, h("div", { class: "oidc-title" }, "Waiting for browser sign-in…"), h("div", { class: "oidc-sub" }, "Finish signing in in the browser tab that just opened."))),
+          h("div", { class: "oidc-actions" }, btn("Cancel", "sm", () => void vaults.cancelOidc())),
+        );
+        return;
+      }
+      if (eff === "valid" && st?.info) {
+        const info = st.info;
+        const r = vaults.remaining(d.id);
+        const ttl = r === Infinity ? "Token never expires" : "Token valid for " + fmtRemaining(r ?? 0);
+        oidcBox.className = "oidc-box signed";
+        oidcBox.append(
+          h(
+            "div",
+            { class: "oidc-state" },
+            h("span", { class: "oidc-badge ok", "aria-hidden": "true" }, "✓"),
+            h("div", null, h("div", { class: "oidc-title" }, info.displayName ? `Signed in as ${info.displayName}` : "Signed in"), info.policies.length ? h("div", { class: "oidc-sub" }, "Policies: " + info.policies.join(", ")) : null),
+          ),
+          h("div", { class: "oidc-ttl " + statusTone(d.id) }, h("span", { class: "oidc-dot", "aria-hidden": "true" }), ttl + (r === Infinity ? "" : info.renewable ? " · renewed automatically while DataTrip is open" : " · sign in again when it expires")),
+          h("div", { class: "oidc-actions" }, btn("Sign out", "sm", () => void vaults.signOut(d.id).catch((e) => showErr(errMsg(e))))),
+        );
+        return;
+      }
+      if (eff === "loading") {
+        oidcBox.className = "oidc-box";
+        oidcBox.append(h("div", { class: "oidc-state" }, h("span", { class: "spinner oidc-spin", "aria-hidden": "true" }), h("div", { class: "oidc-title" }, "Checking the session…")));
+        return;
+      }
+      const noToken = /no token|not set|missing|not found/i.test(st?.error ?? "");
+      if (isOidcSaved && (eff === "expired" || (eff === "invalid" && !noToken))) {
+        oidcBox.className = "oidc-box expired";
+        oidcBox.append(
+          h("div", { class: "oidc-state" }, h("span", { class: "oidc-badge bad", "aria-hidden": "true" }, "!"), h("div", null, h("div", { class: "oidc-title" }, "Session expired"), h("div", { class: "oidc-sub" }, st?.error ? st.error : "Queries on connections using this profile wait until you sign in again."))),
+          btn("Sign in again", "primary oidc-main", () => void signIn()),
+        );
+        if (errLine) oidcBox.append(errLine);
+        return;
+      }
+      oidcBox.className = "oidc-box idle";
+      oidcBox.append(btn("Sign in with browser", "primary oidc-main", () => void signIn()), h("div", { class: "oidc-sub center" }, "Opens your browser at your company sign-in page. No token to copy."));
+      if (errLine) oidcBox.append(errLine);
+    };
+
     const showCard = (kind: "ok" | "warn" | "err" | "busy" | "idle", text: string, extra?: HTMLElement | null): void => {
       statusCard.className = "vstat " + kind;
       clear(statusCard);
@@ -197,6 +297,10 @@ export function openVaultProfilesDialog(opts: VaultDialogOpts = {}): void {
       await vaults.lookup(d.id);
     };
     renderStatus = (): void => {
+      if (source === "oidc") {
+        renderOidc();
+        return;
+      }
       if (!d.id) {
         showCard("idle", source === "keychain" ? "Paste a token to save this profile." : "Fill in the fields and press Save.");
         return;
@@ -245,6 +349,8 @@ export function openVaultProfilesDialog(opts: VaultDialogOpts = {}): void {
       pastePane.style.display = source === "keychain" ? "" : "none";
       filePane.style.display = source === "file" ? "" : "none";
       envPane.style.display = source === "env" ? "" : "none";
+      oidcPane.style.display = source === "oidc" ? "" : "none";
+      statusCard.style.display = source === "oidc" ? "none" : "";
       renderStatus?.();
     };
 
@@ -297,7 +403,7 @@ export function openVaultProfilesDialog(opts: VaultDialogOpts = {}): void {
     ed.append(
       h("div", { class: "row2" }, field("Name", inName), field("Color", h("div", { class: "swatches" }, swatches))),
       h("div", { class: "row2" }, field("Address", inAddr), field("Namespace", inNs)),
-      field("Token source", h("div", { class: "vault-stack" }, seg, pastePane, filePane, envPane, statusCard)),
+      h("div", { class: "field" }, h("span", { class: "field-label" }, "Sign-in method"), h("div", { class: "vault-stack" }, seg, pastePane, oidcPane, filePane, envPane, statusCard)),
       h(
         "details",
         { class: "vault-adv", open: !!(d.caCertPath || d.skipTlsVerify) },

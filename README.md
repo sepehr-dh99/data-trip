@@ -46,7 +46,7 @@ Passwords are stored in the system keychain (macOS Keychain, Windows Credential 
 - SQLite
 - SQL Server (MSSQL)
 
-## Features (v1)
+## Features
 
 - **Connections** with passwords stored in the OS keychain (never in the connection file).
 - **Schema explorer** showing schemas, tables, views, columns and primary keys.
@@ -59,6 +59,14 @@ Passwords are stored in the system keychain (macOS Keychain, Windows Credential 
 - **Export** of query results to CSV or JSON.
 - **Import from DataGrip**: paste copied data-source settings (`#DataSourceSettings#`) or pick a project's `.idea/dataSources.xml`.
 - **HashiCorp Vault authentication**: token from `~/.vault-token`, `VAULT_TOKEN` or the keychain; KV v1/v2 and dynamic database credentials.
+- **Vault OIDC sign-in**: sign in to a Vault profile in your browser (no token to copy); tokens renew automatically while DataTrip is open. The Vault role must allow the redirect URI `http://localhost:8250/oidc/callback`.
+- **Redis and Kafka** consoles, topic browser and consumer groups.
+- **Cross-source queries**: attach several data sources to one console and join them, e.g. `prod_pg.public.orders JOIN stage_mysql.shop.users`. Filters are pushed down to each source; the join runs locally.
+- **Run buttons** (▶) in the gutter for every statement.
+- **Console tabs** on top, left or right, grouped by data source, database, kind or your own groups; sortable, pinnable and searchable (Cmd/Ctrl+P).
+- **Paged results** (100 / 500 / 1,000 / all rows per page) with row counts, grid borders and colors by value type.
+- **Settings** (Cmd/Ctrl+,): editor font and size, 20 text color themes with per-token colors, accent color, keymap presets (DataTrip, DataGrip, VS Code) and custom shortcuts.
+- **Reconnect** a data source from its context menu (fresh Vault credentials and SSH tunnel) without closing consoles.
 
 ## Keyboard shortcuts
 
@@ -70,6 +78,14 @@ Passwords are stored in the system keychain (macOS Keychain, Windows Credential 
 | Close tab | Cmd+W | Ctrl+W |
 | Submit grid edits | Cmd+S | Ctrl+S |
 | Open history | Cmd+Shift+H | Ctrl+Shift+H |
+| Cancel query | Cmd+. | Ctrl+. |
+| Reopen closed tab | Cmd+Shift+T | Ctrl+Shift+T |
+| Jump to tab | Cmd+P | Ctrl+P |
+| Next / previous tab | Ctrl+Tab / Ctrl+Shift+Tab | Ctrl+Tab / Ctrl+Shift+Tab |
+| Reconnect data source | Cmd+Option+R | Ctrl+Alt+R |
+| Settings | Cmd+, | Ctrl+, |
+
+All shortcuts can be changed in Settings › Keymap.
 
 ## Development
 

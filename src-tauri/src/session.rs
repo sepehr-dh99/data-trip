@@ -5,8 +5,8 @@ use crate::db::{self, DbConn};
 use crate::error::{AppError, AppResult};
 use crate::export;
 use crate::model::{
-    ConnectionConfig, DatabaseNode, Driver, ExportFormat, ExportOptions, ObjectGroup, QueryResult,
-    RedisScanResult, RedisValue, RowEdit, SchemaNode, SessionInfo,
+    AuthMethod, ConnectionConfig, DatabaseNode, Driver, ExportFormat, ExportOptions, ObjectGroup,
+    QueryResult, RedisScanResult, RedisValue, RowEdit, SchemaNode, SessionInfo,
 };
 use crate::model::{
     KafkaConsumeRequest, KafkaConsumeResult, KafkaGroupDetail, KafkaOverview, KafkaProduceRequest,
@@ -15,6 +15,7 @@ use crate::model::{
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::task::AbortHandle;
 
 pub enum Job {
@@ -69,6 +70,26 @@ pub enum Job {
         replication: i32,
     },
     KafkaDeleteTopic(String),
+    /// Drop the physical connection (and its SSH forward) and connect again right away.
+    /// Skipped (JobOut::Count(0)) while a transaction is open.
+    Reconnect,
+}
+
+impl Job {
+    /// A copy for one retry after reconnecting; only read-mostly jobs whose failed attempt
+    /// cannot have taken effect (a denied statement did not run).
+    fn retry_copy(&self) -> Option<Job> {
+        match self {
+            Job::Execute { sql, max_rows } => Some(Job::Execute {
+                sql: sql.clone(),
+                max_rows: *max_rows,
+            }),
+            Job::Introspect => Some(Job::Introspect),
+            Job::ListDatabases => Some(Job::ListDatabases),
+            Job::ServerObjects => Some(Job::ServerObjects),
+            _ => None,
+        }
+    }
 }
 
 pub enum JobOut {
@@ -104,6 +125,10 @@ pub struct Session {
     backend_id: Mutex<Option<i64>>,
     /// SSH forward the current connection runs through (None without a tunnel); replaced on reconnect.
     tunnel: Mutex<Option<crate::ssh::ForwardLease>>,
+    /// When the dynamic Vault credentials of the current connection expire (None otherwise).
+    creds_expire_at: Mutex<Option<Instant>>,
+    /// When the current physical connection was opened.
+    connected_at: Mutex<Instant>,
 }
 
 /// Marks the session's connection broken if dropped while armed, i.e. when the job that owns
@@ -137,7 +162,7 @@ impl Session {
         config: ConnectionConfig,
         creds: CredentialSource,
     ) -> AppResult<(Arc<Session>, SessionInfo)> {
-        let connected = creds.connect(&config, None, None, true).await?;
+        let (connected, expires) = creds.connect_with_expiry(&config, None, None, true).await?;
         let info = SessionInfo {
             session_id: uuid::Uuid::new_v4().to_string(),
             connection_id: config.id.clone(),
@@ -159,6 +184,8 @@ impl Session {
             active_job: AtomicU64::new(0),
             backend_id: Mutex::new(connected.backend_id),
             tunnel: Mutex::new(connected.tunnel),
+            creds_expire_at: Mutex::new(expires),
+            connected_at: Mutex::new(Instant::now()),
         });
         Ok((session, info))
     }
@@ -170,14 +197,26 @@ impl Session {
     ) -> futures::future::BoxFuture<'a, AppResult<()>> {
         Box::pin(async move {
             if slot.is_some() && !self.broken.load(Ordering::SeqCst) {
-                return Ok(());
+                // Dynamic Vault credentials past their lease: the server may already have revoked
+                // them (queries then fail with "permission denied"), so reconnect with fresh ones.
+                // Never while a transaction is open: that would silently drop its work.
+                let expired =
+                    matches!(*lock(&self.creds_expire_at), Some(t) if Instant::now() >= t);
+                if !expired || self.in_tx.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
             }
             // Drop the old connection without a graceful close (it may be mid-protocol).
             drop(slot.take());
             let lost_tx = self.in_tx.swap(false, Ordering::SeqCst);
-            let connected = self.creds.connect(&self.config, None, None, true).await?;
+            let (connected, expires) = self
+                .creds
+                .connect_with_expiry(&self.config, None, None, true)
+                .await?;
             *lock(&self.backend_id) = connected.backend_id;
             *lock(&self.tunnel) = connected.tunnel;
+            *lock(&self.creds_expire_at) = expires;
+            *lock(&self.connected_at) = Instant::now();
             *slot = Some(connected.conn);
             self.broken.store(false, Ordering::SeqCst);
             if lost_tx {
@@ -188,6 +227,27 @@ impl Session {
             }
             Ok(())
         })
+    }
+
+    /// True when a failure looks like revoked Vault credentials and a reconnect-and-retry is safe:
+    /// Vault auth, no open transaction, and the connection is not brand new (a fresh connection
+    /// that is denied is a real permission problem, not an expired lease).
+    fn should_refresh_credentials(&self, message: &str) -> bool {
+        if self.config.auth_method != AuthMethod::Vault || self.in_tx.load(Ordering::SeqCst) {
+            return false;
+        }
+        if lock(&self.connected_at).elapsed() < Duration::from_secs(20) {
+            return false;
+        }
+        let m = message.to_lowercase();
+        m.contains("permission denied")
+            || m.contains("password authentication failed")
+            || m.contains("authentication failed")
+            || m.contains("access denied")
+            || m.contains("login failed")
+            || (m.contains("role") && m.contains("does not exist"))
+            || m.contains("terminating connection")
+            || m.contains("command denied")
     }
 
     fn begin_if_needed<'a>(
@@ -216,7 +276,19 @@ impl Session {
                 session: &*self,
                 armed: true,
             };
-            let res = self.run_job(&mut guard, job).await;
+            let again = job.retry_copy();
+            let mut res = self.run_job(&mut guard, job).await;
+            let refresh = match &res {
+                Err(e) => self.should_refresh_credentials(&e.message),
+                Ok(_) => false,
+            };
+            if let (true, Some(job)) = (refresh, again) {
+                // The Vault credentials were probably revoked (lease or token expired while
+                // idle): fetch fresh ones, reconnect and run the job once more.
+                self.creds.invalidate(&self.config.id);
+                self.broken.store(true, Ordering::SeqCst);
+                res = self.run_job(&mut guard, job).await;
+            }
             tripwire.armed = false;
             res
         })
@@ -228,6 +300,21 @@ impl Session {
         job: Job,
     ) -> futures::future::BoxFuture<'a, AppResult<JobOut>> {
         Box::pin(async move {
+            if matches!(job, Job::Reconnect) {
+                if self.in_tx.load(Ordering::SeqCst) {
+                    return Ok(JobOut::Count(0));
+                }
+                if let Some(c) = slot.take() {
+                    if self.broken.load(Ordering::SeqCst) {
+                        drop(c);
+                    } else {
+                        // The server or tunnel may be gone: never wait long for a graceful close.
+                        let _ = tokio::time::timeout(Duration::from_secs(2), c.close()).await;
+                    }
+                }
+                // Release the old SSH forward so the reconnect gets a fresh one.
+                drop(lock(&self.tunnel).take());
+            }
             self.ensure_connected(slot).await?;
             let conn = match slot.as_mut() {
                 Some(c) => c,
@@ -331,6 +418,7 @@ impl Session {
                     conn.kafka_delete_topic(&t).await?;
                     Ok(JobOut::Unit)
                 }
+                Job::Reconnect => Ok(JobOut::Count(1)),
             }
         })
     }
@@ -551,6 +639,19 @@ impl Session {
         self.run(Job::KafkaDeleteTopic(topic)).await.map(|_| ())
     }
 
+    /// Drops the physical connection and reconnects now (fresh credentials and SSH forward),
+    /// keeping the session id. Ok(false): skipped because a transaction is open.
+    /// The caller invalidates the connection's credential cache first.
+    pub async fn reconnect(self: &Arc<Self>) -> AppResult<bool> {
+        if self.in_tx.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        match self.run(Job::Reconnect).await? {
+            JobOut::Count(n) => Ok(n > 0),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
     pub async fn set_auto_commit(self: &Arc<Self>, on: bool) -> AppResult<()> {
         if has_no_transactions(self.config.driver) {
             return Ok(());
@@ -662,5 +763,14 @@ impl SessionRegistry {
 
     pub fn remove(&self, id: &str) -> Option<Arc<Session>> {
         lock(&self.map).remove(id)
+    }
+
+    /// Open sessions of one connection.
+    pub fn for_connection(&self, connection_id: &str) -> Vec<Arc<Session>> {
+        lock(&self.map)
+            .values()
+            .filter(|s| s.config.id == connection_id)
+            .cloned()
+            .collect()
     }
 }

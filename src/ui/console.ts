@@ -2,7 +2,7 @@
 // Its run controls (Run / Cancel, Run all, transaction pill) are mounted by the shell into the
 // floating capsule while this console is active.
 import { api } from "../api";
-import type { Driver, QueryResult, RowEdit, SchemaNode, SessionInfo } from "../types";
+import type { Driver, FedResult, FedSource, FedStep, QueryResult, RowEdit, SchemaNode, SessionInfo } from "../types";
 import { clear, errMsg, h, icon } from "./dom";
 import { DRIVER_LABELS } from "../types";
 import { confirmDialog } from "./confirm";
@@ -10,8 +10,12 @@ import { showMenu } from "./menu";
 import { SqlEditor } from "./editor";
 import { kafkaNames, loadOverview } from "./kafka";
 import { ResultGrid } from "./grid";
+import type { PagingState } from "./grid";
 import { store } from "./state";
-import { buildCompletionSchema, buildFilteredSql, detectEditContext, nextOrder, orderMarks, parseFilterable, qualifiedName, quoteIdent } from "./sqlutil";
+import { buildCompletionSchema, buildFilteredSql, connColor, countSql, detectEditContext, nextOrder, orderMarks, pagedSql, pagingFirstPageOnly, parseFilterable, qualifiedName, quoteIdent } from "./sqlutil";
+import { getSettings } from "./settings";
+import { handleActionError } from "./recovery";
+import { FED_DRIVERS, aliasSlug, isAlias, uniqueAlias } from "./federation";
 import { openExportDialog } from "./exportDialog";
 import { FilterBar } from "./filterBar";
 import type { FilterState } from "./filterBar";
@@ -50,6 +54,37 @@ interface ResultItem {
   last?: QueryResult;
   /** Set while the result is a simple single-table SELECT (filter bar + server-side sort). */
   filter?: FilterState;
+  /** Server-side paging of a single SELECT (null / undefined = not paged). */
+  paging?: PagingState | null;
+  /** Cross-source result (read-only, not re-runnable through the session). */
+  fed?: boolean;
+}
+
+/** An extra data source attached to a console for cross-source queries. */
+interface FedAttach {
+  alias: string;
+  connId: string;
+  database: string | null;
+}
+
+const MSSQL_PAGE_REASON = "SQL Server can't page a query that has ORDER BY without TOP — only the first page is shown";
+
+/** Strips leading comments so the statement's first keyword can be checked. */
+function headOf(sql: string): string {
+  return sql.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*/, "");
+}
+
+/** Why a statement is risky (UPDATE / DELETE without WHERE, DROP, TRUNCATE), or null. */
+function riskOf(sql: string): string | null {
+  const t = headOf(sql)
+    .replace(/'(?:[^']|'')*'/g, "''")
+    .replace(/--[^\n]*/g, " ")
+    .replace(/\/\*[\s\S]*?\*\//g, " ");
+  const kw = /^([A-Za-z]+)/.exec(t)?.[1]?.toLowerCase();
+  if (kw === "drop") return "DROP";
+  if (kw === "truncate") return "TRUNCATE";
+  if ((kw === "delete" || kw === "update") && !/\bwhere\b/i.test(t)) return `${kw.toUpperCase()} without WHERE`;
+  return null;
 }
 
 let counter = 0;
@@ -83,6 +118,13 @@ export class ConsolePane implements TabPane {
   private waitText: HTMLElement;
   private txMenuClosedAt = 0;
   private alive = true;
+  private btnFed: HTMLButtonElement;
+  // cross-source queries
+  private fedEl: HTMLElement;
+  private fed: FedAttach[] = [];
+  private fedShown = false;
+  private ownAlias = "";
+  private ownAliasEdited = false;
 
   constructor(
     public connId: string,
@@ -93,6 +135,8 @@ export class ConsolePane implements TabPane {
     public database: string | null = null,
     /** Schema that completion defaults to (set when opened from a schema node). */
     public schema: string | null = null,
+    /** Table / view the console was opened on (tab names), null for a plain console. */
+    public table: string | null = null,
   ) {
     this.title = title;
     const entry = store.conns.get(connId);
@@ -106,7 +150,12 @@ export class ConsolePane implements TabPane {
     this.btnStop.disabled = true;
     this.btnRunAll = h("button", { class: "cap-btn ghost icon-only", type: "button", title: `Run all statements (${mod}Shift+Enter)`, "aria-label": "Run all statements", onclick: () => void this.runAll() }, icon("playAll", 15));
     this.btnTx = h("button", { class: "cap-btn fill tx", type: "button", title: "Transaction mode", "aria-haspopup": "menu", onclick: () => this.openTxMenu() });
-    this.controls = h("div", { class: "cap-controls" }, this.btnRun, this.btnStop, this.btnRunAll, this.btnTx);
+    this.btnFed = h(
+      "button",
+      { class: "cap-btn ghost icon-only fed-btn", type: "button", title: "Sources: query several data sources in this console", "aria-label": "Attach data sources", "aria-pressed": "false", onclick: () => this.onFedButton() },
+      icon("layers", 15),
+    );
+    this.controls = h("div", { class: "cap-controls" }, this.btnRun, this.btnStop, this.btnRunAll, this.btnFed, this.btnTx);
     this.btnTx.hidden = driver === "redis" || driver === "kafka";
     this.syncTxLabel();
     this.waitText = h("span", null, "Running…");
@@ -120,13 +169,21 @@ export class ConsolePane implements TabPane {
       onRun: () => void this.runCurrent(),
       onRunAll: () => void this.runAll(),
     });
+    // Gutter ▶: run just that statement (Alt/Option-click: keep the current results, add a result tab).
+    this.editor.onRunStatement((r, o) => {
+      const list = this.editor.splitText(r.text);
+      if (list.length) void this.runList(list, { append: o.newTab });
+    });
     this.tabsEl = h("div", { class: "r-tabs", role: "tablist", "aria-label": "Results" });
     this.bodyEl = h("div", { class: "r-body" });
     const splitter = h("div", { class: "c-split", role: "separator", "aria-orientation": "horizontal", "aria-label": "Resize editor", title: "Drag to resize" });
     this.bindSplitter(splitter);
     this.bar = new FilterBar(driver, { onApply: (where, order) => this.applyBar(where, order) });
     const results = h("div", { class: "c-results" }, this.tabsEl, this.bar.el, this.bodyEl);
-    this.el = h("div", { class: "console" }, this.editorWrap, splitter, results);
+    this.fedEl = h("div", { class: "fed-strip", role: "group", "aria-label": "Sources", hidden: true });
+    this.el = h("div", { class: "console" }, this.fedEl, this.editorWrap, splitter, results);
+    this.ownAlias = aliasSlug(entry?.config.name ?? "main");
+    this.syncFedUi();
     this.showEmptyResults();
     this.updateSchema();
     this.loadSchema();
@@ -146,6 +203,37 @@ export class ConsolePane implements TabPane {
 
   setSql(sql: string): void {
     this.editor.setText(sql);
+  }
+
+  /** Adds `sql` as its own statement (new line, `;`-separated) at the cursor, or at the end. */
+  insertStatement(sql: string, atEnd = false): void {
+    this.editor.insertStatement(sql, atEnd);
+    this.editor.focus();
+  }
+
+  undo(): boolean {
+    this.editor.focus();
+    return this.editor.undo();
+  }
+
+  /** Pending grid edits or an open manual transaction. */
+  get dirty(): boolean {
+    return (!this.autoCommit && this.session !== null) || this.items.some((i) => i.grid?.hasPending() === true);
+  }
+
+  /** The editor's whole text (reopen closed tab). */
+  get sqlText(): string {
+    return this.editor.getText();
+  }
+
+  /** Cancel shortcut. */
+  cancelRun(): void {
+    void this.cancel();
+  }
+
+  redo(): boolean {
+    this.editor.focus();
+    return this.editor.redo();
   }
 
   async runSqlText(sql: string): Promise<void> {
@@ -214,6 +302,7 @@ export class ConsolePane implements TabPane {
     this.autoCommit = true;
     this.database = target;
     this.schema = null;
+    this.table = null;
     this.schemaExplicit = false;
     this.syncTxUi();
     this.updateSchema();
@@ -250,8 +339,16 @@ export class ConsolePane implements TabPane {
     this.connId = connId;
     this.database = null;
     this.schema = null;
+    this.table = null;
     this.schemaExplicit = false;
     const e = store.conns.get(connId);
+    this.fed = this.fed.filter((f) => f.connId !== connId);
+    if (!this.ownAliasEdited) this.ownAlias = uniqueAlias(aliasSlug(e?.config.name ?? "main"), this.fed.map((f) => f.alias));
+    if (this.isLineBased || !FED_DRIVERS.has(e?.config.driver ?? "postgres")) {
+      this.fed = [];
+      this.fedShown = false;
+    }
+    this.syncFedUi();
     this.status.serverVersion = e?.session?.serverVersion ?? "";
     this.syncTxUi();
     this.updateSchema();
@@ -403,7 +500,7 @@ export class ConsolePane implements TabPane {
 
   // ---------------------------------------------------------------- running
 
-  private async runCurrent(): Promise<void> {
+  async runCurrent(): Promise<void> {
     const r = this.editor.getSelectionOrStatementAtCursor();
     if (!r) {
       toast("Nothing to run at the cursor", "info");
@@ -419,7 +516,7 @@ export class ConsolePane implements TabPane {
     await this.runList(list);
   }
 
-  private async runAll(): Promise<void> {
+  async runAll(): Promise<void> {
     const all = this.editor.getAllStatements().map((s) => s.text);
     if (all.length === 0) {
       toast("Nothing to run", "info");
@@ -440,36 +537,183 @@ export class ConsolePane implements TabPane {
     this.host.onStatus(this);
   }
 
-  private async runList(stmts: string[]): Promise<void> {
+  /** Asks before UPDATE / DELETE without WHERE, DROP and TRUNCATE (Settings › Data › Confirm risky statements). */
+  private async confirmRisky(stmts: string[]): Promise<boolean> {
+    if (this.isLineBased || !getSettings().data.confirmRisky) return true;
+    const risky = stmts.map((s) => ({ s, why: riskOf(s) })).filter((x) => x.why !== null);
+    if (risky.length === 0) return true;
+    const first = risky[0];
+    const one = first.s.trim().replace(/\s+/g, " ");
+    const name = store.conns.get(this.connId)?.config.name ?? "this data source";
+    const text =
+      risky.length === 1
+        ? `This runs ${first.why} on ${name}:\n${one.length > 160 ? one.slice(0, 160) + "…" : one}`
+        : `${risky.length} statements are risky on ${name} (${[...new Set(risky.map((r) => r.why))].join(", ")}).`;
+    return confirmDialog("Run risky statement?", text, "Run anyway", true);
+  }
+
+  /**
+   * Runs the statements one by one. `append`: keep the current results and add the new ones as extra result tabs
+   * (gutter ▶ with Alt/Option). With attached sources the statements run as cross-source queries.
+   */
+  private async runList(stmts: string[], opts: { append?: boolean } = {}): Promise<void> {
     if (this.running || stmts.length === 0) return;
-    this.setRunning(true, "Connecting…");
-    this.clearResults();
+    if (!(await this.confirmRisky(stmts))) return;
+    if (this.running) return;
+    const fed = this.fedActive;
+    const base = opts.append ? this.items.length : 0;
+    const total = base + stmts.length;
+    this.setRunning(true, fed ? "Running across sources…" : "Connecting…");
+    if (opts.append && this.items.length > 0) this.waitEl.remove();
+    else this.clearResults();
+    this.items.forEach((it) => it.view.classList.add("hidden"));
     this.bodyEl.appendChild(this.waitEl);
     let schemaTouched = false;
+    let autoCount: ResultItem | null = null;
     try {
+      if (fed) {
+        const sources = this.fedSources();
+        for (let i = 0; i < stmts.length; i++) {
+          const sql = stmts[i];
+          this.setRunning(true, stmts.length > 1 ? `Running ${i + 1} of ${stmts.length} across sources…` : "Running across sources…");
+          try {
+            const fr = await api.federatedExecute(sources, sql, DEFAULT_MAX_ROWS);
+            if (!this.alive) return;
+            this.addFedResult(sql, fr, base + i + 1, total);
+          } catch (e) {
+            if (!this.alive) return;
+            this.addError(sql, errMsg(e), base + i + 1, total);
+            if (!handleActionError(e)) toast(errMsg(e), "error");
+            break;
+          }
+        }
+        return;
+      }
       const sess = await this.ensureSession();
       for (let i = 0; i < stmts.length; i++) {
         const sql = stmts[i];
         this.setRunning(true, stmts.length > 1 ? `Running ${i + 1} of ${stmts.length}…` : "Running…");
         try {
-          const res = await api.execute(sess.sessionId, sql, DEFAULT_MAX_ROWS);
-          this.addResult(sql, res, DEFAULT_MAX_ROWS, i + 1, stmts.length);
+          const size = stmts.length === 1 ? this.pageSizeFor(sql) : 0;
+          if (size > 0) {
+            // A single SELECT: run its first page (n + 1 rows tell whether more exist).
+            const pg = await this.fetchPage(sess.sessionId, sql, 0, size);
+            const firstOnly = pagingFirstPageOnly(this.driver, sql);
+            const paging: PagingState = { offset: 0, pageSize: size, hasMore: pg.hasMore, total: null, enabled: !firstOnly, disabledReason: firstOnly ? MSSQL_PAGE_REASON : undefined };
+            const item = this.addResult(sql, pg.res, size, base + i + 1, total, paging);
+            if (item && getSettings().results.countRows && !firstOnly) autoCount = item;
+          } else {
+            const res = await api.execute(sess.sessionId, sql, DEFAULT_MAX_ROWS);
+            this.addResult(sql, res, DEFAULT_MAX_ROWS, base + i + 1, total);
+          }
           if (!this.isLineBased && /^\s*(create|alter|drop|rename)\b/i.test(sql)) schemaTouched = true;
           if (this.isKafka && /^\s*(create|delete)\s+topic\b/i.test(sql)) void loadOverview(this.connId, true);
         } catch (e) {
-          this.addError(sql, errMsg(e), i + 1, stmts.length);
+          this.addError(sql, errMsg(e), base + i + 1, total);
           toast(errMsg(e), "error");
           break;
         }
       }
     } catch (e) {
-      this.addError("", `Could not open a session: ${errMsg(e)}`, 1, 1);
+      this.addError("", `Could not open a session: ${errMsg(e)}`, base + 1, total);
       toast(errMsg(e), "error");
     } finally {
+      this.waitEl.remove();
+      if (this.items.length > 0 && this.activeItem >= 0) this.activate(this.activeItem);
       this.setRunning(false, this.status.text.startsWith("Running") || this.status.text === "Connecting…" ? "Done" : this.status.text);
       this.host.onExecuted(this.connId);
       if (schemaTouched) this.host.onSchemaChanged(this.connId);
     }
+    if (autoCount && this.alive) await this.countRows(autoCount);
+  }
+
+  // ---------------------------------------------------------------- paging
+
+  /** Rows per page for this statement (0 = not paged: setting "All", not a single SELECT, Redis / Kafka). */
+  private pageSizeFor(sql: string): number {
+    if (this.isLineBased) return 0;
+    const size = getSettings().results.pageSize;
+    if (!(size > 0)) return 0;
+    return pagedSql(this.driver, sql, size, 0) !== null ? size : 0;
+  }
+
+  /** Runs one page of `sql` (pageSize + 1 rows); the extra row only tells that more exist. */
+  private async fetchPage(sessionId: string, sql: string, offset: number, size: number): Promise<{ res: QueryResult; hasMore: boolean }> {
+    const wrapped = pagedSql(this.driver, sql, size, offset);
+    if (!wrapped) throw new Error("This statement can't be paged");
+    const res = await api.execute(sessionId, wrapped, size + 1);
+    const hasMore = res.rows.length > size || res.truncated;
+    if (res.rows.length > size) res.rows = res.rows.slice(0, size);
+    res.truncated = false;
+    // Edit detection / export look at the statement: report the user's one, not the paging wrapper.
+    res.statement = sql;
+    return { res, hasMore };
+  }
+
+  /** Pager: page `offset` with `size` rows (size 0 = all rows, unwrapped, up to the default row limit). */
+  private async loadPage(item: ResultItem, offset: number, size: number, force = false): Promise<void> {
+    if (!item.paging || this.running || !item.grid) return;
+    if (!force && item.grid.hasPending()) {
+      toast("Submit or revert pending changes first", "info");
+      return;
+    }
+    this.setRunning(true, "Loading page…");
+    try {
+      const sess = await this.ensureSession();
+      const prev = item.paging;
+      if (size <= 0) {
+        item.maxRows = DEFAULT_MAX_ROWS;
+        const res = await api.execute(sess.sessionId, item.sql, DEFAULT_MAX_ROWS);
+        if (!this.alive) return;
+        item.last = res;
+        item.paging = { offset: 0, pageSize: 0, hasMore: false, total: prev.total, enabled: true };
+        this.applyGrid(item.grid, res, DEFAULT_MAX_ROWS);
+        this.setItemLabel(item, res.rows.length, res.truncated);
+      } else {
+        const pg = await this.fetchPage(sess.sessionId, item.sql, offset, size);
+        if (!this.alive) return;
+        const firstOnly = pagingFirstPageOnly(this.driver, item.sql);
+        item.last = pg.res;
+        item.maxRows = size;
+        item.paging = { offset, pageSize: size, hasMore: pg.hasMore, total: prev.total, enabled: !firstOnly, disabledReason: firstOnly ? MSSQL_PAGE_REASON : undefined };
+        this.applyGrid(item.grid, pg.res, size);
+        this.setItemLabel(item, pg.res.rows.length, pg.hasMore);
+      }
+      if (item.filter) item.grid.setServerSort(orderMarks(item.filter.order, this.driver));
+      item.grid.setPaging(item.paging);
+      this.status.rows = item.last?.rows.length ?? null;
+      this.status.elapsedMs = item.last?.elapsedMs ?? null;
+    } catch (e) {
+      toast(errMsg(e), "error");
+    } finally {
+      if (this.alive) this.setRunning(false, "Done");
+    }
+  }
+
+  /** "Count rows": SELECT COUNT(*) over the statement; the pager then shows the total. */
+  private async countRows(item: ResultItem): Promise<void> {
+    const q = countSql(this.driver, item.sql);
+    if (!q || !item.paging || this.running) return;
+    this.setRunning(true, "Counting rows…");
+    try {
+      const sess = await this.ensureSession();
+      const r = await api.execute(sess.sessionId, q, 1);
+      const v = r.rows[0]?.[0];
+      const n = typeof v === "number" ? v : Number(v);
+      if (Number.isFinite(n) && item.paging) {
+        item.paging = { ...item.paging, total: n };
+        item.grid?.setPaging(item.paging);
+      }
+    } catch (e) {
+      toast(`Could not count rows: ${errMsg(e)}`, "error");
+    } finally {
+      if (this.alive) this.setRunning(false, "Done");
+    }
+  }
+
+  private setItemLabel(item: ResultItem, rows: number, more: boolean): void {
+    const label = item.tab.querySelector(".r-label");
+    if (label) label.textContent = `${(label.textContent ?? "Result").split(" · ")[0]} · ${rows.toLocaleString()}${more ? "+" : ""}`;
   }
 
   private async cancel(): Promise<void> {
@@ -557,7 +801,7 @@ export class ConsolePane implements TabPane {
   }
 
   private makeGrid(item: () => ResultItem): ResultGrid {
-    return new ResultGrid({
+    const g = new ResultGrid({
       onSubmit: (edits) => this.submitEdits(item(), edits),
       onLoadMore: () => {
         const it = item();
@@ -571,9 +815,12 @@ export class ConsolePane implements TabPane {
       onExport: (fromMenu) => this.exportItem(item(), fromMenu === true),
       onHeaderSort: (col, append) => this.headerSort(item(), col, append),
     });
+    g.onPage((offset, size) => void this.loadPage(item(), offset, size));
+    g.onCountRows(() => void this.countRows(item()));
+    return g;
   }
 
-  private addResult(sql: string, res: QueryResult, maxRows: number, n: number, total: number): void {
+  private addResult(sql: string, res: QueryResult, maxRows: number, n: number, total: number, paging: PagingState | null = null): ResultItem | null {
     this.status.elapsedMs = res.elapsedMs;
     const isRows = res.columns.length > 0;
     if (!isRows) {
@@ -590,7 +837,7 @@ export class ConsolePane implements TabPane {
         h("pre", { class: "r-sql" }, sql),
       );
       this.addItem(total > 1 ? `Statement ${n}` : "OK", sql, view, "ok");
-      return;
+      return null;
     }
     let ref!: ResultItem;
     const grid = this.makeGrid(() => ref);
@@ -599,14 +846,61 @@ export class ConsolePane implements TabPane {
     ref.grid = grid;
     ref.last = res;
     ref.maxRows = maxRows;
+    ref.paging = paging;
+    if (paging) grid.setPaging(paging);
     this.initFilter(ref);
     this.syncBar();
     const label = ref.tab.querySelector(".r-label");
-    if (label) label.textContent = `${total > 1 ? `Result ${n}` : "Result"} · ${res.rows.length.toLocaleString()}${res.truncated ? "+" : ""}`;
+    if (label) label.textContent = `${total > 1 ? `Result ${n}` : "Result"} · ${res.rows.length.toLocaleString()}${res.truncated || paging?.hasMore ? "+" : ""}`;
     this.status.rows = res.rows.length;
     this.status.affected = res.rowsAffected;
     this.status.text = "Done";
     this.host.onStatus(this);
+    return ref;
+  }
+
+  /** A cross-source result: "How it ran" (one line per pull + the in-memory join) above a read-only grid. */
+  private addFedResult(sql: string, fr: FedResult, n: number, total: number): void {
+    const res = fr.result;
+    this.status.elapsedMs = res.elapsedMs;
+    let ref!: ResultItem;
+    const grid = this.makeGrid(() => ref);
+    grid.setOptions({});
+    grid.setResult(res, null, "Cross-source results are read-only", DEFAULT_MAX_ROWS);
+    grid.setExportInfo(this.driver, null);
+    const pulls = fr.plan.filter((st) => st.alias !== "");
+    const ms = fr.plan.reduce((a, st) => a + st.elapsedMs, 0) || res.elapsedMs;
+    const pulled = pulls.map((st) => `${st.rows.toLocaleString()} from ${st.sourceName}`);
+    const pulledText = pulled.length > 1 ? pulled.slice(0, -1).join(", ") + " and " + pulled[pulled.length - 1] : pulled.join("");
+    grid.setMeta([pulledText ? "pulled " + pulledText : "", ms >= 1000 ? (ms / 1000).toFixed(2) + " s" : ms + " ms", "read-only"].filter(Boolean).join(" · "));
+    const view = h("div", { class: "fed-view" }, this.planEl(fr.plan), grid.el);
+    ref = this.addItem(total > 1 ? `Result ${n}` : "Result", sql, view, "rows");
+    ref.grid = grid;
+    ref.last = res;
+    ref.fed = true;
+    ref.maxRows = DEFAULT_MAX_ROWS;
+    this.setItemLabel(ref, res.rows.length, res.truncated);
+    this.status.rows = res.rows.length;
+    this.status.affected = null;
+    this.status.text = "Done";
+    this.host.onStatus(this);
+  }
+
+  private planEl(plan: FedStep[]): HTMLElement {
+    const rows = plan.map((st) => {
+      const e = st.connectionId ? store.conns.get(st.connectionId) : undefined;
+      const color = st.alias === "" || !e ? "var(--text-3)" : connColor(e.config);
+      return h(
+        "div",
+        { class: "fed-step" + (st.alias === "" ? " local" : "") },
+        h("span", { class: "fed-dot", style: `--c:${color}`, "aria-hidden": "true" }),
+        h("span", { class: "fed-src", title: st.alias ? `${st.sourceName} (${st.alias})` : st.sourceName }, st.sourceName),
+        h("span", { class: "fed-sql mono", title: st.sql }, st.sql),
+        h("span", { class: "fed-rows" }, `${st.rows.toLocaleString()} row${st.rows === 1 ? "" : "s"}`),
+        h("span", { class: "fed-ms" }, `${st.elapsedMs.toLocaleString()} ms`),
+      );
+    });
+    return h("div", { class: "fed-plan", role: "group", "aria-label": "How it ran" }, h("div", { class: "fed-head" }, "How it ran"), rows);
   }
 
   private applyGrid(grid: ResultGrid, res: QueryResult, maxRows: number): void {
@@ -665,7 +959,7 @@ export class ConsolePane implements TabPane {
 
   /** Marks the result as filterable when its statement is a simple single-table SELECT. */
   private initFilter(item: ResultItem): void {
-    const p = this.isLineBased ? null : parseFilterable(item.sql, this.driver);
+    const p = this.isLineBased || item.fed ? null : parseFilterable(item.sql, this.driver);
     if (!p || !item.grid || !item.last) {
       item.filter = undefined;
       item.grid?.setServerSort(null);
@@ -730,7 +1024,14 @@ export class ConsolePane implements TabPane {
     this.bar.setBusy(true);
     try {
       const sess = await this.ensureSession();
-      const res = await api.execute(sess.sessionId, sql, item.maxRows);
+      const size = item.paging && item.paging.pageSize > 0 ? this.pageSizeFor(sql) && item.paging.pageSize : 0;
+      let res: QueryResult;
+      let more = false;
+      if (size > 0) {
+        const pg = await this.fetchPage(sess.sessionId, sql, 0, size);
+        res = pg.res;
+        more = pg.hasMore;
+      } else res = await api.execute(sess.sessionId, sql, item.maxRows);
       if (!this.alive) return;
       this.editor.replaceStatementText(item.sql, sql);
       const np = parseFilterable(sql, this.driver);
@@ -742,12 +1043,19 @@ export class ConsolePane implements TabPane {
       f.error = null;
       f.draftOrder = f.order;
       if (from === "bar" || f.draftWhere === where) f.draftWhere = f.where;
-      if (item.grid) {
-        this.applyGrid(item.grid, res, item.maxRows);
-        item.grid.setServerSort(orderMarks(f.order, this.driver));
+      if (item.paging) {
+        const firstOnly = pagingFirstPageOnly(this.driver, sql);
+        item.paging =
+          size > 0
+            ? { offset: 0, pageSize: size, hasMore: more, total: null, enabled: !firstOnly, disabledReason: firstOnly ? MSSQL_PAGE_REASON : undefined }
+            : { ...item.paging, offset: 0, hasMore: false, total: null };
       }
-      const label = item.tab.querySelector(".r-label");
-      if (label) label.textContent = `${(label.textContent ?? "Result").split(" · ")[0]} · ${res.rows.length.toLocaleString()}${res.truncated ? "+" : ""}`;
+      if (item.grid) {
+        this.applyGrid(item.grid, res, size > 0 ? size : item.maxRows);
+        item.grid.setServerSort(orderMarks(f.order, this.driver));
+        if (item.paging) item.grid.setPaging(item.paging);
+      }
+      this.setItemLabel(item, res.rows.length, res.truncated || more);
       this.status.rows = res.rows.length;
       this.status.elapsedMs = res.elapsedMs;
     } catch (e) {
@@ -760,9 +1068,33 @@ export class ConsolePane implements TabPane {
         this.host.onExecuted(this.connId);
       }
     }
+    if (this.alive && f.error === null && item.paging && item.paging.pageSize > 0 && item.paging.enabled && getSettings().results.countRows) await this.countRows(item);
   }
 
   private async rerun(item: ResultItem): Promise<void> {
+    if (item.fed) {
+      // "Load more" on a cross-source result: run it again with the larger row limit.
+      if (this.running || !item.grid || this.fed.length === 0) return;
+      this.setRunning(true, "Reloading across sources…");
+      try {
+        const fr = await api.federatedExecute(this.fedSources(), item.sql, item.maxRows);
+        if (!this.alive) return;
+        item.last = fr.result;
+        item.grid.setResult(fr.result, null, "Cross-source results are read-only", item.maxRows);
+        item.view.querySelector(".fed-plan")?.replaceWith(this.planEl(fr.plan));
+        this.setItemLabel(item, fr.result.rows.length, fr.result.truncated);
+        this.status.rows = fr.result.rows.length;
+      } catch (e) {
+        toast(errMsg(e), "error");
+      } finally {
+        if (this.alive) this.setRunning(false, "Done");
+      }
+      return;
+    }
+    if (item.paging && item.paging.pageSize > 0) {
+      await this.loadPage(item, item.paging.offset, item.paging.pageSize, true);
+      return;
+    }
     if (!this.session || this.running) return;
     this.setRunning(true, "Reloading…");
     try {
@@ -802,6 +1134,9 @@ export class ConsolePane implements TabPane {
     if (driver === "redis" || driver === "kafka") {
       sql = null;
       reason = "Redis and Kafka results export the loaded rows only";
+    } else if (item.fed) {
+      sql = null;
+      reason = "Cross-source results export the loaded rows only";
     } else if (!/^\s*(?:(?:--[^\n]*\n|\/\*[\s\S]*?\*\/|\s)*)(select|with|values|table)\b/i.test(item.sql)) {
       sql = null;
       reason = "Only a SELECT result can be re-run for all rows";
@@ -821,8 +1156,144 @@ export class ConsolePane implements TabPane {
 
   /** Qualified, dialect-quoted table of a simple single-table SELECT, else null. */
   private exportTable(sql: string): string | null {
-    const p = this.isLineBased ? null : parseFilterable(sql, this.driver);
+    const p = this.isLineBased || this.fedActive ? null : parseFilterable(sql, this.driver);
     return p ? qualifiedName(this.driver, p.schema, p.table) : null;
+  }
+
+  // ---------------------------------------------------------------- cross-source queries (Sources strip)
+
+  /** True when runs go through federated_execute: a SQL console with at least one extra source attached. */
+  get fedActive(): boolean {
+    return this.fed.length > 0 && !this.isLineBased && FED_DRIVERS.has(this.driver);
+  }
+
+  /** The console's own data source first (with its alias), then the attached ones. */
+  private fedSources(): FedSource[] {
+    return [
+      { alias: this.ownAlias, connectionId: this.connId, database: this.database },
+      ...this.fed.map((f) => ({ alias: f.alias, connectionId: f.connId, database: f.database })),
+    ];
+  }
+
+  private onFedButton(): void {
+    if (!this.fedShown && this.fed.length === 0) {
+      this.fedShown = true;
+      this.syncFedUi();
+      const add = this.fedEl.querySelector<HTMLElement>(".fed-add");
+      if (add) this.openAttachMenu(add);
+      return;
+    }
+    if (this.fed.length === 0) {
+      this.fedShown = false;
+      this.syncFedUi();
+      return;
+    }
+    const add = this.fedEl.querySelector<HTMLElement>(".fed-add");
+    if (add) this.openAttachMenu(add);
+  }
+
+  private openAttachMenu(anchor: HTMLElement): void {
+    const r = anchor.getBoundingClientRect();
+    const used = new Set([this.connId, ...this.fed.map((f) => f.connId)]);
+    const cands = store.list().filter((e) => FED_DRIVERS.has(e.config.driver) && !used.has(e.config.id));
+    showMenu(
+      r.left,
+      r.bottom + 6,
+      cands.length
+        ? cands.map((e) => ({ label: e.config.name, icon: "database", hint: DRIVER_LABELS[e.config.driver].split(" / ")[0], onClick: () => this.attachSource(e.config.id) }))
+        : [{ label: "No other SQL data source to attach", disabled: true }],
+      { minWidth: 220 },
+    );
+  }
+
+  private attachSource(connId: string): void {
+    const e = store.conns.get(connId);
+    if (!e) return;
+    const alias = uniqueAlias(aliasSlug(e.config.name), [this.ownAlias, ...this.fed.map((f) => f.alias)]);
+    this.fed.push({ alias, connId, database: null });
+    this.fedShown = true;
+    this.syncFedUi();
+    toast(`Attached ${e.config.name} as ${alias} — use ${alias}.schema.table in SQL`, "info");
+  }
+
+  private detachSource(i: number): void {
+    this.fed.splice(i, 1);
+    this.syncFedUi();
+  }
+
+  private fedChip(alias: string, connId: string, onAlias: (v: string) => void, onDetach: (() => void) | null): HTMLElement {
+    const e = store.conns.get(connId);
+    const name = e?.config.name ?? "(removed data source)";
+    const color = e ? connColor(e.config) : "var(--text-3)";
+    const input = h("input", { class: "fed-alias mono", type: "text", value: alias, spellcheck: false, autocomplete: "off", "aria-label": `Alias of ${name}`, title: "Alias used in SQL: alias.schema.table" });
+    input.size = Math.max(3, alias.length);
+    input.addEventListener("input", () => (input.size = Math.max(3, input.value.length)));
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        input.blur();
+      } else if (ev.key === "Escape") {
+        ev.stopPropagation();
+        input.value = alias;
+        input.blur();
+      }
+    });
+    input.addEventListener("change", () => {
+      const v = input.value.trim();
+      if (v === alias) return;
+      const others = [this.ownAlias, ...this.fed.map((f) => f.alias)].filter((a) => a !== alias).map((a) => a.toLowerCase());
+      if (!isAlias(v)) toast("An alias uses letters, digits and _ and doesn't start with a digit", "info");
+      else if (others.includes(v.toLowerCase())) toast(`The alias ${v} is already used in this console`, "info");
+      else {
+        onAlias(v);
+        return;
+      }
+      input.value = alias;
+      input.size = Math.max(3, alias.length);
+    });
+    return h(
+      "span",
+      { class: "fed-chip", style: `--c:${color}`, title: `${name}${e ? " — " + DRIVER_LABELS[e.config.driver] : ""}` },
+      h("span", { class: "fed-dot", "aria-hidden": "true" }),
+      input,
+      h("span", { class: "fed-name" }, name),
+      onDetach ? h("button", { class: "fed-x", type: "button", title: `Detach ${name}`, "aria-label": `Detach ${name}`, onclick: onDetach }, icon("x", 10)) : null,
+    );
+  }
+
+  private syncFedUi(): void {
+    const supported = !this.isLineBased && FED_DRIVERS.has(this.driver);
+    this.btnFed.hidden = !supported;
+    const on = this.fedActive;
+    this.btnFed.classList.toggle("on", on);
+    this.btnFed.setAttribute("aria-pressed", String(this.fedShown || on));
+    this.btnFed.title = on ? `Sources: ${this.fed.length + 1} data sources — attach another…` : "Sources: query several data sources in this console";
+    this.btnRun.title = on ? `Run across ${this.fed.length + 1} data sources (${MOD}Enter)` : `Run selection or statement at cursor (${MOD}Enter)`;
+    const show = supported && (this.fedShown || this.fed.length > 0);
+    this.fedEl.hidden = !show;
+    this.el?.classList.toggle("fed-on", show);
+    clear(this.fedEl);
+    if (!show) return;
+    const add = h("button", { class: "fed-add", type: "button", "aria-haspopup": "menu", onclick: (ev: MouseEvent) => this.openAttachMenu(ev.currentTarget as HTMLElement) }, icon("plus", 12), "Attach source");
+    this.fedEl.append(
+      h("span", { class: "fed-label" }, "Sources"),
+      this.fedChip(this.ownAlias, this.connId, (v) => {
+        this.ownAlias = v;
+        this.ownAliasEdited = true;
+        this.syncFedUi();
+      }, null),
+      ...this.fed.map((f, i) =>
+        this.fedChip(f.alias, f.connId, (v) => {
+          f.alias = v;
+          this.syncFedUi();
+        }, () => this.detachSource(i)),
+      ),
+      add,
+      h("span", { class: "fed-hint" }, this.fed.length ? "Query them as alias.schema.table · results are read-only" : "Attach another data source to join across sources"),
+    );
+    if (this.fed.length === 0) {
+      this.fedEl.append(h("button", { class: "fed-x close", type: "button", title: "Hide sources", "aria-label": "Hide sources", onclick: () => ((this.fedShown = false), this.syncFedUi()) }, icon("x", 11)));
+    }
   }
 
   // ---------------------------------------------------------------- layout

@@ -99,6 +99,7 @@ pub struct Profiles {
     vault_path: PathBuf,
     ssh_path: PathBuf,
     layout_path: PathBuf,
+    settings_path: PathBuf,
     file_lock: tokio::sync::Mutex<()>,
     vault_tokens: SecretStore,
     ssh_secrets: SecretStore,
@@ -111,6 +112,7 @@ impl Profiles {
             vault_path: config_dir.join("vault_profiles.json"),
             ssh_path: config_dir.join("ssh_profiles.json"),
             layout_path: config_dir.join("explorer_layout.json"),
+            settings_path: config_dir.join("settings.json"),
             file_lock: tokio::sync::Mutex::new(()),
             vault_tokens: SecretStore::new(VAULT_PROFILE_SERVICE),
             ssh_secrets: SecretStore::new(SSH_SERVICE),
@@ -138,6 +140,28 @@ impl Profiles {
     pub async fn save_layout(&self, layout: &crate::model::ExplorerLayout) -> AppResult<()> {
         let _g = self.file_lock.lock().await;
         write_json_atomic(&self.layout_path, layout)
+    }
+
+    // ----- App settings (shape owned by the frontend) -----
+
+    /// `<config>/settings.json` as raw JSON; `{}` when missing, unreadable or not an object.
+    pub async fn get_settings(&self) -> serde_json::Value {
+        let _g = self.file_lock.lock().await;
+        let parsed = std::fs::read_to_string(&self.settings_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        match parsed {
+            Some(v) if v.is_object() => v,
+            _ => serde_json::Value::Object(serde_json::Map::new()),
+        }
+    }
+
+    pub async fn save_settings(&self, settings: &serde_json::Value) -> AppResult<()> {
+        if !settings.is_object() {
+            return Err(AppError::new("Settings must be a JSON object."));
+        }
+        let _g = self.file_lock.lock().await;
+        write_json_atomic(&self.settings_path, settings)
     }
 
     // ----- Vault profiles -----
@@ -215,6 +239,11 @@ impl Profiles {
 
     pub fn vault_token(&self, id: &str) -> Option<String> {
         self.vault_tokens.get(id)
+    }
+
+    /// Stores a profile's token (as `save_vault` does for a pasted one); "" clears it.
+    pub fn set_vault_token(&self, id: &str, token: &str) {
+        self.vault_tokens.set(id, token.trim());
     }
 
     /// Ids of connections whose Vault config references this profile.

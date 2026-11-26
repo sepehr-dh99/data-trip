@@ -434,6 +434,18 @@ body.resizing-col .resizer {
 .side-search input::-webkit-search-cancel-button {
   filter: invert(0.7);
 }
+/* WebKitGTK draws its own GTK entry frame (rounded border + background) inside the pill
+   unless native appearance is switched off. */
+.side-search input,
+input[type="search"] {
+  -webkit-appearance: none;
+  appearance: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
+}
 .tree {
   flex: 1;
   min-height: 0;
@@ -1822,6 +1834,7 @@ body.resizing-row .c-split::after {
   background: var(--fill-hover);
 }
 .drawer-search {
+  flex: 0 0 auto;
   margin: 0 12px 8px;
 }
 .hist-list {

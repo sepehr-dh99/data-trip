@@ -6,7 +6,7 @@ import type { AuthMethod, ConnectionConfig, Driver, KafkaConfig, VaultCheck, Vau
 import { handleActionError } from "./recovery";
 import { openSshProfilesDialog, sshLabel, sshStore } from "./sshDialog";
 import { statusText, statusTone, vaults } from "./vault";
-import { openTokenPopover } from "./vaultChips";
+import { openTokenPopover, startOidcSignIn } from "./vaultChips";
 import { openVaultProfilesDialog } from "./vaultDialog";
 import { clear, errMsg, h, icon } from "./dom";
 import { CONN_COLORS, DRIVER_COLORS } from "./sqlutil";
@@ -137,7 +137,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     return b;
   });
   const authSeg = h("div", { class: "seg", role: "radiogroup", "aria-label": "Authentication method" }, authBtns);
-  const tokenLabels: Record<VaultTokenSource, string> = { file: "Token file", env: "VAULT_TOKEN env", keychain: "Keychain" };
+  const tokenLabels: Record<VaultTokenSource, string> = { file: "Token file", env: "VAULT_TOKEN env", keychain: "Keychain", oidc: "OIDC" };
   const tokenBtns = (["file", "env", "keychain"] as VaultTokenSource[]).map((t) => {
     const b = h("button", { type: "button", class: "seg-btn", role: "radio", onclick: () => setTokenSource(t) }, tokenLabels[t]);
     b.dataset.t = t;
@@ -473,15 +473,19 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     vSummary.style.display = p ? "" : "none";
     if (!p) return;
     const host = (p.address ?? "").replace(/^https?:\/\//, "");
-    const tone = (p.tokenSource ?? "keychain") === "keychain" ? statusTone(p.id) : "idle";
-    const tok = (p.tokenSource ?? "keychain") === "keychain" ? "token " + (statusText(p.id).startsWith("expires") ? statusText(p.id) : statusText(p.id)) : p.tokenSource === "file" ? "token from file" : "token from VAULT_TOKEN";
+    const src = p.tokenSource ?? "keychain";
+    const tone = src === "keychain" || src === "oidc" ? statusTone(p.id) : "idle";
+    const tok = src === "keychain" ? "token " + statusText(p.id) : src === "oidc" ? "OIDC · " + statusText(p.id) : src === "file" ? "token from file" : "token from VAULT_TOKEN";
+    const oidcOff = src === "oidc" && vaults.effective(p.id) !== "valid" && vaults.oidcPending !== p.id;
     vSummary.className = "vault-summary " + tone;
     vSummary.append(
       h("span", { class: "vchip-dot", style: `--pc:${p.color ?? "#8e8e93"}` }),
       h("span", { class: "vs-text" }, `${p.name} · ${host.length > 24 ? host.slice(0, 24) + "…" : host || "VAULT_ADDR"} · `, h("span", { class: "vs-tok " + tone }, tok)),
-      (p.tokenSource ?? "keychain") === "keychain"
+      src === "keychain"
         ? h("button", { class: "btn ghost sm", type: "button", onclick: (e: Event) => openTokenPopover(p.id, e.currentTarget as HTMLElement) }, icon("key", 13), "Paste token")
-        : h("span"),
+        : oidcOff
+          ? h("button", { class: "btn ghost sm", type: "button", onclick: () => void startOidcSignIn(p.id) }, icon("key", 13), "Sign in")
+          : h("span"),
     );
   };
   selVProfile.addEventListener("change", () => {

@@ -27,6 +27,9 @@ import type {
   ExportOptions,
   SshProfile,
   SshCheck,
+  ReconnectResult,
+  FedSource,
+  FedResult,
 } from "./types";
 
 /** Normalizes any thrown value from invoke() into an Error with a readable message. */
@@ -146,4 +149,18 @@ export const api = {
   /** Stores (or with "" clears) the Vault token in the OS keychain for tokenSource "keychain". */
   setVaultToken: (connectionId: string, token: string) =>
     call<null>("set_vault_token", { connectionId, token }),
+
+  // ── v0.10 ──
+  /** Raw settings object from <config>/settings.json ({} when none). Shape owned by src/ui/settings.ts. */
+  getSettings: () => call<Record<string, unknown>>("get_settings"),
+  saveSettings: (settings: Record<string, unknown>) => call<null>("save_settings", { settings }),
+  /** Drops and re-opens every open session of a connection (fresh Vault credentials / SSH forward). */
+  reconnectConnection: (connectionId: string) => call<ReconnectResult>("reconnect_connection", { connectionId }),
+  /** Runs one SELECT across several data sources (see CONTRACT.md v0.10). */
+  federatedExecute: (sources: FedSource[], sql: string, maxRows: number) =>
+    call<FedResult>("federated_execute", { sources, sql, maxRows }),
+  /** Browser OIDC sign-in for a Vault profile; resolves when the callback arrives (5 min timeout). */
+  vaultOidcLogin: (profileId: string, role: string | null) =>
+    call<VaultTokenInfo>("vault_oidc_login", { profileId, role }),
+  vaultOidcCancel: () => call<null>("vault_oidc_cancel"),
 };

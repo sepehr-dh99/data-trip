@@ -1,4 +1,8 @@
 import { App } from "./ui/app";
+import { installInputUndo } from "./ui/inputUndo";
+import { loadSettings } from "./ui/settings";
+import "./styles/settings.css";
+import "./styles/shell.css";
 
 // Platform classes drive the few OS-specific rules in glass.css:
 //  mac      -> reserve the traffic-light strip (titleBarStyle Overlay)
@@ -10,5 +14,8 @@ if (/Mac/.test(ua)) root.classList.add("mac");
 else if (/Windows/.test(ua)) root.classList.add("win");
 else if (/Linux|X11|BSD/.test(ua)) root.classList.add("os-linux");
 
+installInputUndo();
+
 const mount = document.getElementById("app");
-if (mount) void new App(mount).start();
+// Settings are applied before the app starts so the first paint already has the user's accent, fonts and theme.
+if (mount) void loadSettings().then(() => new App(mount).start());

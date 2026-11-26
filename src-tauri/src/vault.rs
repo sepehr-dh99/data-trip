@@ -8,12 +8,14 @@ use futures::future::BoxFuture;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::error::Error as StdError;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, Notify};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Cached dynamic credentials are dropped this long before the lease ends.
-const LEASE_MARGIN: Duration = Duration::from_secs(30);
+pub(crate) const LEASE_MARGIN: Duration = Duration::from_secs(30);
 
 /// A secret read from Vault. Deliberately has no `Debug` impl.
 pub struct VaultSecret {
@@ -103,12 +105,22 @@ fn resolve_token(
                 ))
             }
         },
+        // The OIDC sign-in stores its token in the keychain exactly like a pasted one.
+        VaultTokenSource::Oidc => match keychain_token {
+            Some(t) => t.trim().to_string(),
+            None => {
+                return Err(AppError::new(
+                    "Not signed in to Vault yet. Use \"Sign in with OIDC\" in the Vault profile.",
+                ))
+            }
+        },
     };
     if token.is_empty() {
         let src = match cfg.token_source {
             VaultTokenSource::File => "token file",
             VaultTokenSource::Env => "VAULT_TOKEN",
             VaultTokenSource::Keychain => "keychain token",
+            VaultTokenSource::Oidc => "OIDC token",
         };
         return Err(AppError::new(format!("The Vault {} is empty.", src)));
     }
@@ -497,11 +509,17 @@ impl VaultCache {
     }
 
     /// Returns (username, password) while the lease is still comfortably valid.
+    #[allow(dead_code)]
     pub fn get(&self, conn_id: &str) -> Option<(Option<String>, String)> {
+        self.get_with_expiry(conn_id).map(|(u, p, _)| (u, p))
+    }
+
+    /// Like `get`, plus the instant the cached credentials stop being trusted.
+    pub fn get_with_expiry(&self, conn_id: &str) -> Option<(Option<String>, String, Instant)> {
         let mut m = self.guard();
         match m.get(conn_id) {
             Some(c) if c.expires_at > Instant::now() => {
-                Some((c.username.clone(), c.password.clone()))
+                Some((c.username.clone(), c.password.clone(), c.expires_at))
             }
             Some(_) => {
                 m.remove(conn_id);
@@ -538,5 +556,510 @@ impl VaultCache {
 impl Default for VaultCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OIDC browser sign-in (like `vault login -method=oidc`)
+// ---------------------------------------------------------------------------
+
+/// Must be listed in the Vault role's `allowed_redirect_uris`.
+pub const OIDC_REDIRECT_URI: &str = "http://localhost:8250/oidc/callback";
+const OIDC_PORT: u16 = 8250;
+const OIDC_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The pending OIDC sign-in (at most one: they share port 8250), so it can be cancelled.
+pub struct OidcLogins {
+    pending: Mutex<Option<Arc<Notify>>>,
+}
+
+impl OidcLogins {
+    pub fn new() -> Self {
+        OidcLogins {
+            pending: Mutex::new(None),
+        }
+    }
+
+    fn guard(&self) -> std::sync::MutexGuard<'_, Option<Arc<Notify>>> {
+        self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn begin(&self) -> Arc<Notify> {
+        let n = Arc::new(Notify::new());
+        *self.guard() = Some(n.clone());
+        n
+    }
+
+    fn finish(&self, n: &Arc<Notify>) {
+        let mut g = self.guard();
+        if g.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, n)) {
+            *g = None;
+        }
+    }
+
+    /// Aborts the pending sign-in; false when none is running.
+    pub fn cancel(&self) -> bool {
+        let pending = self.guard().take();
+        match pending {
+            Some(n) => {
+                // notify_one keeps a permit when the login is not waiting at this instant.
+                n.notify_one();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+impl Default for OidcLogins {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &c in s.as_bytes() {
+        if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~') {
+            out.push(c as char);
+        } else {
+            out.push_str(&format!("%{:02X}", c));
+        }
+    }
+    out
+}
+
+fn hex_digit(c: u8) -> Option<u8> {
+    (c as char).to_digit(16).map(|d| d as u8)
+}
+
+/// Decodes `application/x-www-form-urlencoded` text (`+` = space, `%XX`).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < b.len() => match (hex_digit(b[i + 1]), hex_digit(b[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push(h * 16 + l);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b'%');
+                    i += 1;
+                }
+            },
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// What the browser's request to the callback listener carried.
+enum Callback {
+    Code {
+        code: String,
+        state: String,
+    },
+    Failed(String),
+    /// favicon.ico, probes, malformed requests: answered with 404 / 400 and ignored.
+    Ignore,
+}
+
+/// Parses the request line `GET /oidc/callback?code=…&state=… HTTP/1.1`.
+fn parse_callback(head: &str) -> Callback {
+    let line = head.lines().next().unwrap_or("");
+    let mut parts = line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    if method != "GET" {
+        return Callback::Ignore;
+    }
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    if path != "/oidc/callback" {
+        return Callback::Ignore;
+    }
+    let mut code = String::new();
+    let mut state = String::new();
+    let mut error = String::new();
+    let mut description = String::new();
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        match k {
+            "code" => code = percent_decode(v),
+            "state" => state = percent_decode(v),
+            "error" => error = percent_decode(v),
+            "error_description" => description = percent_decode(v),
+            _ => {}
+        }
+    }
+    if !code.is_empty() && !state.is_empty() {
+        Callback::Code { code, state }
+    } else if !error.is_empty() || !description.is_empty() {
+        let msg = if description.is_empty() {
+            error
+        } else if error.is_empty() {
+            description
+        } else {
+            format!("{} ({})", description, error)
+        };
+        Callback::Failed(msg)
+    } else {
+        Callback::Ignore
+    }
+}
+
+fn http_page(status: &str, body: &str) -> String {
+    let html = format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>DataTrip</title></head>\
+         <body style=\"font-family:-apple-system,system-ui,sans-serif;display:flex;align-items:center;\
+         justify-content:center;height:90vh;margin:0;color:#333\"><p style=\"font-size:16px\">{}</p></body></html>",
+        body
+    );
+    format!(
+        "HTTP/1.1 {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\
+         Cache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+        status,
+        html.len(),
+        html
+    )
+}
+
+async fn read_request_head(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 2048];
+    loop {
+        let n = stream.read(&mut chunk).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() > 16 * 1024 {
+            break;
+        }
+    }
+    Ok(buf)
+}
+
+type CallbackResult = Result<(String, String), String>;
+
+/// Answers one browser connection and reports a code/state pair (or an IdP error).
+async fn handle_callback(mut stream: TcpStream, tx: mpsc::UnboundedSender<CallbackResult>) {
+    use tokio::io::AsyncWriteExt;
+    let head =
+        match tokio::time::timeout(Duration::from_secs(10), read_request_head(&mut stream)).await {
+            Ok(Ok(h)) => h,
+            _ => return,
+        };
+    let head = String::from_utf8_lossy(&head).into_owned();
+    let (response, outcome) = match parse_callback(&head) {
+        Callback::Code { code, state } => (
+            http_page(
+                "200 OK",
+                "Signed in \u{2014} you can close this tab and return to DataTrip.",
+            ),
+            Some(Ok((code, state))),
+        ),
+        Callback::Failed(msg) => (
+            http_page(
+                "200 OK",
+                &format!(
+                    "Sign-in failed: {}. You can close this tab and return to DataTrip.",
+                    html_escape(&msg)
+                ),
+            ),
+            Some(Err(format!("Vault OIDC sign-in failed: {}", msg))),
+        ),
+        Callback::Ignore => (http_page("404 Not Found", "Not found"), None),
+    };
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+    if let Some(o) = outcome {
+        let _ = tx.send(o);
+    }
+}
+
+/// Accepts browser connections until the callback arrives or the sign-in is cancelled.
+async fn accept_callback(
+    listener: TcpListener,
+    cancel: Arc<Notify>,
+) -> AppResult<(String, String)> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<CallbackResult>();
+    loop {
+        tokio::select! {
+            _ = cancel.notified() => {
+                return Err(AppError::new("OIDC_CANCELLED: The Vault sign-in was cancelled."));
+            }
+            got = rx.recv() => {
+                match got {
+                    Some(Ok(pair)) => return Ok(pair),
+                    Some(Err(msg)) => return Err(AppError::new(msg)),
+                    None => {}
+                }
+            }
+            acc = listener.accept() => {
+                // Browsers may open speculative connections that never send a request,
+                // so every connection is answered on its own task.
+                match acc {
+                    Ok((stream, _)) => {
+                        tauri::async_runtime::spawn(handle_callback(stream, tx.clone()));
+                    }
+                    Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+                }
+            }
+        }
+    }
+}
+
+/// Binds 127.0.0.1:8250. `retry`: a previous sign-in was just cancelled and may still hold it.
+async fn bind_callback_port(retry: bool) -> AppResult<TcpListener> {
+    let mut attempts = if retry { 30 } else { 1 };
+    loop {
+        match TcpListener::bind(("127.0.0.1", OIDC_PORT)).await {
+            Ok(l) => return Ok(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                attempts -= 1;
+                if attempts == 0 {
+                    return Err(AppError::new(
+                        "Port 8250 is in use (another vault login running?)",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                return Err(AppError::new(format!(
+                    "Could not listen on 127.0.0.1:{} for the OIDC callback: {}",
+                    OIDC_PORT, e
+                )))
+            }
+        }
+    }
+}
+
+/// Opens a URL in the default browser without going through a shell.
+fn open_browser(url: &str) -> AppResult<()> {
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg(url);
+        c
+    } else if cfg!(target_os = "windows") {
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler").arg(url);
+        c
+    } else {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    match cmd.spawn() {
+        Ok(mut child) => {
+            // Reap the launcher so it does not linger as a zombie.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Ok(())
+        }
+        Err(e) => Err(AppError::new(format!(
+            "Could not open the web browser for the Vault sign-in: {}",
+            e
+        ))),
+    }
+}
+
+/// Reads a Vault JSON response; non-2xx statuses become errors carrying Vault's `errors`.
+async fn vault_json(addr: &str, what: &str, resp: reqwest::Response) -> AppResult<Value> {
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| net_error(addr, &e))?;
+    let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    if !status.is_success() {
+        return Err(match vault_errors(&body) {
+            Some(d) => AppError::new(format!("{} failed: {}", what, d)),
+            None => AppError::new(format!("{} failed (HTTP {}).", what, status.as_u16())),
+        });
+    }
+    if let Some(d) = vault_errors(&body) {
+        return Err(AppError::new(format!("{} failed: {}", what, d)));
+    }
+    Ok(body)
+}
+
+/// Browser sign-in with Vault's OIDC auth method. Returns the new client token (never logged).
+/// `role`: explicit role, else the profile's `oidc_role`, else the mount's default role.
+pub fn oidc_login<'a>(
+    profile: &'a VaultProfile,
+    role: Option<String>,
+    logins: &'a OidcLogins,
+) -> BoxFuture<'a, AppResult<String>> {
+    Box::pin(async move {
+        let cfg = config_from_profile(profile);
+        let addr = resolve_address(&cfg)?;
+        let client = build_client(&cfg)?;
+        let mount = non_empty(&profile.oidc_mount)
+            .unwrap_or("oidc")
+            .trim_matches('/')
+            .to_string();
+        let role = role
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .or_else(|| non_empty(&profile.oidc_role))
+            .unwrap_or("")
+            .to_string();
+
+        // Only one sign-in can own the callback port: a new one replaces the pending one.
+        let replaced = logins.cancel();
+        let listener = bind_callback_port(replaced).await?;
+        let cancel = logins.begin();
+        let res = oidc_flow(
+            &client,
+            &cfg,
+            &addr,
+            &mount,
+            &role,
+            listener,
+            cancel.clone(),
+        )
+        .await;
+        logins.finish(&cancel);
+        res
+    })
+}
+
+async fn oidc_flow(
+    client: &reqwest::Client,
+    cfg: &VaultConfig,
+    addr: &str,
+    mount: &str,
+    role: &str,
+    listener: TcpListener,
+    cancel: Arc<Notify>,
+) -> AppResult<String> {
+    let nonce = format!(
+        "{}{}",
+        hex::encode(uuid::Uuid::new_v4().as_bytes()),
+        hex::encode(uuid::Uuid::new_v4().as_bytes())
+    );
+    let body = serde_json::json!({
+        "role": role,
+        "redirect_uri": OIDC_REDIRECT_URI,
+        "client_nonce": nonce,
+    });
+    let mut req = client
+        .post(format!("{}/v1/auth/{}/oidc/auth_url", addr, mount))
+        .json(&body);
+    if let Some(ns) = non_empty(&cfg.namespace) {
+        req = req.header("X-Vault-Namespace", ns);
+    }
+    let resp = req.send().await.map_err(|e| net_error(addr, &e))?;
+    let v = vault_json(addr, "Vault OIDC sign-in", resp).await?;
+    let auth_url = v
+        .get("data")
+        .and_then(|d| d.get("auth_url"))
+        .and_then(|u| u.as_str())
+        .unwrap_or("")
+        .to_string();
+    if auth_url.is_empty() {
+        return Err(AppError::new(format!(
+            "Vault returned no sign-in URL. Check the OIDC role and that its allowed_redirect_uris include {}.",
+            OIDC_REDIRECT_URI
+        )));
+    }
+    if !(auth_url.starts_with("https://") || auth_url.starts_with("http://")) {
+        return Err(AppError::new(
+            "Vault returned an unexpected sign-in URL (not http/https).",
+        ));
+    }
+    open_browser(&auth_url)?;
+
+    let (code, state) =
+        match tokio::time::timeout(OIDC_TIMEOUT, accept_callback(listener, cancel)).await {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(AppError::new(
+                    "OIDC_TIMEOUT: The Vault sign-in timed out after 5 minutes.",
+                ))
+            }
+        };
+
+    let url = format!(
+        "{}/v1/auth/{}/oidc/callback?code={}&state={}&client_nonce={}",
+        addr,
+        mount,
+        percent_encode(&code),
+        percent_encode(&state),
+        percent_encode(&nonce)
+    );
+    let mut req = client.get(url.as_str());
+    if let Some(ns) = non_empty(&cfg.namespace) {
+        req = req.header("X-Vault-Namespace", ns);
+    }
+    let resp = req.send().await.map_err(|e| net_error(addr, &e))?;
+    let v = vault_json(addr, "Vault OIDC sign-in", resp).await?;
+    let token = v
+        .get("auth")
+        .and_then(|a| a.get("client_token"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        return Err(AppError::new(
+            "Vault completed the OIDC sign-in but returned no token.",
+        ));
+    }
+    Ok(token)
+}
+
+#[cfg(test)]
+mod oidc_tests {
+    use super::*;
+
+    #[test]
+    fn parses_callback_request_line() {
+        match parse_callback(
+            "GET /oidc/callback?code=a%2Fb+c&state=st_1 HTTP/1.1\r\nHost: x\r\n\r\n",
+        ) {
+            Callback::Code { code, state } => {
+                assert_eq!(code, "a/b c");
+                assert_eq!(state, "st_1");
+            }
+            _ => panic!("expected code"),
+        }
+        assert!(matches!(
+            parse_callback("GET /favicon.ico HTTP/1.1\r\n\r\n"),
+            Callback::Ignore
+        ));
+        match parse_callback(
+            "GET /oidc/callback?error=access_denied&error_description=User%20cancelled HTTP/1.1",
+        ) {
+            Callback::Failed(m) => assert_eq!(m, "User cancelled (access_denied)"),
+            _ => panic!("expected failure"),
+        }
+    }
+
+    #[test]
+    fn percent_round_trip() {
+        let s = "a b/c?d=é&%";
+        assert_eq!(percent_decode(&percent_encode(s)), s);
+        assert_eq!(percent_decode("100%"), "100%");
     }
 }

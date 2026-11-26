@@ -12,6 +12,7 @@ use crate::store::Store;
 use crate::vault::{self, VaultCache};
 use futures::future::BoxFuture;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(Clone)]
 pub struct CredentialSource {
@@ -33,6 +34,27 @@ struct Resolved {
     config: ConnectionConfig,
     password: Option<String>,
     from_cache: bool,
+    /// When dynamic Vault credentials stop being trusted (lease end minus a safety margin).
+    expires_at: Option<Instant>,
+}
+
+/// Lease end minus the safety margin; short leases get half their duration.
+fn lease_deadline(secret: &vault::VaultSecret) -> Option<Instant> {
+    if secret.kind != "dynamic" {
+        return None;
+    }
+    let lease = Duration::from_secs(secret.lease_secs.filter(|s| *s > 0)?);
+    let usable = if lease > vault::LEASE_MARGIN * 2 {
+        lease - vault::LEASE_MARGIN
+    } else {
+        lease / 2
+    };
+    Some(Instant::now() + usable)
+}
+
+/// Token sources whose token lives in the keychain (pasted, or from an OIDC sign-in).
+fn uses_keychain(src: VaultTokenSource) -> bool {
+    matches!(src, VaultTokenSource::Keychain | VaultTokenSource::Oidc)
 }
 
 /// Heuristic for "the database rejected the credentials" across the supported drivers.
@@ -78,12 +100,11 @@ impl CredentialSource {
                 Some(pid) => {
                     let p = self.profiles.get_vault(pid).await?;
                     let config = vault::merge_profile(vcfg, &p);
-                    let keychain_token =
-                        if config.token_source == VaultTokenSource::Keychain && !explicit_token {
-                            self.profiles.vault_token(&p.id)
-                        } else {
-                            None
-                        };
+                    let keychain_token = if uses_keychain(config.token_source) && !explicit_token {
+                        self.profiles.vault_token(&p.id)
+                    } else {
+                        None
+                    };
                     Ok(PreparedVault {
                         config,
                         keychain_token,
@@ -91,12 +112,11 @@ impl CredentialSource {
                     })
                 }
                 None => {
-                    let keychain_token =
-                        if vcfg.token_source == VaultTokenSource::Keychain && !explicit_token {
-                            self.store.get_vault_token(conn_id)
-                        } else {
-                            None
-                        };
+                    let keychain_token = if uses_keychain(vcfg.token_source) && !explicit_token {
+                        self.store.get_vault_token(conn_id)
+                    } else {
+                        None
+                    };
                     Ok(PreparedVault {
                         config: vcfg.clone(),
                         keychain_token,
@@ -215,6 +235,7 @@ impl CredentialSource {
                     config: cfg.clone(),
                     password: pw,
                     from_cache: false,
+                    expires_at: None,
                 });
             }
             let vcfg = match cfg.vault.as_ref() {
@@ -227,7 +248,7 @@ impl CredentialSource {
             };
             let mut out = cfg.clone();
             if use_cache {
-                if let Some((user, pass)) = self.cache.get(&cfg.id) {
+                if let Some((user, pass, until)) = self.cache.get_with_expiry(&cfg.id) {
                     if user.is_some() {
                         out.username = user;
                     }
@@ -235,6 +256,7 @@ impl CredentialSource {
                         config: out,
                         password: Some(pass),
                         from_cache: true,
+                        expires_at: Some(until),
                     });
                 }
             }
@@ -257,10 +279,12 @@ impl CredentialSource {
             if secret.username.is_some() {
                 out.username = secret.username.clone();
             }
+            let expires_at = lease_deadline(&secret);
             Ok(Resolved {
                 config: out,
                 password: Some(secret.password),
                 from_cache: false,
+                expires_at,
             })
         })
     }
@@ -291,6 +315,21 @@ impl CredentialSource {
         use_cache: bool,
     ) -> BoxFuture<'a, AppResult<db::Connected>> {
         Box::pin(async move {
+            self.connect_with_expiry(cfg, explicit_password, explicit_vault_token, use_cache)
+                .await
+                .map(|(c, _)| c)
+        })
+    }
+
+    /// `connect`, plus when the credentials it used stop being valid (dynamic Vault leases only).
+    pub fn connect_with_expiry<'a>(
+        &'a self,
+        cfg: &'a ConnectionConfig,
+        explicit_password: Option<String>,
+        explicit_vault_token: Option<String>,
+        use_cache: bool,
+    ) -> BoxFuture<'a, AppResult<(db::Connected, Option<Instant>)>> {
+        Box::pin(async move {
             let r = self
                 .resolve_inner(
                     cfg,
@@ -307,14 +346,16 @@ impl CredentialSource {
                 Ok(_) => false,
             };
             if !retry {
-                return first;
+                return first.map(|c| (c, r.expires_at));
             }
             self.cache.invalidate(&cfg.id);
             let r2 = self
                 .resolve_inner(cfg, explicit_password, explicit_vault_token, use_cache)
                 .await?;
-            self.connect_tunneled(&r2.config, r2.password.as_deref())
-                .await
+            let c = self
+                .connect_tunneled(&r2.config, r2.password.as_deref())
+                .await?;
+            Ok((c, r2.expires_at))
         })
     }
 

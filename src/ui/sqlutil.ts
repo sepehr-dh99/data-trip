@@ -1,5 +1,7 @@
 // Dialect helpers: identifier quoting, completion schema, edit-context detection.
 import type { ColumnMeta, ConnectionConfig, Driver, SchemaNode, TableNode } from "../types";
+import { splitStatements } from "../sqlsplit";
+import type { SplitOptions } from "../sqlsplit";
 
 export function quoteIdent(driver: Driver, name: string): string {
   switch (driver) {
@@ -621,4 +623,141 @@ export function filterCompletions(
       : ["ASC", "DESC", ...(driver === "mssql" || driver === "mysql" ? [] : ["NULLS FIRST", "NULLS LAST"])];
   for (const k of kws) out.push({ label: k, apply: k, kind: "keyword" });
   return out;
+}
+
+// ---------------------------------------------------------------- paging helpers (v0.10)
+
+/** Statement-splitter options for a driver's dialect. */
+export function splitOptionsFor(driver: Driver): SplitOptions {
+  switch (driver) {
+    case "postgres":
+      return { brackets: false, dollarQuotes: true };
+    case "mysql":
+      return { brackets: false, dollarQuotes: false, backslashEscapes: true };
+    default:
+      return { brackets: true, dollarQuotes: false };
+  }
+}
+
+/** Replaces comments and the insides of string / quoted-identifier literals with spaces (same length). */
+function maskSql(sql: string, driver: Driver): string {
+  const out: string[] = [];
+  const n = sql.length;
+  const bs = driver === "mysql";
+  let i = 0;
+  const blank = (from: number, to: number): void => {
+    for (let k = from; k < to; k++) out.push(sql[k] === "\n" ? "\n" : " ");
+  };
+  while (i < n) {
+    const c = sql[i];
+    const d = sql[i + 1];
+    if (c === "-" && d === "-") {
+      let j = i;
+      while (j < n && sql[j] !== "\n") j++;
+      blank(i, j);
+      i = j;
+    } else if (c === "/" && d === "*") {
+      let j = sql.indexOf("*/", i + 2);
+      j = j < 0 ? n : j + 2;
+      blank(i, j);
+      i = j;
+    } else if (c === "'" || c === '"' || c === "`" || (c === "[" && (driver === "mssql" || driver === "sqlite"))) {
+      const close = c === "[" ? "]" : c;
+      let j = i + 1;
+      while (j < n) {
+        if (bs && c === "'" && sql[j] === "\\") {
+          j += 2;
+          continue;
+        }
+        if (sql[j] === close) {
+          if (sql[j + 1] === close && c !== "[") {
+            j += 2;
+            continue;
+          }
+          break;
+        }
+        j++;
+      }
+      j = Math.min(n, j + 1);
+      out.push(c);
+      blank(i + 1, Math.max(i + 1, j - 1));
+      if (j - 1 > i) out.push(sql[j - 1] === close ? close : " ");
+      i = j;
+    } else {
+      out.push(c);
+      i++;
+    }
+  }
+  return out.join("");
+}
+
+/** The statement's text when it is exactly one SELECT / WITH query, else null. */
+function singleSelect(driver: Driver, sql: string): { text: string; masked: string } | null {
+  if (driver === "redis" || driver === "kafka") return null;
+  const stmts = splitStatements(sql, splitOptionsFor(driver));
+  if (stmts.length !== 1) return null;
+  const text = stmts[0].text;
+  const masked = maskSql(text, driver);
+  const head = /^[\s(]*([A-Za-z]+)/.exec(masked);
+  if (!head) return null;
+  const kw = head[1].toLowerCase();
+  if (kw !== "select" && kw !== "with") return null;
+  // SELECT ... INTO creates a table; FOR UPDATE / SHARE cannot sit in a subquery.
+  if (/\binto\b/i.test(masked) && kw === "select") return null;
+  if (/\bfor\s+(update|share|no\s+key\s+update|key\s+share)\b/i.test(masked)) return null;
+  // data-modifying CTEs
+  if (kw === "with" && /\b(insert|update|delete|merge)\b/i.test(masked)) return null;
+  // PG: EXPLAIN / VALUES are not SELECTs and were excluded above; MSSQL cannot nest WITH in a derived table.
+  if (driver === "mssql" && kw === "with") return null;
+  return { text, masked };
+}
+
+/** True when the query has an ORDER BY at the top level (outside parentheses). */
+function hasTopLevelOrder(masked: string): boolean {
+  let depth = 0;
+  for (let i = 0; i < masked.length; i++) {
+    const c = masked[i];
+    if (c === "(") depth++;
+    else if (c === ")") depth--;
+    else if (depth === 0 && (c === "o" || c === "O") && /^order\s+by\b/i.test(masked.slice(i, i + 24)) && !/\w/.test(masked[i - 1] ?? " ")) return true;
+  }
+  return false;
+}
+
+/** MSSQL cannot nest a query with ORDER BY (and no TOP) in a derived table: only page 1 is available. */
+export function pagingFirstPageOnly(driver: Driver, sql: string): boolean {
+  if (driver !== "mssql") return false;
+  const s = singleSelect(driver, sql);
+  return !!s && hasTopLevelOrder(s.masked) && !/\bselect\s+(?:distinct\s+)?top\b/i.test(s.masked);
+}
+
+/**
+ * The statement wrapped for one page: fetches `limit + 1` rows from `offset` so "more available" can be told.
+ * null when the statement can't be paged (not a single SELECT/WITH, Redis/Kafka, MSSQL with an inner ORDER BY and
+ * no TOP at offset > 0). MSSQL with an inner ORDER BY at offset 0 returns the statement unchanged (the caller runs
+ * it with maxRows = limit + 1; see pagingFirstPageOnly for the pager's disabled state).
+ */
+export function pagedSql(driver: Driver, sql: string, limit: number, offset: number): string | null {
+  if (!(limit >= 1) || !(offset >= 0)) return null;
+  const s = singleSelect(driver, sql);
+  if (!s) return null;
+  const n1 = Math.floor(limit) + 1;
+  const off = Math.floor(offset);
+  if (driver === "mssql") {
+    if (pagingFirstPageOnly(driver, sql)) return off > 0 ? null : s.text;
+    return `SELECT * FROM (\n${s.text}\n) AS _dt_page ORDER BY (SELECT NULL) OFFSET ${off} ROWS FETCH NEXT ${n1} ROWS ONLY`;
+  }
+  return `SELECT * FROM (\n${s.text}\n) AS _dt_page LIMIT ${n1} OFFSET ${off}`;
+}
+
+/** `SELECT COUNT(*) FROM (<sql>) AS _dt_count`, or null when the statement can't be counted this way. */
+export function countSql(driver: Driver, sql: string): string | null {
+  const s = singleSelect(driver, sql);
+  if (!s) return null;
+  if (pagingFirstPageOnly(driver, sql)) return null;
+  return `SELECT COUNT(*) FROM (\n${s.text}\n) AS _dt_count`;
+}
+
+export function isPageable(driver: Driver, sql: string): boolean {
+  return pagedSql(driver, sql, 1, 0) !== null;
 }

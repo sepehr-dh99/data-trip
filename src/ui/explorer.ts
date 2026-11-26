@@ -31,6 +31,9 @@ import { vaults } from "./vault";
 import { assignVaultProfile } from "./vaultAssign";
 import { VaultChips } from "./vaultChips";
 import { openVaultProfilesDialog } from "./vaultDialog";
+import { getSettings, onSettingsChange, updateSettings } from "./settings";
+import { openSettings } from "./settingsDialog";
+import { shortcutLabel } from "./keymap";
 
 const OVERSCAN = 8;
 /** Indent (px) per tree depth: compact = 12 per level (spec); comfortable keeps 0 / 16 / 30, then +14. */
@@ -52,6 +55,8 @@ export interface OpenConsoleOpts {
   schema?: string | null;
   /** The schema was chosen by the user (navigator): PostgreSQL consoles also get a search_path. */
   explicitSchema?: boolean;
+  /** The console was opened on this table / view (tab names: "orders · shop"). */
+  table?: string;
 }
 
 export interface ExplorerHost {
@@ -240,6 +245,8 @@ export class Explorer {
               { sep: true },
               { label: "Density: Compact", checked: this.density === "compact", onClick: () => this.setDensity("compact") },
               { label: "Density: Comfortable", checked: this.density === "comfortable", onClick: () => this.setDensity("comfortable") },
+              { sep: true },
+              { label: "Settings…", icon: "sliders", hint: shortcutLabel("settings"), onClick: () => openSettings() },
             ],
             { minWidth: 230 },
           );
@@ -267,6 +274,14 @@ export class Explorer {
     );
     this.el.setAttribute("aria-label", "Explorer");
     this.applyDensity();
+    // Density lives in the app settings (Settings › Appearance); follow changes made there.
+    onSettingsChange((st) => {
+      if (st.appearance.density !== this.density) {
+        this.density = st.appearance.density;
+        this.applyDensity();
+        this.render();
+      }
+    });
     onScopeChange(() => this.render());
     onLayoutChange(() => this.render());
     store.subscribe(() => this.render());
@@ -333,6 +348,7 @@ export class Explorer {
     if (d === this.density) return;
     this.density = d;
     setDensity(d);
+    if (getSettings().appearance.density !== d) updateSettings((st) => (st.appearance.density = d));
     this.applyDensity();
     this.render();
   }
@@ -627,7 +643,7 @@ export class Explorer {
     const consoleDb = db === e.defaultDb ? null : db;
     const openData = (): void => {
       pushRecent(id, { db, schema: s.name, name: t.name, kind: t.kind });
-      this.host.openConsole(id, { sql: `SELECT * FROM ${q} `, run: true, title: t.name, database: consoleDb, schema: s.name });
+      this.host.openConsole(id, { sql: `SELECT * FROM ${q} `, run: true, title: t.name, table: t.name, database: consoleDb, schema: s.name });
     };
     const colsKey = `${key}:cols`;
     const fkLabel = (fk: ForeignKeyNode): string => `→ ${fk.refSchema && fk.refSchema !== s.name ? fk.refSchema + "." : ""}${fk.refTable}(${fk.refColumns.join(", ")})`;
@@ -1452,6 +1468,7 @@ export class Explorer {
       connected
         ? { label: "Disconnect", icon: "unplug", onClick: () => void this.disconnect(id) }
         : { label: "Connect", icon: "plug", onClick: () => void this.connect(id) },
+      { label: "Reconnect", icon: "refresh", hint: shortcutLabel("reconnect"), onClick: () => void this.reconnect(id) },
       { label: "New console", icon: "terminal", disabled: !connected, onClick: () => this.host.openConsole(id) },
       { label: "Refresh", icon: "refresh", disabled: !connected, onClick: () => void this.refresh(id) },
       { sep: true },
@@ -1590,6 +1607,37 @@ export class Explorer {
       const msg = errMsg(err);
       const authFail = /password|authentication|access denied|login failed|auth failed|28P01|28000/i.test(msg);
       toast(`Could not connect: ${msg}${authFail ? "\nEdit connection to set the password." : ""}`, "error");
+    }
+  }
+
+  /**
+   * Drops and re-opens every session of the data source (fresh Vault credentials, fresh SSH forward) without
+   * closing consoles. Not connected yet → a plain connect.
+   */
+  async reconnect(id: string): Promise<void> {
+    const e = store.conns.get(id);
+    if (!e) return;
+    const name = e.config.name;
+    if (e.status !== "connected") {
+      await this.connect(id);
+      if (store.conns.get(id)?.status === "connected") toast(`Connected to ${name}`, "ok");
+      return;
+    }
+    try {
+      const r = await api.reconnectConnection(id);
+      if (r.sessions === 0) {
+        // Nothing was open on the backend side (e.g. it restarted): connect from scratch.
+        await this.disconnect(id);
+        await this.connect(id);
+        if (store.conns.get(id)?.status === "connected") toast(`Connected to ${name}`, "ok");
+        return;
+      }
+      const skipped = r.skippedInTx > 0 ? ` · ${r.skippedInTx} skipped (open transaction)` : "";
+      toast(`Reconnected to ${name} · ${r.elapsedMs.toLocaleString()} ms${skipped}`, "ok");
+    } catch (err) {
+      // Expired Vault token / unknown SSH host: fix it inline, then reconnect again.
+      if (handleActionError(err, () => this.reconnect(id))) return;
+      toast(`Could not reconnect: ${errMsg(err)}`, "error");
     }
   }
 

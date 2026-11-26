@@ -2,7 +2,8 @@
 // global "paste a token anywhere" prompt. Replacing an expired token is one paste.
 import { clear, errMsg, h, icon } from "./dom";
 import { openVaultProfilesDialog } from "./vaultDialog";
-import { fmtRemaining, statusText, statusTone, VAULT_TOKEN_RE, vaults } from "./vault";
+import { fmtRemaining, isOidcCancel, statusText, statusTone, VAULT_TOKEN_RE, vaults } from "./vault";
+import { toast } from "./toast";
 
 // ------------------------------------------------------------------ token input
 
@@ -93,7 +94,7 @@ export class VaultChips {
   }
 
   render(): void {
-    const list = vaults.keychainProfiles();
+    const list = vaults.tokenProfiles();
     this.el.hidden = list.length === 0;
     // Re-render in place only when the structure changed; otherwise update the labels (keeps focus + popover anchor).
     const ids = list.map((p) => p.id).join(",");
@@ -108,7 +109,13 @@ export class VaultChips {
           h("span", { class: "vchip-name" }),
           h("span", { class: "vchip-time" }),
         );
-        b.addEventListener("click", () => openTokenPopover(p.id, b));
+        b.addEventListener("click", () => {
+          const cur = vaults.get(p.id);
+          const eff = vaults.effective(p.id);
+          // OIDC: an expired / refused session goes straight to the browser sign-in.
+          if (cur?.tokenSource === "oidc" && (eff === "expired" || eff === "invalid") && vaults.oidcPending !== p.id) void startOidcSignIn(p.id);
+          else openTokenPopover(p.id, b);
+        });
         this.el.appendChild(b);
       }
     }
@@ -118,7 +125,13 @@ export class VaultChips {
       const tone = statusTone(p.id);
       b.className = "vchip " + tone;
       b.style.setProperty("--pc", p.color ?? "#8e8e93");
-      b.title = `${p.name} — ${dotTitle[tone]} · click to paste a new token`;
+      const oidc = p.tokenSource === "oidc";
+      const eff = vaults.effective(p.id);
+      b.classList.toggle("oidc", oidc);
+      b.classList.toggle("pending", vaults.oidcPending === p.id);
+      b.title = oidc
+        ? `${p.name} — ${dotTitle[tone]} · ${eff === "expired" || eff === "invalid" ? "click to sign in with your browser" : "OIDC sign-in"}`
+        : `${p.name} — ${dotTitle[tone]} · click to paste a new token`;
       b.querySelector(".vchip-name")!.textContent = p.name;
       b.querySelector(".vchip-time")!.textContent = this.chipText(p.id);
     }
@@ -156,6 +169,7 @@ export function openTokenPopover(profileId: string, anchor: HTMLElement): void {
   closePop?.();
   const profile = vaults.get(profileId);
   if (!profile) return;
+  const isOidc = profile.tokenSource === "oidc";
   const status = h("div", { class: "vpop-status", "aria-live": "polite" });
   const renewBtn = h("button", { class: "btn sm", type: "button" }, icon("refresh", 13), "Renew");
   const manage = h("button", { class: "btn ghost sm", type: "button" }, "Manage profiles…");
@@ -202,6 +216,7 @@ export function openTokenPopover(profileId: string, anchor: HTMLElement): void {
     st.textContent = statusText(profileId);
     const info = vaults.state(profileId).info;
     renewBtn.style.display = info?.renewable && vaults.effective(profileId) === "valid" ? "" : "none";
+    if (isOidc) signIn.textContent = vaults.effective(profileId) === "valid" ? "Sign in again" : "Sign in with browser";
   };
   const unsub = vaults.subscribe(syncHead);
   renewBtn.onclick = async () => {
@@ -225,11 +240,20 @@ export function openTokenPopover(profileId: string, anchor: HTMLElement): void {
     close();
     openVaultProfilesDialog({ select: profileId });
   };
+  const signIn = h("button", { class: "btn primary sm oidc-signin", type: "button" }, "Sign in with browser");
+  signIn.onclick = async () => {
+    signIn.disabled = true;
+    status.className = "vpop-status busy";
+    status.textContent = "Waiting for browser sign-in…";
+    const ok = await startOidcSignIn(profileId, status);
+    signIn.disabled = false;
+    if (ok) window.setTimeout(close, 1200);
+  };
   const pop = h(
     "div",
-    { class: "vault-pop", role: "dialog", "aria-label": "Replace Vault token for " + profile.name },
+    { class: "vault-pop", role: "dialog", "aria-label": (isOidc ? "Sign in to " : "Replace Vault token for ") + profile.name },
     head,
-    ti.el,
+    isOidc ? signIn : ti.el,
     status,
     h("div", { class: "vpop-foot" }, renewBtn, h("div", { class: "spacer" }), manage),
   );
@@ -242,7 +266,39 @@ export function openTokenPopover(profileId: string, anchor: HTMLElement): void {
   syncHead();
   window.addEventListener("pointerdown", away, true);
   window.addEventListener("keydown", onKey, true);
-  ti.input.focus();
+  if (isOidc) signIn.focus();
+  else ti.input.focus();
+}
+
+// ------------------------------------------------------------------ OIDC sign-in
+
+/**
+ * Starts the browser sign-in of an OIDC profile. Progress / errors go to `status` when given, else to toasts.
+ * Resolves true once signed in (false on error or cancel).
+ */
+export async function startOidcSignIn(profileId: string, status?: HTMLElement): Promise<boolean> {
+  const p = vaults.get(profileId);
+  if (!p) return false;
+  if (!status) toast(`Finish signing in to ${p.name} in your browser…`, "info", 6000);
+  try {
+    const info = await vaults.oidcLogin(profileId);
+    const who = info.displayName ? ` as ${info.displayName}` : "";
+    const ttl = info.ttlSecs === 0 ? "never expires" : "valid for " + fmtRemaining(info.ttlSecs);
+    if (status) {
+      status.className = "vpop-status ok";
+      clear(status);
+      status.append(icon("check", 14), h("span", null, `Signed in${who} · ${ttl}`));
+    } else toast(`Signed in to ${p.name}${who} · ${ttl}`, "ok");
+    return true;
+  } catch (e) {
+    const cancelled = isOidcCancel(e);
+    if (status) {
+      status.className = "vpop-status" + (cancelled ? "" : " err");
+      clear(status);
+      if (!cancelled) status.append(icon("alert", 14), h("span", null, errMsg(e)));
+    } else if (!cancelled) toast(`Sign-in to ${p.name} failed: ${errMsg(e)}`, "error");
+    return false;
+  }
 }
 
 // ------------------------------------------------------------------ global paste prompt

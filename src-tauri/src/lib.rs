@@ -5,6 +5,8 @@ pub mod credentials;
 pub mod db;
 pub mod error;
 pub mod export;
+pub mod federation;
+pub mod fedsql;
 pub mod model;
 pub mod profiles;
 pub mod session;
@@ -23,6 +25,8 @@ pub struct AppState {
     pub sessions: session::SessionRegistry,
     pub profiles: Arc<profiles::Profiles>,
     pub tunnels: Arc<ssh::TunnelManager>,
+    /// The pending Vault OIDC browser sign-in, if any.
+    pub oidc: vault::OidcLogins,
 }
 
 pub fn run() {
@@ -51,6 +55,7 @@ pub fn run() {
                 sessions: session::SessionRegistry::new(),
                 profiles,
                 tunnels,
+                oidc: vault::OidcLogins::new(),
             });
             Ok(())
         })
@@ -101,6 +106,12 @@ pub fn run() {
             commands::kafka_reset_offsets,
             commands::kafka_create_topic,
             commands::kafka_delete_topic,
+            commands::get_settings,
+            commands::save_settings,
+            commands::reconnect_connection,
+            commands::federated_execute,
+            commands::vault_oidc_login,
+            commands::vault_oidc_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DataTrip");

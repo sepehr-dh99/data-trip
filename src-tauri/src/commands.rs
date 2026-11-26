@@ -3,11 +3,11 @@
 use crate::credentials::CredentialSource;
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    AuthMethod, ConnectionConfig, DatabaseNode, Driver, ExportFormat, HistoryEntry,
-    KafkaConsumeRequest, KafkaConsumeResult, KafkaGroupDetail, KafkaOverview, KafkaProduceRequest,
-    KafkaProduceResult, KafkaTopicDetail, ObjectGroup, QueryResult, RedisScanResult, RedisValue,
-    RowEdit, SchemaNode, ServerInfo, SessionInfo, SshCheck, SshProfile, VaultCheck, VaultProfile,
-    VaultTokenInfo,
+    AuthMethod, ConnectionConfig, DatabaseNode, Driver, ExportFormat, FedResult, FedSource,
+    HistoryEntry, KafkaConsumeRequest, KafkaConsumeResult, KafkaGroupDetail, KafkaOverview,
+    KafkaProduceRequest, KafkaProduceResult, KafkaTopicDetail, ObjectGroup, QueryResult,
+    ReconnectResult, RedisScanResult, RedisValue, RowEdit, SchemaNode, ServerInfo, SessionInfo,
+    SshCheck, SshProfile, VaultCheck, VaultProfile, VaultTokenInfo,
 };
 use crate::session::Session;
 use crate::{vault, AppState};
@@ -602,4 +602,106 @@ pub async fn trust_ssh_host(
     fingerprint: String,
 ) -> AppResult<()> {
     state.tunnels.trust_host(&host, port, &fingerprint)
+}
+
+// ----- v0.10: settings, reconnect, cross-source queries, Vault OIDC -----
+
+/// Raw settings object from `<config>/settings.json` (`{}` when none).
+#[tauri::command]
+pub async fn get_settings(state: State<'_, AppState>) -> AppResult<serde_json::Value> {
+    Ok(state.profiles.get_settings().await)
+}
+
+#[tauri::command]
+pub async fn save_settings(
+    state: State<'_, AppState>,
+    settings: serde_json::Value,
+) -> AppResult<()> {
+    state.profiles.save_settings(&settings).await
+}
+
+/// Drops and re-opens the physical connection of every open session of the connection
+/// (fresh Vault credentials and SSH forward); sessions inside a transaction are skipped.
+#[tauri::command]
+pub async fn reconnect_connection(
+    state: State<'_, AppState>,
+    connection_id: String,
+) -> AppResult<ReconnectResult> {
+    let started = Instant::now();
+    let sessions = state.sessions.for_connection(&connection_id);
+    if sessions.is_empty() {
+        return Ok(ReconnectResult {
+            sessions: 0,
+            skipped_in_tx: 0,
+            elapsed_ms: 0,
+        });
+    }
+    // Once for the connection: the first session fetches fresh credentials, the others share them.
+    state.creds.invalidate(&connection_id);
+    let mut done: u32 = 0;
+    let mut skipped: u32 = 0;
+    let mut first_err: Option<AppError> = None;
+    for s in sessions {
+        match s.reconnect().await {
+            Ok(true) => done += 1,
+            Ok(false) => skipped += 1,
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+    Ok(ReconnectResult {
+        sessions: done,
+        skipped_in_tx: skipped,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+/// Runs one SELECT / WITH across several data sources, joined in an in-memory SQLite database.
+#[tauri::command]
+pub async fn federated_execute(
+    state: State<'_, AppState>,
+    sources: Vec<FedSource>,
+    sql: String,
+    max_rows: u32,
+) -> AppResult<FedResult> {
+    crate::federation::federated_execute(
+        &state.store,
+        &state.creds,
+        sources,
+        sql,
+        max_rows as usize,
+    )
+    .await
+}
+
+/// Browser sign-in with Vault's OIDC auth method; stores the token like a pasted one.
+#[tauri::command]
+pub async fn vault_oidc_login(
+    state: State<'_, AppState>,
+    profile_id: String,
+    role: Option<String>,
+) -> AppResult<VaultTokenInfo> {
+    let profile = state.profiles.get_vault(&profile_id).await?;
+    let token = vault::oidc_login(&profile, role, &state.oidc).await?;
+    state.profiles.set_vault_token(&profile.id, &token);
+    for conn_id in state.profiles.connections_using_vault(&profile.id).await? {
+        state.vault_cache.invalidate(&conn_id);
+    }
+    let cfg = vault::config_from_profile(&profile);
+    vault::token_info(&cfg, None, Some(token), false)
+        .await
+        .map_err(|e| token_error(e, &profile.id, &profile.name))
+}
+
+/// Aborts a pending `vault_oidc_login` (it fails with `OIDC_CANCELLED: …`).
+#[tauri::command]
+pub async fn vault_oidc_cancel(state: State<'_, AppState>) -> AppResult<()> {
+    state.oidc.cancel();
+    Ok(())
 }

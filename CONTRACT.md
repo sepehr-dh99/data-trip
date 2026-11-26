@@ -262,3 +262,50 @@ with header still writes the header line.
   MSSQL `[]`); strings single-quoted with `'` doubled; NULL → `NULL`; bool → `TRUE`/`FALSE` (MSSQL: 1/0).
 - **markdown**: `| a | b |` header + `| --- | --- |` (header required: if includeHeader is false, use
   `col1…colN`), cells with `|` → `\|` and newlines → `<br>`, NULL → nullText.
+
+## v0.10 additions — settings, tabs, run gutter, paging, reconnect, cross-source queries, Vault OIDC
+
+Approved designs (read them, they are the spec for look and behavior): `/home/claude/canvas/project/`
+`Settings.dc.html` (I), `ConsoleUX.dc.html` (J), `ResultsGrid.dc.html` (K), `CrossSourceOidc.dc.html` (L).
+
+| command | args | returns |
+|---|---|---|
+| get_settings | – | object (raw JSON; `{}` when none) |
+| save_settings | settings: object | null |
+| reconnect_connection | connectionId | ReconnectResult |
+| federated_execute | sources: FedSource[], sql, maxRows | FedResult |
+| vault_oidc_login | profileId, role: string\|null | VaultTokenInfo |
+| vault_oidc_cancel | – | null |
+
+- **Settings**: stored verbatim in `<config>/settings.json` (atomic write). The frontend owns the shape
+  (`AppSettings` in `src/ui/settings.ts`), merging defaults for missing keys.
+- **reconnect_connection**: for every open session of that connection: invalidate the credential cache, drop the
+  physical connection and reconnect now (fresh Vault credentials, fresh SSH forward) keeping the session id. In a
+  transaction → that session is skipped and reported. `ReconnectResult { sessions: number, skippedInTx: number,
+  elapsedMs: number }`. No open session → `sessions: 0` (frontend then just connects).
+- **federated_execute**: `FedSource { alias: string, connectionId: string, database: string|null }`. The SQL
+  refers to tables as `alias.schema.table` or `alias.table` (alias case-insensitive, `[A-Za-z_][A-Za-z0-9_]*`).
+  For each distinct referenced table the backend pulls rows from that source (a temporary session per source),
+  then loads them into an in-memory SQLite database and runs the query there (SQLite dialect for the outer query;
+  references are rewritten to quoted table names). Pushdown, only when provably safe: projection to the columns
+  referenced as `<tableAlias>.<col>` (none if `*`/unqualified columns appear) and top-level `AND`-ed WHERE
+  conjuncts that reference exactly one table alias and contain no subquery; literals kept verbatim. Pull cap per
+  table: 200 000 rows (exceeding → error naming the table, suggesting a WHERE filter). Only SELECT/WITH.
+  `FedResult { result: QueryResult, plan: FedStep[] }`, `FedStep { alias, connectionId, sourceName, sql,
+  rows, elapsedMs }` — one step per pull plus a last step `{alias:"", sourceName:"DataTrip", sql:"join … (in
+  memory)"}`. Result is read-only. Supported sources: PostgreSQL, MySQL, SQLite, SQL Server.
+- **Vault OIDC**: `VaultTokenSource` gains `"oidc"`; `VaultProfile` gains `oidcMount?: string|null` (default
+  "oidc") and `oidcRole?: string|null`. `vault_oidc_login`: POST `<addr>/v1/auth/<mount>/oidc/auth_url`
+  `{role, redirect_uri:"http://localhost:8250/oidc/callback", client_nonce}`, opens the returned auth_url in the
+  default browser, listens on 127.0.0.1:8250 for `GET /oidc/callback?code&state` (answers a small "You can close
+  this tab" page), then GET `<addr>/v1/auth/<mount>/oidc/callback?code&state&client_nonce` → `auth.client_token`,
+  stored in the keychain exactly like a pasted token; invalidates the cache of connections using the profile;
+  returns `vault_token_info`. Times out after 5 min; `vault_oidc_cancel` aborts a pending login (error
+  `OIDC_CANCELLED`). Port busy → error saying so. Renewal: frontend calls `renew_vault_token` when a renewable
+  OIDC token has < 1/3 of its TTL left (checked every 5 min while the app is open).
+- **Paging** (frontend only): a single SELECT/WITH statement is paged by re-running it wrapped:
+  PG/MySQL/SQLite `SELECT * FROM (<sql>) AS _dt_page LIMIT <n+1> OFFSET <m>`; MSSQL
+  `SELECT * FROM (<sql>) AS _dt_page ORDER BY (SELECT NULL) OFFSET <m> ROWS FETCH NEXT <n+1> ROWS ONLY`
+  (inner trailing `;` removed; inner ORDER BY kept for PG/MySQL/SQLite; MSSQL with inner ORDER BY and no TOP →
+  page 1 only, pager disabled with a tooltip). n+1 rows fetched → "more available". Count rows:
+  `SELECT COUNT(*) FROM (<sql>) AS _dt_count`. Other statements and Redis/Kafka: no pager.

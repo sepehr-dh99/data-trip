@@ -107,6 +107,9 @@ const ICONS: Record<string, string> = {
   up: '<path d="M12 19V5M6 11l6-6 6 6"/>',
   down: '<path d="M12 5v14M6 13l6 6 6-6"/>',
   copyCheck: '<path d="M5 12.500l4.500 4.500L19 7.500"/>',
+  sliders: '<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/>',
+  pin: '<path d="M9 4h6l-1 5 3 3v2H7v-2l3-3zM12 14v6"/>',
+  layers: '<path d="M12 4l8.5 4.5L12 13 3.5 8.5z"/><path d="M3.5 12.500L12 17l8.5-4.500"/>',
 };
 
 export function icon(name: string, size = 16): HTMLSpanElement {

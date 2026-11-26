@@ -6,6 +6,8 @@ import { clear, copyText, debounce, h, icon } from "./dom";
 import { rememberedOptions } from "./exportDialog";
 import { FORMAT_LABEL, formatRows } from "./exportFormat";
 import { showMenu } from "./menu";
+import { getSettings, onSettingsChange, updateSettings } from "./settings";
+import type { PageSize } from "./settings";
 import { toast } from "./toast";
 
 const ROW_H = 34;
@@ -19,6 +21,21 @@ const IS_MAC = /Mac/.test(navigator.userAgent);
 const MODK = IS_MAC ? "⌘" : "Ctrl+";
 const BOOL_TYPE = /^(bool|boolean)$/i;
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
+/** Server-side paging of the shown result (the grid never runs SQL itself; the console does, on the callbacks). */
+export interface PagingState {
+  /** Zero-based offset of the first loaded row. */
+  offset: number;
+  /** Rows per page; 0 = all rows (no paging). */
+  pageSize: number;
+  /** More rows exist after this page. */
+  hasMore: boolean;
+  /** Total row count when known. */
+  total: number | null;
+  /** false: pager shown but disabled (see disabledReason). */
+  enabled: boolean;
+  disabledReason?: string;
+}
 
 export interface GridCallbacks {
   onSubmit(edits: RowEdit[]): Promise<void>;
@@ -66,6 +83,23 @@ export class ResultGrid {
   private opts: GridOptions = {};
   private baseWidths: number[] = [];
   private btnExport!: HTMLButtonElement;
+  // paging
+  private paging: PagingState | null = null;
+  private pageCb: ((offset: number, pageSize: number) => void) | null = null;
+  private countCb: (() => void) | null = null;
+  private pagerEl!: HTMLElement;
+  private pgFirst!: HTMLButtonElement;
+  private pgPrev!: HTMLButtonElement;
+  private pgNext!: HTMLButtonElement;
+  private pgLast!: HTMLButtonElement;
+  private pgRange!: HTMLElement;
+  private pgTotal!: HTMLElement;
+  private pgCount!: HTMLButtonElement;
+  private pgSize!: HTMLButtonElement;
+  private pgPage!: HTMLElement;
+  private offSettings: (() => void) | null = null;
+  private lastMaxCol = 0;
+  private kinds: ("num" | "date" | "bool" | "key" | "text")[] = [];
 
   // data
   private cols: ColumnMeta[] = [];
@@ -181,10 +215,29 @@ export class ResultGrid {
     this.btnNull = btn("Set NULL", () => this.nullSelected(), "", "Set selected cells to NULL");
     this.btnSubmit = btn("Submit", () => void this.submit(), "accent", `Write pending changes to the database (${MODK}S)`);
     this.pendGroup = h("div", { class: "pill-group pending" }, h("span", { class: "pill-sep", "aria-hidden": "true" }), this.pendingEl, this.btnRevert, this.btnDelete, this.btnNull, this.btnSubmit);
+    const pg = (label: string, glyph: string, fn: () => void): HTMLButtonElement =>
+      h("button", { class: "pg-btn", type: "button", title: label, "aria-label": label, onclick: fn }, glyph);
+    this.pgFirst = pg("First page", "|◀", () => this.gotoPage("first"));
+    this.pgPrev = pg("Previous page", "◀", () => this.gotoPage("prev"));
+    this.pgNext = pg("Next page", "▶", () => this.gotoPage("next"));
+    this.pgLast = pg("Last page", "▶|", () => this.gotoPage("last"));
+    this.pgRange = h("b", { class: "pg-range" });
+    this.pgTotal = h("span", { class: "pg-total" });
+    this.pgCount = h("button", { class: "pg-count", type: "button", title: "Count the total rows (runs COUNT(*))", onclick: () => this.countCb?.() }, "Count rows");
+    this.pgPage = h("span", { class: "pg-page" });
+    this.pgSize = h("button", { class: "pg-size", type: "button", "aria-haspopup": "menu", onclick: () => this.openPageSizeMenu() });
+    this.pagerEl = h(
+      "div",
+      { class: "pill-group pager", role: "group", "aria-label": "Pages", hidden: true },
+      h("div", { class: "pg-nav" }, this.pgFirst, this.pgPrev, h("span", { class: "pg-info" }, this.pgRange, this.pgTotal), this.pgCount, this.pgNext, this.pgLast),
+      this.pgPage,
+      this.pgSize,
+    );
     this.pill = h(
       "div",
       { class: "float-pill g-pill", role: "toolbar", "aria-label": "Result" },
       h("span", { class: "pill-stat" }, h("span", { class: "pill-dot", "aria-hidden": "true" }), this.countEl),
+      this.pagerEl,
       this.metaEl,
       this.btnLoadMore,
       this.roChip,
@@ -217,6 +270,116 @@ export class ResultGrid {
       this.fitLast();
       this.schedule();
     }).observe(this.scroller);
+    this.lastMaxCol = getSettings().results.maxColWidth;
+    let seen = false;
+    this.offSettings = onSettingsChange(() => {
+      if (this.el.isConnected) seen = true;
+      else if (seen) return this.destroy();
+      this.onSettings();
+    });
+  }
+
+  /** Stops listening to settings changes (called automatically once the grid has left the document). */
+  destroy(): void {
+    this.offSettings?.();
+    this.offSettings = null;
+  }
+
+  private onSettings(): void {
+    const max = getSettings().results.maxColWidth;
+    if (max !== this.lastMaxCol && this.cols.length) {
+      this.lastMaxCol = max;
+      this.widths = this.cols.map((c, i) => Math.max(this.autoWidth(c, i), this.opts.minWidths?.[i] ?? 0));
+      this.baseWidths = [...this.widths];
+      this.buildHeader();
+      this.fitLast();
+      this.body.style.width = this.totalW() + "px";
+      this.headEl.style.width = this.totalW() - this.rnW + "px";
+    }
+    this.lastMaxCol = max;
+    this.fullRefill = true;
+    this.schedule();
+    this.updateBar();
+  }
+
+  // ---------------------------------------------------------------- paging
+
+  /** Shows (or with null, hides) the pager. The console owns the SQL: it calls this after every page it loads. */
+  setPaging(p: PagingState | null): void {
+    this.paging = p;
+    if (p) this.rnW = Math.max(RN_MIN, String(p.offset + this.rows.length).length * 7 + 22);
+    this.cornerEl.style.width = this.rnW + "px";
+    this.body.style.width = this.totalW() + "px";
+    this.headEl.style.width = this.totalW() - this.rnW + "px";
+    this.fullRefill = true;
+    this.schedule();
+    this.updateBar();
+  }
+
+  /** `cb(offset, pageSize)`: a page was requested (pageSize 0 = all rows; a size change comes with offset 0). */
+  onPage(cb: (offset: number, pageSize: number) => void): void {
+    this.pageCb = cb;
+  }
+
+  /** "Count rows" was clicked: run the COUNT(*) and report it through setPaging({ total }). */
+  onCountRows(cb: () => void): void {
+    this.countCb = cb;
+  }
+
+  private gotoPage(where: "first" | "prev" | "next" | "last"): void {
+    const p = this.paging;
+    if (!p || !p.enabled || p.pageSize <= 0) return;
+    let off = p.offset;
+    if (where === "first") off = 0;
+    else if (where === "prev") off = Math.max(0, p.offset - p.pageSize);
+    else if (where === "next") off = p.offset + p.pageSize;
+    else if (p.total !== null) off = Math.max(0, Math.ceil(p.total / p.pageSize) - 1) * p.pageSize;
+    if (off !== p.offset) this.pageCb?.(off, p.pageSize);
+  }
+
+  private openPageSizeMenu(): void {
+    const p = this.paging;
+    if (!p) return;
+    const r = this.pgSize.getBoundingClientRect();
+    const items = ([100, 500, 1000, 0] as PageSize[]).map((n) => ({
+      label: n === 0 ? "All (careful)" : n.toLocaleString(),
+      checked: p.pageSize === n,
+      onClick: () => {
+        updateSettings((s) => {
+          s.results.pageSize = n;
+        });
+        if (n !== p.pageSize) this.pageCb?.(0, n);
+      },
+    }));
+    showMenu(r.left, r.top - 6, items, { above: true, minWidth: Math.max(150, r.width) });
+  }
+
+  private updatePager(): void {
+    const p = this.paging;
+    this.pagerEl.hidden = !p;
+    this.countEl.hidden = !!p;
+    if (!p) return;
+    const n = this.rows.length;
+    const fmtN = (x: number): string => x.toLocaleString();
+    const first = n === 0 ? 0 : p.offset + 1;
+    const last = p.offset + n;
+    const all = p.pageSize <= 0;
+    this.pgRange.textContent = n === 0 ? "0 rows" : first === last ? fmtN(first) : `${fmtN(first)}–${fmtN(last)}`;
+    const unknown = p.total === null && p.hasMore;
+    this.pgTotal.textContent = all && p.total === null ? "" : n === 0 && p.offset === 0 ? "" : ` of ${p.total !== null ? fmtN(p.total) : fmtN(last) + (p.hasMore ? "+" : "")}`;
+    this.pgCount.hidden = !(unknown && p.enabled && !all);
+    const off = !p.enabled || all;
+    const canNext = !off && (p.total !== null ? p.offset + p.pageSize < p.total : p.hasMore);
+    const canPrev = !off && p.offset > 0;
+    this.pgFirst.disabled = this.pgPrev.disabled = !canPrev;
+    this.pgNext.disabled = !canNext;
+    this.pgLast.disabled = !canNext || p.total === null;
+    const pages = p.total !== null && p.pageSize > 0 ? Math.max(1, Math.ceil(p.total / p.pageSize)) : null;
+    const page = p.pageSize > 0 ? Math.floor(p.offset / p.pageSize) + 1 : 1;
+    this.pgPage.textContent = all ? "" : `Page ${page} of ${pages !== null ? fmtN(pages) : "?"}`;
+    this.pgSize.textContent = (all ? "All" : fmtN(p.pageSize)) + " / page ▾";
+    this.pagerEl.title = !p.enabled && p.disabledReason ? p.disabledReason : "";
+    this.pagerEl.classList.toggle("off", !p.enabled);
   }
 
   /** Read-only presentation tweaks; call before setResult. */
@@ -267,7 +430,8 @@ export class ResultGrid {
     this.submitting = false;
     this.numeric = this.cols.map((c) => NUMERIC_TYPE.test(c.typeName));
     this.colCls = this.cols.map((c, i) => (this.numeric[i] ? " num" : TEMPORAL_TYPE.test(c.typeName) ? " t" : ""));
-    this.rnW = Math.max(RN_MIN, String(this.rows.length).length * 7 + 22);
+    this.kinds = this.cols.map((c, i) => this.kindOf(c, i));
+    this.rnW = Math.max(RN_MIN, String((this.paging ? this.paging.offset : 0) + this.rows.length).length * 7 + 22);
     const keep = this.widths.length === this.cols.length && this.sortCol >= 0 ? this.sortCol : -1;
     this.widths = this.cols.map((c, i) => Math.max(this.autoWidth(c, i), this.opts.minWidths?.[i] ?? 0));
     this.baseWidths = [...this.widths];
@@ -292,15 +456,25 @@ export class ResultGrid {
     this.scroller.focus({ preventScroll: true });
   }
 
+  /** Value-color class of a column: keys (primary key / id-like names), numbers, dates, booleans or plain text. */
+  private kindOf(c: ColumnMeta, i: number): "num" | "date" | "bool" | "key" | "text" {
+    const pk = !!this.ctx && this.ctx.colMap[i] !== null && this.ctx.pk.includes(this.ctx.colMap[i] as string);
+    if (pk || /^(id|uuid|guid|pk)$|(_|^)(id|uuid|guid|key)$|[a-z]Id$/.test(c.name)) return "key";
+    if (BOOL_TYPE.test(c.typeName)) return "bool";
+    if (this.numeric[i]) return "num";
+    if (TEMPORAL_TYPE.test(c.typeName)) return "date";
+    return "text";
+  }
+
   private autoWidth(c: ColumnMeta, i: number): number {
     let len = c.name.length + 3;
     const n = Math.min(this.rows.length, 60);
     for (let r = 0; r < n; r++) {
       const v = this.rows[r][i];
-      const l = v === null ? 4 : String(v).length;
+      const l = v === null ? getSettings().results.nullText.length : String(v).length;
       if (l > len) len = l;
     }
-    return Math.max(80, Math.min(360, Math.round(len * (this.numeric[i] ? 7.6 : 7.9) + (this.numeric[i] ? 34 : 26))));
+    return Math.max(80, Math.min(getSettings().results.maxColWidth, Math.round(len * (this.numeric[i] ? 7.6 : 7.9) + (this.numeric[i] ? 34 : 26))));
   }
 
   private totalW(): number {
@@ -324,7 +498,7 @@ export class ResultGrid {
   }
 
   private fmt(v: Cell): string {
-    if (v === null) return "NULL";
+    if (v === null) return getSettings().results.nullText;
     if (typeof v === "string") return v.length > 400 ? v.slice(0, 400) + "…" : v;
     return String(v);
   }
@@ -415,7 +589,7 @@ export class ResultGrid {
       const hc = h(
         "div",
         { class: "g-hc" + (this.numeric[i] ? " num" : ""), role: "columnheader", style: `width:${this.widths[i]}px`, title: `${col.name} — ${col.typeName}${isPk ? " · primary key" : ""}\n${this.serverSort ? "Click to sort (ASC, DESC, off) · Shift+click to add a column" : "Click to sort"}` },
-        h("div", { class: "g-hc-main" }, isPk ? icon("key", 11) : null, h("span", { class: "g-hc-name" }, col.name), sortMark),
+        h("div", { class: "g-hc-main" }, isPk ? icon("key", 11) : null, h("span", { class: "g-hc-name" }, col.name), h("span", { class: "g-hc-type" }, col.typeName), sortMark),
       );
       (hc as HTMLElement & { _sort?: HTMLElement })._sort = sortMark;
       hc.addEventListener("click", (e) => {
@@ -591,7 +765,7 @@ export class ResultGrid {
         (rowSel ? " rowsel" + (i === sel.r0 ? " r0" : "") + (i === sel.r1 ? " r1" : "") : "");
       const rn = row._rn as HTMLDivElement;
       rn.style.width = this.rnW + "px";
-      rn.textContent = isNew ? "+" : String(ri + 1);
+      rn.textContent = isNew ? "+" : String(ri + 1 + (this.paging ? this.paging.offset : 0));
       const ov = this.overrides.get(ri);
       const cells = row._cells as HTMLDivElement[];
       for (let c = 0; c < ncol; c++) {
@@ -599,6 +773,7 @@ export class ResultGrid {
         const v = this.getCell(ri, c);
         let cls = "g-cell" + this.colCls[c];
         if (v === null) cls += " null";
+        else cls += typeof v === "boolean" ? " k-bool" : " k-" + this.kinds[c];
         if (ov && ov.has(c)) cls += " dirty";
         else if (isNew && this.inserts[ri - n].touched.has(c)) cls += " dirty";
         if (sel && rowSel && c >= sel.c0 && c <= sel.c1) {
@@ -1124,6 +1299,7 @@ export class ResultGrid {
   // ---------------------------------------------------------------- toolbar state
 
   private updateBar(): void {
+    this.updatePager();
     const total = this.rows.length + this.inserts.length;
     const shown = this.order.length;
     this.countEl.textContent = this.opts.countLabel

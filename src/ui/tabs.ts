@@ -11,6 +11,10 @@ export interface TabPane {
   readonly isRunning: boolean;
   /** Redis key tabs: icon name + type color class for the tab strip. */
   readonly tabIcon?: { icon: string; cls: string };
+  /** Consoles opened on a table / view: its name (tab names "orders · shop"). */
+  readonly table?: string | null;
+  /** Unsaved work (pending grid edits, open manual transaction): the tab shows a dot. */
+  readonly dirty?: boolean;
   /** Kafka topic / group tabs: what the capsule's second breadcrumb segment shows. */
   readonly objectLabel?: { glyph: "topic" | "group"; name: string };
   focus(): void;
