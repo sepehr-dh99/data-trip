@@ -15,6 +15,7 @@ pub mod profiles;
 pub mod session;
 pub mod ssh;
 pub mod store;
+pub mod updater;
 pub mod vault;
 
 use std::sync::Arc;
@@ -36,6 +37,7 @@ pub fn run() {
     // macOS: native menu bar (custom items emit the "menu" event); Windows / Linux: none.
     app_menu::with_app_menu(tauri::Builder::default())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
             let data_dir = app.path().app_data_dir()?;
@@ -53,6 +55,7 @@ pub fn run() {
                 tunnels.clone(),
             );
             app.manage(ai::AiState::default());
+            app.manage(updater::UpdaterState::default());
             app.manage(AppState {
                 store,
                 vault_cache,
@@ -126,6 +129,11 @@ pub fn run() {
             ai::ai_generate,
             ai::ai_cancel,
             ai::ai_set_api_key,
+            updater::update_status,
+            updater::update_check,
+            updater::update_download,
+            updater::update_install,
+            updater::update_open_page,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DataTrip");

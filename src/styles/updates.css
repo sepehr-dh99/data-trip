@@ -1,0 +1,133 @@
+/* In-app update card (board Q) — bottom-right corner, above everything but dialogs. */
+.upd-card {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 900;
+  width: 380px;
+  box-sizing: border-box;
+  padding: 16px;
+  border-radius: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--pop-bg, rgba(44, 43, 50, 0.96));
+  backdrop-filter: blur(24px) saturate(160%);
+  -webkit-backdrop-filter: blur(24px) saturate(160%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), inset 0 0 0 0.5px rgba(255, 255, 255, 0.08), 0 20px 60px rgba(0, 0, 0, 0.55);
+  color: var(--text, #f2f2f5);
+  font-size: 13px;
+}
+.upd-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.upd-logo {
+  display: flex;
+}
+.upd-titles {
+  flex: 1;
+  min-width: 0;
+}
+.upd-title {
+  font-weight: 600;
+}
+.upd-sub,
+.upd-progress {
+  font-size: 11.5px;
+  color: var(--text-2, #a6a6ae);
+}
+.upd-x {
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-3, #8e8e96);
+  cursor: pointer;
+}
+.upd-x:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+.upd-notes {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--text-1, #d8d8de);
+}
+.upd-text {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--text-1, #d8d8de);
+}
+.upd-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.upd-spacer {
+  flex: 1;
+}
+.upd-primary,
+.upd-secondary {
+  height: 32px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 999px;
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.upd-primary {
+  background: var(--accent, #ff1a3c);
+  color: #fff;
+  font-weight: 600;
+}
+.upd-primary:hover {
+  background: var(--accent-hover, #ff3a57);
+}
+.upd-secondary {
+  background: rgba(118, 118, 128, 0.24);
+  color: var(--text, #f2f2f5);
+}
+.upd-secondary:hover {
+  background: rgba(118, 118, 128, 0.36);
+}
+.upd-link {
+  border: 0;
+  background: transparent;
+  color: var(--accent-text, #ff9aab);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.upd-bar {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+.upd-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent, #ff1a3c);
+  transition: width 0.2s ease;
+}
+.upd-fill.indeterminate {
+  width: 35%;
+  animation: upd-slide 1.2s ease-in-out infinite;
+}
+@keyframes upd-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(290%);
+  }
+}
+.st-upd-note {
+  padding: 4px 16px;
+  line-height: 17px;
+}

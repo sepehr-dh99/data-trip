@@ -157,3 +157,22 @@ DataTrip is released under the [MIT License](LICENSE).
 Every push runs a quick check (type-check, web build, `cargo check`, clippy). The installers for macOS,
 Windows and Linux are built only for a version tag (`v*`, which also creates a draft release), for a manual
 run (GitHub › Actions › release › Run workflow), or for a push whose commit message contains `[build]`.
+
+## In-app updates
+
+DataTrip checks its GitHub releases on launch and once a day, shows a card when a newer version is out,
+downloads it in the background and restarts into it (Settings › Updates; Help › Check for updates…).
+Downloads are verified with the project's update signing key, so this needs a one-time setup:
+
+1. Generate a key pair (choose a password when asked):
+   `npx @tauri-apps/cli signer generate -w ~/.tauri/datatrip.key`
+2. In GitHub › Settings › Secrets and variables › Actions add:
+   - secret `TAURI_SIGNING_PRIVATE_KEY`: the contents of `~/.tauri/datatrip.key`
+   - secret `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: the password
+   - variable `TAURI_UPDATER_PUBKEY`: the contents of `~/.tauri/datatrip.key.pub`
+3. Build a release from a tag as usual, then **publish** the draft release: the updater only sees
+   published releases (it reads the `latest.json` file CI attaches to them). Pre-releases are offered
+   only to users who turn on "Include pre-releases".
+
+Keep the private key safe: every future update must be signed with the same key. Builds made without these
+settings still work, with the updater turned off. On Linux, updates install for the AppImage.

@@ -104,6 +104,8 @@ fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<R>> {
         .text("helpShortcuts", "Keyboard shortcuts…")
         .text("crossSourceGuide", "Cross-source queries guide")
         .text("helpPalette", "Command palette…")
+        .separator()
+        .text("checkUpdates", "Check for updates…")
         .build()?;
     MenuBuilder::new(app)
         .items(&[&datatrip, &file, &edit, &view, &console, &window, &help])

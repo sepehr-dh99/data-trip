@@ -133,16 +133,36 @@ jobs:
       - name: Install npm dependencies
         run: npm install
 
+      # In-app updates: with the signing key secret present, builds also produce signed update
+      # bundles and tauri-action attaches latest.json to the release. Without it, builds work as
+      # before and the app's updater stays off.
+      - name: Updater signing (when configured)
+        id: updater
+        shell: bash
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "args=--config src-tauri/tauri.updater.conf.json" >> "$GITHUB_OUTPUT"
+          else
+            echo "No TAURI_SIGNING_PRIVATE_KEY secret: building without update signatures."
+          fi
+
       - name: Build and (for tags) draft release
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Public key compiled into the app to verify downloaded updates (repository variable).
+          DATATRIP_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
         with:
           tagName: ${{ startsWith(github.ref, 'refs/tags/') && 'v__VERSION__' || '' }}
           releaseName: ${{ startsWith(github.ref, 'refs/tags/') && 'DataTrip v__VERSION__' || '' }}
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.args }}
+          includeUpdaterJson: true
+          args: ${{ matrix.args }} ${{ steps.updater.outputs.args }}
 
       - name: Upload installers as workflow artifacts
         uses: actions/upload-artifact@v4

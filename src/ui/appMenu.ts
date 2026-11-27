@@ -46,7 +46,8 @@ export type MenuCommand =
   | "jumpToTab"
   | "crossSourceGuide"
   | "helpShortcuts"
-  | "helpPalette";
+  | "helpPalette"
+  | "checkUpdates";
 
 export interface AppMenuEntry {
   id?: MenuCommand;

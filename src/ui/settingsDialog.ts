@@ -12,8 +12,9 @@ import type { AppSettings, EditorFont, KeymapPreset, LineHeight, PageSize } from
 import { THEMES, TOKEN_KEYS, TOKEN_PALETTE } from "./themes";
 import type { TokenKey } from "./themes";
 import { buildAiSettings } from "./aiSettings";
+import { checkForUpdates, onUpdateState, updateState } from "./updates";
 
-export type SettingsSection = "editor" | "appearance" | "results" | "tabs" | "keymap" | "data" | "ai";
+export type SettingsSection = "editor" | "appearance" | "results" | "tabs" | "keymap" | "data" | "ai" | "updates";
 
 interface SectionDef {
   id: SettingsSection;
@@ -30,6 +31,7 @@ const SECTIONS: SectionDef[] = [
   { id: "tabs", label: "Console tabs", short: "Tb", color: "#ff9f0a", sub: "Placement, sorting and names" },
   { id: "keymap", label: "Keymap", short: "Km", color: "#30b0c7", sub: "Keyboard shortcuts" },
   { id: "data", label: "Data & history", short: "Dh", color: "#34c759", sub: "History, safety and reconnects" },
+  { id: "updates", label: "Updates", short: "Up", color: "#64d2ff", sub: "Version, checking and installing updates" },
   { id: "ai", label: "AI assistant", short: "AI", color: "#bf5af2", sub: "Codex, Claude Code, API key or Ollama · what is sent" },
 ];
 
@@ -117,6 +119,7 @@ class SettingsWindow {
     this.buildTabs();
     this.buildKeymap();
     this.buildData();
+    this.buildUpdates();
     this.section("ai", buildAiSettings({
       row: (t, d, c, x) => this.row(t, d, c, x),
       toggle: (l, g, st) => this.toggle(l, g, st),
@@ -216,6 +219,7 @@ class SettingsWindow {
       else if (id === "keymap") s.keymap = d.keymap;
       else if (id === "data") s.data = d.data;
       else if (id === "ai") s.ai = d.ai;
+      else if (id === "updates") s.updates = d.updates;
       else {
         s.tabs.placement = d.tabs.placement;
         s.tabs.sort = d.tabs.sort;
@@ -573,6 +577,38 @@ class SettingsWindow {
     const clearBtn = h("button", { class: "st-pill", type: "button", onclick: () => void this.clearHistory(clearBtn) }, "Clear history…");
     const wipe = this.row("Clear query history", "Delete every entry of every data source from the History panel", clearBtn, "delete remove history");
     this.section("data", [keep, restore, confirm, auto, wipe]);
+  }
+
+  // ------------------------------------------------------------------ Updates
+
+  private buildUpdates(): void {
+    const S = (): AppSettings => getSettings();
+    const ver = h("div", { class: "st-row-title" });
+    const line = h("div", { class: "st-row-desc" });
+    const btn = h("button", { class: "st-pill", type: "button", onclick: () => void checkForUpdates(true) }, "Check for updates");
+    const head: Item = { el: h("div", { class: "st-row" }, h("div", { class: "st-row-text" }, ver, line), btn), text: "version check for updates now" };
+    const paint = (): void => {
+      const u = updateState();
+      ver.textContent = `DataTrip ${u.status?.currentVersion ?? ""}`;
+      btn.disabled = !u.status?.configured || u.phase === "checking" || u.phase === "downloading";
+      btn.textContent = u.phase === "checking" ? "Checking…" : "Check for updates";
+      if (!u.status?.configured) line.textContent = "Updates aren't set up for this build (it has no update signing key).";
+      else if (u.phase === "available" || u.phase === "downloading") line.textContent = `${u.info?.version} is available — see the card in the corner`;
+      else if (u.phase === "ready") line.textContent = `${u.info?.version} is downloaded — restart to finish`;
+      else if (u.phase === "error") line.textContent = `Last check failed: ${u.error}`;
+      else if (u.lastCheck) line.textContent = `Last checked ${new Date(u.lastCheck).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} · you're up to date`;
+      else line.textContent = "Not checked yet";
+    };
+    onUpdateState(paint);
+    this.syncs.push(paint);
+    const auto = this.row("Check for updates automatically", "On launch and once a day while DataTrip is open", this.toggle("Check automatically", () => S().updates.auto, (v) => updateSettings((s) => (s.updates.auto = v))));
+    const bg = this.row("Download updates in the background", "Then only a restart is needed; off = ask first", this.toggle("Download in the background", () => S().updates.background, (v) => updateSettings((s) => (s.updates.background = v))));
+    const pre = this.row("Include pre-releases", "Get beta versions before they are final", this.toggle("Include pre-releases", () => S().updates.prerelease, (v) => updateSettings((s) => (s.updates.prerelease = v))));
+    const note: Item = {
+      el: h("div", { class: "st-row-desc st-upd-note" }, "Updates come from DataTrip's GitHub releases and are verified with its signing key before they are installed. Also in Help › Check for updates… and the command palette."),
+      text: "github releases signing key",
+    };
+    this.section("updates", [head, auto, bg, pre, note]);
   }
 
   private async clearHistory(btn: HTMLButtonElement): Promise<void> {

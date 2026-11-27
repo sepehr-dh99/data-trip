@@ -68,6 +68,17 @@ export interface AppSettings {
     confirmRisky: boolean;
     autoReconnect: boolean;
   };
+  /** In-app updates (v0.14). */
+  updates: {
+    /** Check on launch and once a day while open. */
+    auto: boolean;
+    /** Download a found update without asking (then only a restart is needed). */
+    background: boolean;
+    /** Offer pre-releases too. */
+    prerelease: boolean;
+    /** Version the user dismissed with "Later" (not offered again until a newer one). */
+    skipped: string;
+  };
   /** AI assistant in SQL consoles (v0.12). */
   ai: {
     provider: AiProvider;
@@ -111,6 +122,7 @@ export function defaultSettings(): AppSettings {
     tabs: { placement: "top", sort: "manual", group: "source", naming: "table", customGroups: [], pinned: [] },
     keymap: { preset: "datatrip", overrides: {} },
     data: { historyDays: 90, restoreConsoles: true, confirmRisky: true, autoReconnect: true },
+    updates: { auto: true, background: false, prerelease: false, skipped: "" },
     ai: { provider: "codex", model: "", baseUrl: "", ollamaModel: "", autoTables: true, samples: false, blockProd: true },
   };
 }
@@ -137,6 +149,7 @@ export function mergeSettings(raw: unknown): AppSettings {
   const k = isObj(raw.keymap) ? raw.keymap : {};
   const x = isObj(raw.data) ? raw.data : {};
   const ai = isObj(raw.ai) ? raw.ai : {};
+  const up = isObj(raw.updates) ? raw.updates : {};
 
   const tokenColors: Partial<Record<TokenKey, string>> = {};
   if (isObj(e.tokenColors)) {
@@ -200,6 +213,12 @@ export function mergeSettings(raw: unknown): AppSettings {
       restoreConsoles: bool(x.restoreConsoles, d.data.restoreConsoles),
       confirmRisky: bool(x.confirmRisky, d.data.confirmRisky),
       autoReconnect: bool(x.autoReconnect, d.data.autoReconnect),
+    },
+    updates: {
+      auto: bool(up.auto, d.updates.auto),
+      background: bool(up.background, d.updates.background),
+      prerelease: bool(up.prerelease, d.updates.prerelease),
+      skipped: str(up.skipped, d.updates.skipped),
     },
     ai: {
       provider: oneOf<AiProvider>(ai.provider, ["codex", "claude", "opencode", "openai", "ollama"], d.ai.provider),

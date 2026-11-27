@@ -39,6 +39,7 @@ import { VAULT_TOKEN_RE, vaults } from "./vault";
 import { showTokenPastePrompt } from "./vaultChips";
 import { getSettings, onSettingsChange, updateSettings } from "./settings";
 import { RestoredPane, WorkspaceSaver, loadWorkspace } from "./workspace";
+import { checkForUpdates, initUpdates, setBeforeRestart } from "./updates";
 import type { Workspace, WsTab } from "./workspace";
 
 const IS_MAC = /Mac/.test(navigator.userAgent);
@@ -184,6 +185,9 @@ export class App {
     // macOS: the native menu bar (lib.rs) sends the clicked item's id.
     listenNativeMenu((id) => this.runCommand(id));
     window.addEventListener("paste", (e) => this.onPaste(e));
+    // In-app updates: the open tabs are saved right before an update restarts the app.
+    setBeforeRestart(() => this.saver.flush());
+    void initUpdates();
   }
 
   private inEditable(t: EventTarget | null): boolean {
@@ -924,6 +928,9 @@ export class App {
       case "helpPalette":
         this.openCommandPalette();
         return;
+      case "checkUpdates":
+        void checkForUpdates(true);
+        return;
       case "runStatement":
         if (needConsole()) void c?.runCurrent();
         return;
@@ -1064,6 +1071,7 @@ export class App {
     act("newCrossSource", "New cross-source console", "layers", "", "federated join several data sources");
     act("attachSource", "Attach source to this console…", "layers", "", "cross-source federated", !c || c.isLineBased);
     act("crossSourceGuide", "How do cross-source queries work?", "layers", "", "guide help example");
+    act("checkUpdates", "Check for updates…", "refresh", "", "update upgrade new version release");
     act("reconnect", curName ? `Reconnect ${curName}` : "Reconnect data source", "refresh", k("reconnect"), "connection", !cur);
     act("formatSql", "Format SQL", "sort", k("formatSql"), "beautify pretty", !c || c.isLineBased);
     act("newConsole", "New console", "terminal", k("newConsole"));
@@ -1212,6 +1220,7 @@ export class App {
           { id: "keyboardShortcuts", label: "Keyboard shortcuts…" },
           { id: "crossSourceGuide", label: "Cross-source queries guide" },
           { id: "commandPalette", label: "Command palette…", hint: k("commandPalette") },
+          { id: "checkUpdates", label: "Check for updates…" },
         ],
       },
     ];

@@ -637,3 +637,21 @@ commands; `federated_execute` keeps its signature (v0.10) with new naming rules,
   24 000 characters are written to `request.md` in that dir and the model is asked to read it (Windows command
   lines are capped at 32 767 chars). Signed in = `$XDG_DATA_HOME/opencode/auth.json` (default
   `~/.local/share/opencode`) exists. Also found in `~/.opencode/bin`.
+
+## v0.14 — in-app updates
+
+| command | args | returns |
+|---|---|---|
+| update_status | – | UpdateStatus `{configured, currentVersion, platform}` |
+| update_check | includePre | UpdateInfo `{version, currentVersion, notes, date, url}` \| null |
+| update_download | – | null (emits `update-progress` `{downloaded, total}`) |
+| update_install | restart | null (restart = relaunch now; Windows always relaunches) |
+| update_open_page | url (must be a github.com/sepehr-dh99/data-trip/ page) | null |
+
+- tauri-plugin-updater. The manifest is the `latest.json` asset of the newest non-draft GitHub release
+  (pre-releases only with includePre). The minisign public key is compiled in from the build env
+  `DATATRIP_UPDATER_PUBKEY` (CI: repository variable `TAURI_UPDATER_PUBKEY`); without it `configured` is false
+  and checks are refused. CI signs update bundles only when the `TAURI_SIGNING_PRIVATE_KEY` secret exists
+  (merging `src-tauri/tauri.updater.conf.json` → `bundle.createUpdaterArtifacts`).
+- Settings `updates { auto, background, prerelease, skipped }`; the frontend (src/ui/updates.ts) checks 6 s
+  after launch and hourly when the last check is older than a day; "Later" skips that version until a newer one.

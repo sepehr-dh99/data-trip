@@ -463,3 +463,18 @@ export interface AiResult {
   elapsedMs: number;
   provider: AiProviderId;
 }
+
+// ── v0.14: in-app updates ──
+export interface UpdateStatus {
+  configured: boolean;
+  currentVersion: string;
+  platform: "macos" | "windows" | "linux";
+}
+
+export interface UpdateInfo {
+  version: string;
+  currentVersion: string;
+  notes: string | null;
+  date: string | null;
+  url: string;
+}

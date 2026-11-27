@@ -33,6 +33,8 @@ import type {
   AiProviderStatus,
   AiRequest,
   AiResult,
+  UpdateStatus,
+  UpdateInfo,
 } from "./types";
 
 /** Normalizes any thrown value from invoke() into an Error with a readable message. */
@@ -188,4 +190,10 @@ export const api = {
   aiCancel: () => call<null>("ai_cancel"),
   /** Stores (or with null clears) the OpenAI-compatible API key in the keychain; it is never read back. */
   aiSetApiKey: (key: string | null) => call<null>("ai_set_api_key", { key }),
+  // ── v0.14: in-app updates ──
+  updateStatus: () => call<UpdateStatus>("update_status"),
+  updateCheck: (includePre: boolean) => call<UpdateInfo | null>("update_check", { includePre }),
+  updateDownload: () => call<null>("update_download"),
+  updateInstall: (restart: boolean) => call<null>("update_install", { restart }),
+  updateOpenPage: (url: string) => call<null>("update_open_page", { url }),
 };
