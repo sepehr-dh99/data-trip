@@ -22,7 +22,7 @@ import { closeLookPicker, openLookPicker } from "./lookPicker";
 import { promptDialog } from "./prompt";
 import { confirmDialog } from "./confirm";
 import type { TNode } from "./redis";
-import { KeyTrie, dbLabel, leafName, parseTtlInput, redisDbMeta, ttlLong, ttlShort, typeInfo } from "./redis";
+import { KeyTrie, dbLabel, leafName, parseTtlInput, redisDbMeta, sentinelLabel, ttlLong, ttlShort, typeInfo } from "./redis";
 import { collate, forgetOverview, loadOverview, onOverview, overviewOf, overviewState, stateClass, stateLabel } from "./kafka";
 import { deleteTopicFlow, openCreateTopicDialog } from "./kafkaDialogs";
 import { handleActionError } from "./recovery";
@@ -33,9 +33,13 @@ import { VaultChips } from "./vaultChips";
 import { openVaultProfilesDialog } from "./vaultDialog";
 import { getSettings, onSettingsChange, updateSettings } from "./settings";
 import { openSettings } from "./settingsDialog";
-import { shortcutLabel } from "./keymap";
+import { formatBinding, shortcutLabel } from "./keymap";
+import { FED_DRIVERS, TABLE_DRAG_MIME, setTableDrag } from "./federation";
+import type { TableDrag } from "./federation";
 
 const OVERSCAN = 8;
+const GEAR_PATH =
+  "M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z";
 /** Indent (px) per tree depth: compact = 12 per level (spec); comfortable keeps 0 / 16 / 30, then +14. */
 const indentOf = (d: number, density: Density): number => (density === "compact" ? d * 12 : d <= 0 ? 0 : 16 + (d - 1) * 14);
 const DRAG_MIME = "application/x-datatrip-conn";
@@ -80,6 +84,12 @@ export interface ExplorerHost {
   produceTo(connId: string, topic: string): void;
   /** Kafka: a topic was deleted from the explorer (its tab closes). */
   topicDeleted(connId: string, topic: string): void;
+  /** Sidebar toolbar: Query history. */
+  toggleHistory(): void;
+  /** Sidebar toolbar: the ⌘K pill. */
+  openPalette(): void;
+  /** Multi-selection → "New cross-source console (N sources)": SQL data sources, in selection order. */
+  newCrossSource(connIds: string[]): void;
 }
 
 /** Per (connection, database) Redis scan state behind the namespace tree. */
@@ -135,6 +145,10 @@ interface RowSpec {
   dropFolder?: string;
   /** Layout key ("conn:<id>" / "folder:<name>") of a row that can be dragged and reordered. */
   dragKey?: string;
+  /** A table / view row: dragged into a console it inserts its name (attaching its data source when needed). */
+  dragTable?: TableDrag;
+  /** Connection id of a connection row (⌘/Ctrl-click multi-selection). */
+  multiConn?: string;
   /** Folder appearance: icon stroked and name tinted in the folder's color. */
   look?: { color: string | null; icon: string | null };
 }
@@ -180,6 +194,8 @@ export class Explorer {
   private dropLine: HTMLElement = h("div", { class: "drop-line", "aria-hidden": "true", hidden: true });
   private density: Density = getDensity();
   private rowH = ROW_HEIGHT[getDensity()];
+  /** ⌘/Ctrl-click multi-selection of data sources, in the order they were picked. */
+  private multi: string[] = [];
 
   constructor(private host: ExplorerHost) {
     this.filterInput = h("input", {
@@ -223,35 +239,10 @@ export class Explorer {
         this.paintWindow(false);
       });
     });
+    // The + only adds a data source; everything else lives in the toolbar at the bottom, the menu and ⌘K.
     const addBtn = h(
       "button",
-      {
-        class: "side-plus",
-        type: "button",
-        title: "New data source",
-        "aria-label": "New data source",
-        "aria-haspopup": "menu",
-        onclick: (ev: MouseEvent) => {
-          const r = (ev.currentTarget as HTMLElement).getBoundingClientRect();
-          showMenu(
-            r.right - 230,
-            r.bottom + 6,
-            [
-              { label: "New connection…", icon: "plus", onClick: () => host.addConnection() },
-              { label: "Import from DataGrip…", icon: "download", onClick: () => host.importDataGrip() },
-              { sep: true },
-              { label: "Vault profiles…", icon: "key", onClick: () => openVaultProfilesDialog() },
-              { label: "SSH configurations…", icon: "server", onClick: () => openSshProfilesDialog() },
-              { sep: true },
-              { label: "Density: Compact", checked: this.density === "compact", onClick: () => this.setDensity("compact") },
-              { label: "Density: Comfortable", checked: this.density === "comfortable", onClick: () => this.setDensity("comfortable") },
-              { sep: true },
-              { label: "Settings…", icon: "sliders", hint: shortcutLabel("settings"), onClick: () => openSettings() },
-            ],
-            { minWidth: 230 },
-          );
-        },
-      },
+      { class: "side-plus", type: "button", title: "New connection", "aria-label": "New connection", onclick: () => host.addConnection() },
       icon("plus", 14),
     );
     // macOS draws the traffic lights over this strip (titleBarStyle Overlay); it doubles as a drag handle and
@@ -271,6 +262,7 @@ export class Explorer {
       ),
       new VaultChips().el,
       this.tree,
+      this.toolbar(),
     );
     this.el.setAttribute("aria-label", "Explorer");
     this.applyDensity();
@@ -437,11 +429,12 @@ export class Explorer {
       // Every connection shows a disclosure triangle: on an idle one it connects first.
       expandable: e.status !== "error" || connected,
       cls: "conn " + e.status,
-      title: e.status === "error" && e.error ? e.error : `${e.config.name} — ${DRIVER_LABELS[e.config.driver]}${e.session ? " " + e.session.serverVersion : ""}`,
+      title: e.status === "error" && e.error ? e.error : `${e.config.name} — ${DRIVER_LABELS[e.config.driver]}${e.session ? " " + e.session.serverVersion : ""}${sentinelLabel(e.config) ? " · " + sentinelLabel(e.config) : ""}`,
       actions,
       chip: connected && e.config.driver !== "sqlite" && e.config.driver !== "kafka" && scopeSummary(e).total > 0 ? this.chipEl(e) : undefined,
       dragConn: id,
       dragKey: connKey(id),
+      multiConn: id,
       children: () => {
         if (!connected) return e.status === "error" && e.error ? [this.note(`err:${id}`, e.error, "err")] : [];
         return this.connChildren(e);
@@ -457,7 +450,13 @@ export class Explorer {
         if (!connected) void this.connect(id);
         else this.host.openConsole(id);
       },
-      onContext: (ev) => this.connMenu(ev, e),
+      onContext: (ev) => {
+        if (this.multi.length > 1 && this.multi.includes(id)) this.multiMenu(ev);
+        else {
+          this.multi = [];
+          this.connMenu(ev, e);
+        }
+      },
     };
   }
 
@@ -656,6 +655,7 @@ export class Explorer {
       expandable: hasKids,
       cls: "table",
       title: t.comment ? `${s.name}.${t.name} — ${t.comment}` : `${s.name}.${t.name}`,
+      dragTable: FED_DRIVERS.has(e.config.driver) ? { connId: id, database: db, schema: s.name, table: t.name } : undefined,
       onOpen: () => this.expanded.add(colsKey),
       onClick: (ev, spec) => {
         if (ev.detail > 1) return;
@@ -1218,7 +1218,7 @@ export class Explorer {
     const r = h(
       "div",
       {
-        class: "node-row " + (s.cls ?? "") + (this.selected === s.key ? " selected" : "") + (s.actions && s.actions.length ? " has-actions" : "") + (dragging ? " dragging" : ""),
+        class: "node-row " + (s.cls ?? "") + (this.selected === s.key || (s.multiConn !== undefined && this.multi.includes(s.multiConn)) ? " selected" : "") + (s.actions && s.actions.length ? " has-actions" : "") + (dragging ? " dragging" : ""),
         role: "treeitem",
         "aria-level": String(fr.depth + 1),
         "aria-expanded": expandable ? String(fr.open) : undefined,
@@ -1251,7 +1251,24 @@ export class Explorer {
       });
       r.addEventListener("dragend", () => this.endDrag());
     }
+    if (s.dragTable && !s.dragKey) {
+      const dt = s.dragTable;
+      r.draggable = true;
+      r.addEventListener("dragstart", (ev) => {
+        ev.dataTransfer?.setData(TABLE_DRAG_MIME, JSON.stringify(dt));
+        ev.dataTransfer?.setData("text/plain", qualifiedName(store.conns.get(dt.connId)?.config.driver ?? "postgres", dt.schema, dt.table));
+        if (ev.dataTransfer) ev.dataTransfer.effectAllowed = "copy";
+        setTableDrag(dt);
+      });
+      r.addEventListener("dragend", () => setTableDrag(null));
+    }
     r.addEventListener("click", (e) => {
+      // ⌘-click (Ctrl-click elsewhere) on data sources: multi-selection (cross-source console, reconnect all…).
+      if (s.multiConn !== undefined && (IS_MAC ? e.metaKey : e.ctrlKey)) {
+        this.toggleMulti(s.multiConn);
+        return;
+      }
+      if (this.multi.length) this.multi = [];
       this.selected = s.key;
       if (s.onClick) s.onClick(e, s);
       else if (expandable) this.toggle(s);
@@ -1457,6 +1474,98 @@ export class Explorer {
       icon: () => folderMeta(name)?.icon ?? null,
       set: (p) => setFolderLook(name, p),
     };
+  }
+
+  // ------------------------------------------------------------------ sidebar toolbar, multi-selection
+
+  /** View › Compact explorer. */
+  get compact(): boolean {
+    return this.density === "compact";
+  }
+
+  toggleCompact(): void {
+    this.setDensity(this.density === "compact" ? "comfortable" : "compact");
+  }
+
+  /** Bottom toolbar: Settings, Vault profiles, SSH configurations, Query history, Import, and the ⌘K pill. */
+  private toolbar(): HTMLElement {
+    const btn = (ic: string, name: string, run: () => void): HTMLButtonElement =>
+      h("button", { class: "side-tool", type: "button", "aria-label": name, onclick: run }, icon(ic, 17));
+    const bSettings = btn("sliders", "Settings", () => openSettings());
+    // The board's gear (the shared icon set has none).
+    const gear = h("span", { class: "ico", style: "width:17px;height:17px", "aria-hidden": "true" });
+    gear.innerHTML = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="${GEAR_PATH}"/></svg>`;
+    bSettings.replaceChildren(gear);
+    const bVault = btn("key", "Vault profiles", () => openVaultProfilesDialog());
+    const bSsh = btn("server", "SSH configurations", () => openSshProfilesDialog());
+    const bHistory = btn("clock", "Query history", () => this.host.toggleHistory());
+    const bImport = btn("download", "Import from DataGrip", () => this.host.importDataGrip());
+    const pill = h("button", { class: "side-k", type: "button", "aria-label": "Command palette", onclick: () => this.host.openPalette() });
+    const label = (name: string, key: string): string => (key ? `${name} (${key})` : name);
+    const sync = (): void => {
+      bSettings.title = label("Settings", shortcutLabel("settings"));
+      bVault.title = "Vault profiles — tokens, OIDC sign-in, which data sources use them";
+      bSsh.title = "SSH configurations — jump hosts and keys";
+      bHistory.title = label("Query history", formatBinding("Mod-Shift-H"));
+      bImport.title = "Import data sources from DataGrip";
+      const k = shortcutLabel("commandPalette");
+      pill.textContent = k || "⌘K";
+      pill.title = label("Command palette — every action, data source, table and tab", k);
+    };
+    sync();
+    onSettingsChange(sync);
+    return h("div", { class: "side-tools", role: "toolbar", "aria-label": "Tools" }, bSettings, bVault, bSsh, bHistory, bImport, h("span", { class: "spacer" }), pill);
+  }
+
+  /** ⌘/Ctrl-click on a data source: adds it to (or removes it from) the multi-selection. */
+  private toggleMulti(id: string): void {
+    // The first ⌘-click keeps the data source that was selected before.
+    if (this.multi.length === 0 && this.selected.startsWith("c:") && this.selected !== "c:" + id && store.conns.has(this.selected.slice(2))) this.multi.push(this.selected.slice(2));
+    const i = this.multi.indexOf(id);
+    if (i >= 0) this.multi.splice(i, 1);
+    else this.multi.push(id);
+    this.selected = "c:" + id;
+    this.host.onSelect(id);
+    this.render();
+  }
+
+  /** Context menu of a multi-selection of data sources. */
+  private multiMenu(ev: MouseEvent): void {
+    const ents = this.multi.map((id) => store.conns.get(id)).filter((e): e is ConnEntry => e !== undefined);
+    const sql = ents.filter((e) => FED_DRIVERS.has(e.config.driver));
+    const names = sql.map((e) => e.config.name);
+    showMenu(
+      ev.clientX,
+      ev.clientY,
+      [
+        { label: `${ents.length} data sources selected`, disabled: true },
+        {
+          label: sql.length >= 2 ? `New cross-source console (${sql.length} sources)` : "New cross-source console (needs 2 SQL sources)",
+          icon: "layers",
+          disabled: sql.length < 2,
+          onClick: () => this.host.newCrossSource(sql.map((e) => e.config.id)),
+        },
+        ...(sql.length >= 2 ? [{ label: `Query ${names.slice(0, -1).join(", ")} and ${names[names.length - 1]} together`, disabled: true }] : []),
+        { sep: true },
+        { label: "Reconnect all", icon: "refresh", onClick: () => ents.forEach((e) => void this.reconnect(e.config.id)) },
+        {
+          label: "Disconnect all",
+          icon: "unplug",
+          disabled: !ents.some((e) => e.status === "connected"),
+          onClick: () => ents.filter((e) => e.status === "connected").forEach((e) => void this.disconnect(e.config.id)),
+        },
+        { sep: true },
+        {
+          label: "Clear selection",
+          icon: "x",
+          onClick: () => {
+            this.multi = [];
+            this.render();
+          },
+        },
+      ],
+      { minWidth: 260 },
+    );
   }
 
   // ------------------------------------------------------------------ actions

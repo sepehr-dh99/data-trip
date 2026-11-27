@@ -15,7 +15,12 @@ import { store } from "./state";
 import { buildCompletionSchema, buildFilteredSql, connColor, countSql, detectEditContext, nextOrder, orderMarks, pagedSql, pagingFirstPageOnly, parseFilterable, qualifiedName, quoteIdent } from "./sqlutil";
 import { getSettings } from "./settings";
 import { handleActionError } from "./recovery";
-import { FED_DRIVERS, aliasSlug, isAlias, uniqueAlias } from "./federation";
+import { FED_DRIVERS, aliasSlug, droppedTable, hasTableDrag, isAlias, refPart, tableDrag, uniqueAlias } from "./federation";
+import type { TableDrag } from "./federation";
+import { exampleQuery } from "./crossSource";
+import type { ExampleSource } from "./crossSource";
+import type { FedCompletion, FedHooks, FedMark } from "./editor";
+import { shortcutLabel } from "./keymap";
 import { canFormat, formatSql as formatSqlText } from "./sqlFormat";
 import type { WsConsole } from "./workspace";
 import { openExportDialog } from "./exportDialog";
@@ -23,6 +28,9 @@ import { FilterBar } from "./filterBar";
 import type { FilterState } from "./filterBar";
 import { toast } from "./toast";
 import type { TabPane } from "./tabs";
+import { sentinelLabel } from "./redis";
+import { AiAssist } from "./aiPanel";
+import { docWithoutPending } from "./aiEditor";
 
 const DEFAULT_MAX_ROWS = 500;
 const MOD = /Mac/.test(navigator.userAgent) ? "⌘" : "Ctrl+";
@@ -179,6 +187,9 @@ export class ConsolePane implements TabPane {
   private txMenuClosedAt = 0;
   private alive = true;
   private btnFed: HTMLButtonElement;
+  /** ✦ Ask AI (board N) and the console's AI assistant. */
+  private btnAi: HTMLButtonElement;
+  private ai: AiAssist;
   // cross-source queries
   private fedEl: HTMLElement;
   private fed: FedAttach[] = [];
@@ -192,6 +203,12 @@ export class ConsolePane implements TabPane {
   private waking: Promise<boolean> | null = null;
   /** Effective database when the workspace was saved (tab names until the data source is connected). */
   private dbHint: string | null = null;
+  /** Opened as a cross-source console ("cross-source" tab with an "N sources" badge). */
+  private crossSource = false;
+  /** Cross-source guide card (3 steps + "Insert an example query") over the editor; hides once the user types. */
+  private guideEl: HTMLElement | null = null;
+  /** "Drop to attach …" hint while a table is dragged over the editor. */
+  private dropEl: HTMLElement = h("div", { class: "fed-drop", hidden: true, "aria-hidden": "true" });
 
   constructor(
     public connId: string,
@@ -222,7 +239,14 @@ export class ConsolePane implements TabPane {
       { class: "cap-btn ghost icon-only fed-btn", type: "button", title: "Sources: query several data sources in this console", "aria-label": "Attach data sources", "aria-pressed": "false", onclick: () => this.onFedButton() },
       icon("layers", 15),
     );
-    this.controls = h("div", { class: "cap-controls" }, this.btnRun, this.btnStop, this.btnRunAll, this.btnFed, this.btnTx);
+    this.btnAi = h(
+      "button",
+      { class: "cap-btn ai-ask", type: "button", title: `Ask AI to write SQL (${shortcutLabel("askAi") || "Ask AI"})`, onclick: () => this.askAi() },
+      h("span", { class: "ai-spark", "aria-hidden": "true" }, "✦"),
+      "Ask AI",
+      h("span", { class: "ai-kbd" }, shortcutLabel("askAi")),
+    );
+    this.controls = h("div", { class: "cap-controls" }, this.btnAi, this.btnRun, this.btnStop, this.btnRunAll, this.btnFed, this.btnTx);
     this.btnTx.hidden = driver === "redis" || driver === "kafka";
     this.syncTxLabel();
     this.waitText = h("span", null, "Running…");
@@ -236,6 +260,29 @@ export class ConsolePane implements TabPane {
       onRun: () => void this.runCurrent(),
       onRunAll: () => void this.runAll(),
       onCursor: () => this.host.onWorkspace(),
+      onAskAi: () => this.askAi(),
+    });
+    this.ai = new AiAssist({
+      wrap: this.editorWrap,
+      view: () => this.editor.cmView,
+      connId: () => this.connId,
+      driver: () => this.driver,
+      database: () => this.effectiveDatabase,
+      defaultSchema: () => this.currentSchemaName(),
+      serverVersion: () => this.status.serverVersion,
+      schemas: () => this.schemas(),
+      ensureSchemas: async () => {
+        if (this.needsConnect) await this.wake();
+        if (this.database !== null) await store.ensureDb(this.connId, this.database).catch(() => undefined);
+      },
+      isLineBased: () => this.isLineBased,
+      sample: async (sql: string) => {
+        const sess = await this.ensureSession();
+        return api.execute(sess.sessionId, sql, 20);
+      },
+      statements: () => this.editor.getAllStatements(),
+      focus: () => this.editor.focus(),
+      isActive: () => this.alive && this.el.isConnected && this.controls.isConnected && !this.el.classList.contains("hidden"),
     });
     // Gutter ▶: run just that statement (Alt/Option-click: keep the current results, add a result tab).
     this.editor.onRunStatement((r, o) => {
@@ -250,6 +297,11 @@ export class ConsolePane implements TabPane {
     const results = h("div", { class: "c-results" }, this.tabsEl, this.bar.el, this.bodyEl);
     this.fedEl = h("div", { class: "fed-strip", role: "group", "aria-label": "Sources", hidden: true });
     this.el = h("div", { class: "console" }, this.fedEl, this.editorWrap, splitter, results);
+    this.editorWrap.appendChild(this.dropEl);
+    // The guide card goes away as soon as the user types (or pastes / deletes) in the editor.
+    this.editorWrap.addEventListener("beforeinput", () => this.hideGuide());
+    this.bindTableDrop();
+    this.editor.setFedHooks(this.fedHooks());
     this.ownAlias = aliasSlug(entry?.config.name ?? "main");
     this.syncFedUi();
     this.showEmptyResults();
@@ -284,6 +336,11 @@ export class ConsolePane implements TabPane {
     return this.editor.undo();
   }
 
+  /** Cross-source consoles: "3 sources" next to the tab name. */
+  get sourceBadge(): string | null {
+    return this.crossSource && this.fedActive ? `${this.fed.length + 1} sources` : null;
+  }
+
   /** Pending grid edits or an open manual transaction. */
   get dirty(): boolean {
     return (!this.autoCommit && this.session !== null) || this.items.some((i) => i.grid?.hasPending() === true);
@@ -299,7 +356,7 @@ export class ConsolePane implements TabPane {
   /** What restore on launch saves for this console. */
   snapshot(): WsConsole {
     return {
-      sql: this.editor.getText(),
+      sql: docWithoutPending(this.editor.cmView.state),
       cursor: this.editor.cursor,
       database: this.database,
       dbHint: this.effectiveDatabase,
@@ -310,6 +367,7 @@ export class ConsolePane implements TabPane {
       ownDb: this.fedOwnDb,
       sources: this.fed.map((f) => ({ alias: f.alias, connId: f.connId, database: f.database })),
       fedShown: this.fedShown,
+      crossSource: this.crossSource,
     };
   }
 
@@ -339,6 +397,7 @@ export class ConsolePane implements TabPane {
         this.fed.push({ alias, connId: src.connId, database: SERVER_DRIVERS.has(e.config.driver) ? src.database : null });
       }
       this.fedShown = ws.fedShown || this.fed.length > 0;
+      this.crossSource = ws.crossSource === true;
       this.syncFedUi();
     }
     this.updateSchema();
@@ -368,6 +427,13 @@ export class ConsolePane implements TabPane {
         return true;
       });
     return this.waking;
+  }
+
+  // ---------------------------------------------------------------- AI assistant
+
+  /** ⌘I / ✦ Ask AI: the inline prompt box under the cursor line (SQL consoles only). */
+  askAi(): void {
+    this.ai.open();
   }
 
   // ---------------------------------------------------------------- format
@@ -568,6 +634,7 @@ export class ConsolePane implements TabPane {
     this.bar.destroy();
     const s = this.session;
     this.session = null;
+    this.ai.dispose();
     this.editor.destroy();
     if (s) {
       if (!this.autoCommit) await api.rollback(s.sessionId).catch(() => undefined);
@@ -637,6 +704,7 @@ export class ConsolePane implements TabPane {
 
   private syncTxLabel(): void {
     this.btnTx.hidden = this.isLineBased;
+    this.btnAi.hidden = this.isLineBased;
     clear(this.btnTx);
     this.btnTx.append(this.autoCommit ? "Auto" : "Manual", h("span", { class: "tx-caret", "aria-hidden": "true" }, "▾"));
     this.btnTx.classList.toggle("manual", !this.autoCommit);
@@ -1135,7 +1203,8 @@ export class ConsolePane implements TabPane {
     if (!e) return "";
     const name = DRIVER_LABELS[e.config.driver].split(" / ")[0];
     const ver = this.status.serverVersion || e.session?.serverVersion || "";
-    return ver ? `${name} ${ver}` : name;
+    const sent = sentinelLabel(e.config);
+    return (ver ? `${name} ${ver}` : name) + (sent ? " · " + sent : "");
   }
 
   private lastSql(grid: ResultGrid): string {
@@ -1166,6 +1235,7 @@ export class ConsolePane implements TabPane {
       h("div", { class: "r-error-text" }, msg),
       sql ? h("pre", { class: "r-sql" }, sql) : null,
       btn,
+      reconnect || this.fedActive ? null : this.ai.fixActions(sql, msg),
     );
     this.addItem(total > 1 ? `Error · ${n}` : "Error", sql, view, "err");
   }
@@ -1411,7 +1481,8 @@ export class ConsolePane implements TabPane {
     if (add) this.openAttachMenu(add);
   }
 
-  private openAttachMenu(anchor: HTMLElement): void {
+  /** `alias`: attach the picked source under this alias (the quick fix of an unattached alias). */
+  private openAttachMenu(anchor: HTMLElement, alias?: string): void {
     const r = anchor.getBoundingClientRect();
     const used = new Set([this.connId, ...this.fed.map((f) => f.connId)]);
     const cands = store.list().filter((e) => FED_DRIVERS.has(e.config.driver) && !used.has(e.config.id));
@@ -1419,25 +1490,35 @@ export class ConsolePane implements TabPane {
       r.left,
       r.bottom + 6,
       cands.length
-        ? cands.map((e) => ({ label: e.config.name, icon: "database", hint: DRIVER_LABELS[e.config.driver].split(" / ")[0], onClick: () => this.attachSource(e.config.id) }))
+        ? cands.map((e) => ({ label: e.config.name, icon: "database", hint: DRIVER_LABELS[e.config.driver].split(" / ")[0], onClick: () => void this.attachSource(e.config.id, alias) }))
         : [{ label: "No other SQL data source to attach", disabled: true }],
       { minWidth: 220 },
     );
   }
 
-  private attachSource(connId: string): void {
+  /**
+   * Attaches a data source (alias: `alias` when valid, else its name's slug; made unique). Already attached → its
+   * alias. Returns null when it can't be attached (the console's own source, not a SQL source).
+   */
+  attachSource(connId: string, alias?: string, database: string | null = null, quiet = false): string | null {
     const e = store.conns.get(connId);
-    if (!e) return;
-    const alias = uniqueAlias(aliasSlug(e.config.name), [this.ownAlias, ...this.fed.map((f) => f.alias)]);
-    this.fed.push({ alias, connId, database: null });
+    if (!e || connId === this.connId || !FED_DRIVERS.has(e.config.driver) || this.isLineBased || !FED_DRIVERS.has(this.driver)) return null;
+    const existing = this.fed.find((f) => f.connId === connId);
+    if (existing) return existing.alias;
+    const a = uniqueAlias(alias && isAlias(alias) ? alias : aliasSlug(e.config.name), [this.ownAlias, ...this.fed.map((f) => f.alias)]);
+    this.fed.push({ alias: a, connId, database: SERVER_DRIVERS.has(e.config.driver) ? database : null });
     this.fedShown = true;
     this.syncFedUi();
-    toast(`Attached ${e.config.name} as ${alias} — use ${alias}.schema.table in SQL`, "info");
+    // The tab badge counts the sources.
+    this.host.onDatabase(this);
+    if (!quiet) toast(`Attached ${e.config.name} as ${a} — use ${a}.schema.table in SQL`, "info");
+    return a;
   }
 
   private detachSource(i: number): void {
     this.fed.splice(i, 1);
     this.syncFedUi();
+    this.host.onDatabase(this);
   }
 
   /**
@@ -1546,6 +1627,7 @@ export class ConsolePane implements TabPane {
     clear(this.fedEl);
     // Attached sources are part of the restored workspace.
     this.host.onWorkspace();
+    this.editor.refreshFedMarks();
     if (!show) return;
     const add = h("button", { class: "fed-add", type: "button", "aria-haspopup": "menu", onclick: (ev: MouseEvent) => this.openAttachMenu(ev.currentTarget as HTMLElement) }, icon("plus", 12), "Attach source");
     this.fedEl.append(
@@ -1581,10 +1663,297 @@ export class ConsolePane implements TabPane {
       ),
       add,
       h("span", { class: "fed-hint" }, this.fed.length ? "Query them as alias.schema.table · results are read-only" : "Attach another data source to join across sources"),
+      h("button", { class: "fed-how", type: "button", onclick: () => this.showGuide() }, "How does this work?"),
     );
     if (this.fed.length === 0) {
       this.fedEl.append(h("button", { class: "fed-x close", type: "button", title: "Hide sources", "aria-label": "Hide sources", onclick: () => ((this.fedShown = false), this.syncFedUi()) }, icon("x", 11)));
     }
+  }
+
+  // ---------------------------------------------------------------- cross-source: guide, completion, quick fix, drops
+
+  /** Turns a fresh console into a cross-source console: attaches `others`, shows the Sources strip and the guide. */
+  setupCrossSource(others: string[]): void {
+    if (this.isLineBased || !FED_DRIVERS.has(this.driver)) return;
+    this.crossSource = true;
+    for (const id of others) this.attachSource(id, undefined, null, true);
+    this.fedShown = true;
+    this.syncFedUi();
+    this.host.onDatabase(this);
+    if (!this.editor.getText().trim()) this.showGuide();
+  }
+
+  /** Console › Attach source…: opens the Sources strip and its attach menu. */
+  openAttach(): void {
+    if (this.isLineBased || !FED_DRIVERS.has(this.driver)) {
+      toast("Cross-source queries work in PostgreSQL, MySQL, SQLite and SQL Server consoles", "info");
+      return;
+    }
+    this.fedShown = true;
+    this.syncFedUi();
+    const add = this.fedEl.querySelector<HTMLElement>(".fed-add");
+    if (add) this.openAttachMenu(add);
+  }
+
+  /** The guide card: three steps and "Insert an example query" (also from "How does this work?"). */
+  showGuide(): void {
+    if (this.isLineBased || !FED_DRIVERS.has(this.driver)) return;
+    if (!this.fedShown) {
+      this.fedShown = true;
+      this.syncFedUi();
+    }
+    this.hideGuide();
+    const aliases = [this.ownAlias, ...this.fed.map((f) => f.alias)];
+    const go = h("button", { class: "btn primary fed-guide-go", type: "button" }, "Insert an example query");
+    go.addEventListener("click", () => void this.insertExample(go));
+    const step = (n: string, title: string, sub: string): HTMLElement =>
+      h("div", { class: "fed-gstep" }, h("span", { class: "fed-gstep-n", "aria-hidden": "true" }, n), h("div", { class: "fed-gstep-t" }, title), h("div", { class: "fed-gstep-s" }, sub));
+    const run = shortcutLabel("runStatement");
+    this.guideEl = h(
+      "div",
+      { class: "fed-guide", role: "note", "aria-label": "Query across data sources" },
+      h(
+        "div",
+        { class: "fed-guide-head" },
+        h("span", null, "Query across data sources"),
+        h("button", { class: "fed-x", type: "button", title: "Hide", "aria-label": "Hide the guide", onclick: () => this.hideGuide() }, icon("x", 10)),
+      ),
+      h(
+        "div",
+        { class: "fed-gsteps" },
+        step("1", "Attach sources", "Each one gets a short alias, shown above. Add more with + Attach source."),
+        step("2", "Write alias.schema.table", `e.g. ${aliases[0]}.schema.table JOIN ${aliases[1] ?? "other"}.schema.table`),
+        step("3", run ? `Run (${run})` : "Run", "Filters run on each source; the join runs in DataTrip. Results are read-only."),
+      ),
+      h("div", { class: "fed-guide-foot" }, go, h("span", null, "Uses real tables from your attached sources. Runs as SQLite SQL in DataTrip.")),
+    );
+    this.editorWrap.appendChild(this.guideEl);
+  }
+
+  private hideGuide(): void {
+    if (!this.guideEl) return;
+    this.guideEl.remove();
+    this.guideEl = null;
+  }
+
+  /** Connects a source (explorer connect) and loads its database's introspection; true when ready. */
+  private async loadSource(connId: string, database: string | null): Promise<boolean> {
+    if (!(await this.host.ensureConnected(connId).catch(() => false))) return false;
+    if (database !== null && database !== store.conns.get(connId)?.defaultDb) await store.ensureDb(connId, database);
+    return true;
+  }
+
+  private async insertExample(btn: HTMLButtonElement): Promise<void> {
+    if (this.fed.length === 0) {
+      toast("Attach a second data source first", "info");
+      const add = this.fedEl.querySelector<HTMLElement>(".fed-add");
+      if (add) this.openAttachMenu(add);
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = "Loading tables…";
+    const ex: ExampleSource[] = [];
+    for (const s of this.fedSources()) {
+      const ok = await this.loadSource(s.connectionId, s.database);
+      if (!this.alive) return;
+      if (ok) ex.push({ alias: s.alias, schemas: store.schemasFor(s.connectionId, s.database), defaultSchema: store.defaultSchemaFor(s.connectionId, s.database) });
+    }
+    btn.disabled = false;
+    btn.textContent = "Insert an example query";
+    if (!btn.isConnected) return;
+    const sql = exampleQuery(ex);
+    if (!sql) {
+      toast("Couldn't find tables in two of the attached sources", "info");
+      return;
+    }
+    this.hideGuide();
+    this.editor.insertStatement(sql, true);
+    this.editor.focus();
+  }
+
+  private fedHooks(): FedHooks {
+    return {
+      complete: (path) => this.fedComplete(path),
+      marks: (doc) => this.fedMarks(doc),
+      tooltip: (m) => this.fedTip(m),
+    };
+  }
+
+  /** The source behind an alias of this console (own or attached), while the Sources strip is in use. */
+  private sourceByAlias(alias: string): { connId: string; database: string | null } | null {
+    if (!this.fedShown && this.fed.length === 0) return null;
+    const low = alias.toLowerCase();
+    if (low === this.ownAlias.toLowerCase()) return { connId: this.connId, database: this.fedOwnDb ?? this.database };
+    const f = this.fed.find((x) => x.alias.toLowerCase() === low);
+    return f ? { connId: f.connId, database: f.database } : null;
+  }
+
+  /** `alias.` → the source's schemas, `alias.schema.` → its tables (introspection loaded lazily). */
+  private fedComplete(path: string[]): FedCompletion[] | null | Promise<FedCompletion[] | null> {
+    if (this.isLineBased || !FED_DRIVERS.has(this.driver) || path.length < 1 || path.length > 2) return null;
+    const src = this.sourceByAlias(path[0]);
+    if (!src) return null;
+    const list = (): FedCompletion[] | null => {
+      const schemas = store.schemasFor(src.connId, src.database);
+      if (path.length === 1) {
+        const def = store.defaultSchemaFor(src.connId, src.database);
+        return schemas.map((s) => ({ label: s.name, apply: refPart(s.name), type: "namespace", detail: s.name === def ? "schema · default" : "schema", boost: s.name === def ? 2 : 0 }));
+      }
+      const s = schemas.find((x) => x.name.toLowerCase() === path[1].toLowerCase());
+      if (!s) return null;
+      return s.tables.map((t) => ({ label: t.name, apply: refPart(t.name), type: t.kind === "table" ? "type" : "class", detail: t.kind === "table" ? "table" : t.kind === "view" ? "view" : "materialized view" }));
+    };
+    const e = store.conns.get(src.connId);
+    const ready = e?.status === "connected" && (src.database === null || src.database === e.defaultDb || e.dbs.get(src.database)?.status === "ready");
+    if (ready) return list();
+    return this.loadSource(src.connId, src.database).then((ok) => (ok && this.alive ? list() : null));
+  }
+
+  /**
+   * `foo.schema.table` where `foo` is the alias slug of a SQL data source that isn't attached (and not a database of
+   * this console's server, so real three-part names stay unmarked): underlined, with a one-click attach.
+   */
+  private fedMarks(doc: string): FedMark[] {
+    if (this.isLineBased || !FED_DRIVERS.has(this.driver)) return [];
+    const attached = new Set([this.connId, ...this.fed.map((f) => f.connId)]);
+    const bySlug = new Map<string, string>();
+    for (const e of store.list()) {
+      if (!FED_DRIVERS.has(e.config.driver) || attached.has(e.config.id)) continue;
+      const slug = aliasSlug(e.config.name);
+      if (!bySlug.has(slug)) bySlug.set(slug, e.config.id);
+    }
+    if (bySlug.size === 0) return [];
+    const aliases = new Set([this.ownAlias, ...this.fed.map((f) => f.alias)].map((a) => a.toLowerCase()));
+    const dbNames = new Set((store.conns.get(this.connId)?.databases ?? []).map((d) => d.name.toLowerCase()));
+    // Strings and comments blanked out, offsets kept.
+    const code = doc.replace(/'(?:[^']|'')*'?|--[^\n]*|\/\*[\s\S]*?(?:\*\/|$)/g, (m) => m.replace(/[^\n]/g, " "));
+    const re = /([A-Za-z_][A-Za-z0-9_]*)\.(?:[A-Za-z_][A-Za-z0-9_]*|"[^"\n]*")\.(?:[A-Za-z_][A-Za-z0-9_]*|"[^"\n]*")/g;
+    const out: FedMark[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(code)) !== null && out.length < 200) {
+      const prev = m.index > 0 ? code[m.index - 1] : "";
+      if (prev && /[\w.$"`\]]/.test(prev)) continue;
+      const low = m[1].toLowerCase();
+      if (aliases.has(low) || dbNames.has(low) || !bySlug.has(low)) continue;
+      out.push({ from: m.index, to: m.index + m[1].length, key: m[1] });
+    }
+    return out;
+  }
+
+  private fedTip(m: FedMark): HTMLElement {
+    const low = m.key.toLowerCase();
+    const attached = new Set([this.connId, ...this.fed.map((f) => f.connId)]);
+    const e = store.list().find((x) => FED_DRIVERS.has(x.config.driver) && !attached.has(x.config.id) && aliasSlug(x.config.name) === low);
+    const box = h("div", { class: "fed-tip" }, h("div", null, h("b", { class: "mono" }, m.key), " isn’t attached to this console."));
+    if (!e) return box;
+    const drv = DRIVER_LABELS[e.config.driver].split(" / ")[0];
+    const choose = h("button", { class: "fed-tip-alt", type: "button" }, "Choose source…");
+    choose.addEventListener("click", () => this.openAttachMenu(choose, m.key));
+    box.appendChild(
+      h(
+        "div",
+        { class: "fed-tip-actions" },
+        h("button", { class: "fed-tip-go", type: "button", onclick: () => void this.attachSource(e.config.id, m.key) }, `Attach ${e.config.name} (${drv}) as ${m.key}`),
+        choose,
+      ),
+    );
+    return box;
+  }
+
+  /** What dropping that table here does: insert `schema.table`, or attach its source and insert `alias.schema.table`. */
+  private dropPlan(d: TableDrag): { attach: boolean; alias: string | null; name: string; text: string } | null {
+    const e = store.conns.get(d.connId);
+    if (!e || this.isLineBased) return null;
+    if (d.connId === this.connId) {
+      const text = this.fedActive ? `${this.ownAlias}.${refPart(d.schema)}.${refPart(d.table)}` : qualifiedName(this.driver, d.schema, d.table);
+      return { attach: false, alias: null, name: e.config.name, text };
+    }
+    if (!FED_DRIVERS.has(e.config.driver) || !FED_DRIVERS.has(this.driver)) return null;
+    const ex = this.fed.find((f) => f.connId === d.connId);
+    const alias = ex?.alias ?? uniqueAlias(aliasSlug(e.config.name), [this.ownAlias, ...this.fed.map((f) => f.alias)]);
+    return { attach: !ex, alias, name: e.config.name, text: `${alias}.${refPart(d.schema)}.${refPart(d.table)}` };
+  }
+
+  private showDropHint(): void {
+    const d = tableDrag();
+    const plan = d ? this.dropPlan(d) : null;
+    clear(this.dropEl);
+    if (!plan) {
+      this.hideDropHint();
+      return;
+    }
+    this.dropEl.append(
+      plan.attach
+        ? h(
+            "div",
+            { class: "fed-drop-card" },
+            "Drop to attach ",
+            h("b", null, plan.name),
+            " as ",
+            h("b", { class: "mono" }, plan.alias ?? ""),
+            h("br"),
+            h("span", { class: "dim" }, "and insert "),
+            h("span", { class: "mono hl" }, plan.text),
+          )
+        : h("div", { class: "fed-drop-card" }, h("span", { class: "dim" }, "Drop to insert "), h("span", { class: "mono hl" }, plan.text)),
+    );
+    this.dropEl.hidden = false;
+    this.editorWrap.classList.add("drop-on");
+    this.editorWrap.classList.toggle("drop-attach", plan.attach);
+  }
+
+  private hideDropHint(): void {
+    this.dropEl.hidden = true;
+    this.editorWrap.classList.remove("drop-on", "drop-attach");
+  }
+
+  /** Explorer tables dropped on the editor (capture phase: CodeMirror's own drop handling never sees them). */
+  private bindTableDrop(): void {
+    const wrap = this.editorWrap;
+    const ours = (ev: DragEvent): boolean => hasTableDrag(ev) && !this.isLineBased;
+    wrap.addEventListener(
+      "dragover",
+      (ev) => {
+        if (!ours(ev)) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (ev.dataTransfer) ev.dataTransfer.dropEffect = "copy";
+        if (this.dropEl.hidden) this.showDropHint();
+      },
+      true,
+    );
+    wrap.addEventListener("dragleave", (ev) => {
+      if (!ev.relatedTarget || !wrap.contains(ev.relatedTarget as Node)) this.hideDropHint();
+    });
+    wrap.addEventListener(
+      "drop",
+      (ev) => {
+        if (!ours(ev)) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        this.hideDropHint();
+        const d = droppedTable(ev);
+        if (!d) return;
+        this.dropTable(d, this.editor.posAtCoords(ev.clientX, ev.clientY) ?? this.editor.cursor);
+      },
+      true,
+    );
+  }
+
+  private dropTable(d: TableDrag, pos: number): void {
+    const plan = this.dropPlan(d);
+    if (!plan) return;
+    let text = plan.text;
+    if (plan.attach) {
+      const e = store.conns.get(d.connId);
+      const db = e && d.database !== null && d.database !== e.defaultDb ? d.database : null;
+      const a = this.attachSource(d.connId, plan.alias ?? undefined, db, true);
+      if (!a) return;
+      text = `${a}.${refPart(d.schema)}.${refPart(d.table)}`;
+      toast(`Attached ${e?.config.name ?? "the data source"} as ${a}`, "info");
+    }
+    this.hideGuide();
+    this.editor.insertAt(pos, text);
   }
 
   // ---------------------------------------------------------------- layout

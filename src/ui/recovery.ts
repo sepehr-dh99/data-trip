@@ -107,7 +107,7 @@ function oidcRecovery(profileId: string, name: string, text: string, retry?: Ret
     btn.disabled = true;
     cancel.hidden = false;
     status.className = "rec-status busy";
-    status.textContent = "Waiting for browser sign-in…";
+    status.textContent = "Waiting for sign-in…";
     const ok = await startOidcSignIn(profileId, status);
     cancel.hidden = true;
     btn.disabled = false;
@@ -124,7 +124,7 @@ function oidcRecovery(profileId: string, name: string, text: string, retry?: Ret
     "div",
     { class: "rec" },
     h("div", { class: "rec-head" }, h("b", null, `${name}: session expired`), close),
-    h("div", { class: "rec-text" }, text || "Vault refused the request (403). Sign in again with your browser; the action is retried afterwards."),
+    h("div", { class: "rec-text" }, text || "Vault refused the request (403). Sign in again; the action is retried afterwards."),
     h("div", { class: "rec-actions" }, btn, cancel),
     status,
   );

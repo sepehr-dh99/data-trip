@@ -185,12 +185,24 @@ impl CredentialSource {
 
     /// Connects the driver, through the SSH tunnel when configured. The lease is stored in
     /// `Connected.tunnel` so the forward lives as long as the database connection.
+    /// Redis Sentinel resolves the master itself and opens one forward per node it contacts.
     fn connect_tunneled<'a>(
         &'a self,
         cfg: &'a ConnectionConfig,
         password: Option<&'a str>,
+        sentinel_password: Option<&'a str>,
     ) -> BoxFuture<'a, AppResult<db::Connected>> {
         Box::pin(async move {
+            if db::redis::is_sentinel(cfg) {
+                let tunnels = cfg
+                    .ssh_profile_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(|pid| (self.tunnels.as_ref(), pid));
+                return db::redis::connect_sentinel(cfg, password, sentinel_password, tunnels)
+                    .await;
+            }
             let (tcfg, lease) = self.tunnel_config(cfg).await?;
             match db::connect(&tcfg, password).await {
                 Ok(mut c) => {
@@ -307,6 +319,7 @@ impl CredentialSource {
     /// Resolves credentials and opens a physical connection. With cached dynamic credentials,
     /// an authentication failure invalidates the cache and retries once with a fresh secret.
     /// `use_cache = false` (test connection) neither reads nor writes the cache.
+    #[allow(dead_code)]
     pub fn connect<'a>(
         &'a self,
         cfg: &'a ConnectionConfig,
@@ -321,6 +334,28 @@ impl CredentialSource {
         })
     }
 
+    /// Test connection: like `connect` without the cache; `sentinel_password` (Redis Sentinel) overrides
+    /// the stored one when non-empty.
+    pub fn connect_test<'a>(
+        &'a self,
+        cfg: &'a ConnectionConfig,
+        explicit_password: Option<String>,
+        explicit_vault_token: Option<String>,
+        sentinel_password: Option<String>,
+    ) -> BoxFuture<'a, AppResult<db::Connected>> {
+        Box::pin(async move {
+            self.connect_full(
+                cfg,
+                explicit_password,
+                explicit_vault_token,
+                false,
+                sentinel_password,
+            )
+            .await
+            .map(|(c, _)| c)
+        })
+    }
+
     /// `connect`, plus when the credentials it used stop being valid (dynamic Vault leases only).
     pub fn connect_with_expiry<'a>(
         &'a self,
@@ -329,7 +364,34 @@ impl CredentialSource {
         explicit_vault_token: Option<String>,
         use_cache: bool,
     ) -> BoxFuture<'a, AppResult<(db::Connected, Option<Instant>)>> {
+        self.connect_full(
+            cfg,
+            explicit_password,
+            explicit_vault_token,
+            use_cache,
+            None,
+        )
+    }
+
+    fn connect_full<'a>(
+        &'a self,
+        cfg: &'a ConnectionConfig,
+        explicit_password: Option<String>,
+        explicit_vault_token: Option<String>,
+        use_cache: bool,
+        sentinel_override: Option<String>,
+    ) -> BoxFuture<'a, AppResult<(db::Connected, Option<Instant>)>> {
         Box::pin(async move {
+            // Sentinel password: keychain only (never from Vault), used when the sentinels need one.
+            let sentinel_auth = db::redis::is_sentinel(cfg)
+                && matches!(cfg.redis.as_ref(), Some(r) if r.sentinel_auth);
+            let sentinel_pw = if sentinel_auth {
+                sentinel_override
+                    .filter(|p| !p.is_empty())
+                    .or_else(|| self.store.get_sentinel_password(&cfg.id))
+            } else {
+                None
+            };
             let r = self
                 .resolve_inner(
                     cfg,
@@ -339,7 +401,7 @@ impl CredentialSource {
                 )
                 .await?;
             let first = self
-                .connect_tunneled(&r.config, r.password.as_deref())
+                .connect_tunneled(&r.config, r.password.as_deref(), sentinel_pw.as_deref())
                 .await;
             let retry = match &first {
                 Err(e) => r.from_cache && looks_like_auth_failure(&e.message),
@@ -353,7 +415,7 @@ impl CredentialSource {
                 .resolve_inner(cfg, explicit_password, explicit_vault_token, use_cache)
                 .await?;
             let c = self
-                .connect_tunneled(&r2.config, r2.password.as_deref())
+                .connect_tunneled(&r2.config, r2.password.as_deref(), sentinel_pw.as_deref())
                 .await?;
             Ok((c, r2.expires_at))
         })

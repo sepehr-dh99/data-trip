@@ -34,6 +34,25 @@ export interface ConnectionConfig {
   scope?: ExplorerScope | null;
   /** Kafka only. `host` holds the bootstrap servers ("b1:9092,b2:9092"); username/password are SASL creds. */
   kafka?: KafkaConfig | null;
+  /** Redis only: standalone (host/port) or Sentinel. null = standalone. */
+  redis?: RedisOptions | null;
+}
+
+export type RedisMode = "standalone" | "sentinel";
+export type RedisReadFrom = "master" | "replica";
+
+/** Redis topology. In sentinel mode host/port are ignored: the sentinels report the master. */
+export interface RedisOptions {
+  mode?: RedisMode;
+  /** "host:port" (default port 26379), tried in order. */
+  sentinels?: string[];
+  /** Monitored master name, e.g. "mymaster". */
+  masterName?: string;
+  readFrom?: RedisReadFrom;
+  /** ACL user for the sentinels (optional; used only with sentinelAuth). */
+  sentinelUsername?: string | null;
+  /** Sentinels have their own password (keychain, separate from the master password). */
+  sentinelAuth?: boolean;
 }
 
 /** Explorer visibility for one data source (stored with the connection, UI-only). */
@@ -123,6 +142,8 @@ export interface VaultCheck {
 
 export interface ServerInfo {
   version: string;
+  /** Step-by-step report (Redis Sentinel); each line starts with "✓ ", "✕ " or "! " (note). */
+  details?: string[] | null;
 }
 
 export interface SessionInfo {
@@ -400,4 +421,40 @@ export interface FedStep {
 export interface FedResult {
   result: QueryResult;
   plan: FedStep[];
+}
+
+// ── v0.12: AI assistant (src-tauri/src/ai.rs) ──
+export type AiProviderId = "codex" | "claude" | "openai" | "ollama";
+export type AiMode = "write" | "fix" | "explain" | "refine";
+
+export interface AiProviderStatus {
+  id: AiProviderId;
+  /** Installed (CLI found) / key stored (openai) / server running (ollama). */
+  available: boolean;
+  /** Codex: an auth file exists; null = unknown. */
+  signedIn: boolean | null;
+  path: string | null;
+  detail: string;
+  /** Ollama: installed models. */
+  models: string[];
+}
+
+export interface AiRequest {
+  provider: AiProviderId;
+  model?: string | null;
+  baseUrl?: string | null;
+  mode: AiMode;
+  prompt: string;
+  driver: string;
+  dialectHint?: string | null;
+  schemaContext: string;
+  currentSql?: string | null;
+  error?: string | null;
+}
+
+export interface AiResult {
+  sql: string | null;
+  explanation: string | null;
+  elapsedMs: number;
+  provider: AiProviderId;
 }

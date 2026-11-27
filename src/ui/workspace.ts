@@ -34,6 +34,8 @@ export interface WsConsole {
   sources: WsSource[];
   /** The Sources strip was open (even without attached sources). */
   fedShown: boolean;
+  /** Opened as a cross-source console (tab badge "N sources"); absent in older workspaces. */
+  crossSource?: boolean;
 }
 
 export interface WsTab {
@@ -90,6 +92,7 @@ function parseConsole(v: unknown): WsConsole {
     ownDb: str(c.ownDb),
     sources: Array.isArray(c.sources) ? c.sources.map(parseSource).filter((s): s is WsSource => s !== null) : [],
     fedShown: c.fedShown === true,
+    crossSource: c.crossSource === true,
   };
 }
 

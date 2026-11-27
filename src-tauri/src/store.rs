@@ -13,6 +13,11 @@ const KEYRING_SERVICE: &str = "DataTrip";
 const VAULT_KEYRING_SERVICE: &str = "DataTrip-Vault";
 const HISTORY_KEEP: i64 = 5000;
 
+/// Keychain user holding a Redis connection's sentinel password.
+fn sentinel_key(id: &str) -> String {
+    format!("{}:sentinel", id)
+}
+
 pub struct Store {
     connections_path: PathBuf,
     file_lock: tokio::sync::Mutex<()>,
@@ -136,8 +141,29 @@ impl Store {
             self.write_connections(&list)?;
         }
         self.clear_password(id);
+        self.clear_password(&sentinel_key(id));
         self.clear_vault_token(id);
         Ok(())
+    }
+
+    /// Redis Sentinel password (keychain user "<id>:sentinel").
+    /// None keeps the stored one, Some("") clears it, Some(p) stores it.
+    pub fn save_sentinel_password(&self, id: &str, password: Option<String>) {
+        if id.is_empty() {
+            return;
+        }
+        match password {
+            None => {}
+            Some(p) if p.is_empty() => self.clear_password(&sentinel_key(id)),
+            Some(p) => self.set_password(&sentinel_key(id), &p),
+        }
+    }
+
+    pub fn get_sentinel_password(&self, id: &str) -> Option<String> {
+        if id.is_empty() {
+            return None;
+        }
+        self.get_password(&sentinel_key(id))
     }
 
     // ----- passwords -----

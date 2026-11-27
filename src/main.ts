@@ -3,6 +3,7 @@ import { installInputUndo } from "./ui/inputUndo";
 import { loadSettings } from "./ui/settings";
 import "./styles/settings.css";
 import "./styles/shell.css";
+import "./styles/nav.css";
 
 // Platform classes drive the few OS-specific rules in glass.css:
 //  mac      -> reserve the traffic-light strip (titleBarStyle Overlay)

@@ -5839,3 +5839,150 @@ button.kf-name {
   opacity: 0.6;
   pointer-events: none;
 }
+
+/* ================================================================== Redis Sentinel (connection dialog) */
+.dialog .seg.redis-mode {
+  display: inline-flex;
+  align-self: flex-start;
+}
+.dialog .seg.redis-mode .seg-btn {
+  padding: 0 18px;
+}
+.sent-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.sent-sub {
+  color: var(--text-3);
+  font-weight: 400;
+}
+.sent-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 38px;
+  box-sizing: border-box;
+  padding: 6px;
+  border-radius: 18px;
+  background: var(--fill);
+  cursor: text;
+}
+.sent-chips:focus-within {
+  box-shadow: var(--focus-ring);
+}
+.sent-chip-list {
+  display: contents;
+}
+.sent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 4px 0 11px;
+  border-radius: var(--pill);
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text);
+  font: 12px var(--font-mono);
+}
+.sent-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-3);
+}
+.sent-dot.ok {
+  background: var(--ok);
+}
+.sent-dot.bad {
+  background: var(--danger);
+}
+.sent-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--text-3);
+}
+.sent-x:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text);
+}
+.sent-input {
+  flex: 1;
+  min-width: 140px;
+  height: 26px;
+  padding: 0 6px;
+  border: 0;
+  background: transparent;
+  outline: none;
+  color: var(--text);
+  font: 12px var(--font-mono);
+}
+.sent-err {
+  padding-left: 4px;
+  color: var(--danger-text);
+  font-size: 11.5px;
+}
+.sent-err:empty {
+  display: none;
+}
+.sent-auth {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--text-body);
+  font-size: 12.5px;
+}
+.sent-auth-title {
+  padding-top: 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+.ssh-sent-note {
+  margin-left: auto;
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 400;
+}
+.ssh-sent-note + .ssh-state {
+  margin-left: 8px;
+}
+.test-result.sent-report {
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  color: var(--text-body);
+}
+.test-result.sent-report.warn {
+  background: rgba(255, 159, 10, 0.1);
+}
+.sent-line {
+  display: flex;
+  gap: 8px;
+}
+.sent-g {
+  flex: none;
+  width: 14px;
+}
+.sent-line.ok .sent-g {
+  color: var(--ok-text);
+}
+.sent-line.bad .sent-g {
+  color: var(--danger-text);
+}
+.sent-line.note .sent-g {
+  color: var(--warn-text);
+}
+.sent-text {
+  font: 12px/18px var(--font-mono);
+  overflow-wrap: anywhere;
+}

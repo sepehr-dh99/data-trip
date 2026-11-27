@@ -30,6 +30,9 @@ import type {
   ReconnectResult,
   FedSource,
   FedResult,
+  AiProviderStatus,
+  AiRequest,
+  AiResult,
 } from "./types";
 
 /** Normalizes any thrown value from invoke() into an Error with a readable message. */
@@ -46,11 +49,13 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
 
 export const api = {
   listConnections: () => call<ConnectionConfig[]>("list_connections"),
-  saveConnection: (config: ConnectionConfig, password: string | null) =>
-    call<ConnectionConfig>("save_connection", { config, password }),
+  /** sentinelPassword (Redis Sentinel): null = keep the stored one, "" = clear. */
+  saveConnection: (config: ConnectionConfig, password: string | null, sentinelPassword: string | null = null) =>
+    call<ConnectionConfig>("save_connection", { config, password, sentinelPassword }),
   deleteConnection: (id: string) => call<null>("delete_connection", { id }),
-  testConnection: (config: ConnectionConfig, password: string | null, vaultToken: string | null = null) =>
-    call<ServerInfo>("test_connection", { config, password, vaultToken }),
+  /** sentinelPassword: typed sentinel password (null = the stored one). */
+  testConnection: (config: ConnectionConfig, password: string | null, vaultToken: string | null = null, sentinelPassword: string | null = null) =>
+    call<ServerInfo>("test_connection", { config, password, vaultToken, sentinelPassword }),
 
   /** database: connect to this database instead of the connection's default (null = default). */
   openSession: (connectionId: string, database: string | null = null) =>
@@ -174,4 +179,13 @@ export const api = {
   clearHistory: (connectionId: string | null) => call<number>("clear_history", { connectionId }),
   /** Number of history entries (one connection, or all when null). */
   countHistory: (connectionId: string | null) => call<number>("count_history", { connectionId }),
+
+  // ── v0.12: AI assistant ──
+  /** Which AI providers are installed / configured / running. */
+  aiProviders: () => call<AiProviderStatus[]>("ai_providers"),
+  /** One generation (write / fix / explain / refine). Never executes anything. Cancelled → error "AI_CANCELLED: …". */
+  aiGenerate: (request: AiRequest) => call<AiResult>("ai_generate", { request }),
+  aiCancel: () => call<null>("ai_cancel"),
+  /** Stores (or with null clears) the OpenAI-compatible API key in the keychain; it is never read back. */
+  aiSetApiKey: (key: string | null) => call<null>("ai_set_api_key", { key }),
 };

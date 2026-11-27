@@ -304,6 +304,20 @@ fn offsets_for_ts(
 // Connect / close
 // ---------------------------------------------------------------------------
 
+/// Host names such as `kafka-headless.ops`, `kafka.ns.svc` or `*.cluster.local` only exist in
+/// a Kubernetes cluster's DNS.
+fn looks_cluster_internal(server: &str) -> bool {
+    let host = server.rsplit("://").next().unwrap_or(server);
+    let host = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    host.contains("-headless")
+        || host.ends_with(".svc")
+        || host.contains(".svc.")
+        || host.ends_with(".cluster.local")
+}
+
 /// Turns a failed first metadata fetch into an actionable message: probes each bootstrap
 /// server with a plain TCP connect to tell "network can't reach it" (VPN, firewall, a broker
 /// only reachable through a jump host) from "reachable, but the handshake failed" (wrong
@@ -330,6 +344,19 @@ fn connect_error(servers: &str, protocol: &str, e: KafkaError) -> AppError {
         }
     }
     let base = format!("Could not connect to Kafka: {}.", e);
+    let internal = servers
+        .split(',')
+        .map(str::trim)
+        .find(|s| looks_cluster_internal(s));
+    if let (true, Some(name)) = (reachable.is_empty(), internal) {
+        return AppError::new(format!(
+            "{} {} looks like a Kubernetes-internal service name: it only resolves inside the \
+             cluster, not from this computer (even on VPN). Use the brokers' external addresses \
+             (ask your infrastructure team which bootstrap servers are reachable over VPN).",
+            base,
+            name.rsplit("://").next().unwrap_or(name)
+        ));
+    }
     if reachable.is_empty() && !unreachable.is_empty() {
         AppError::new(format!(
             "{} None of the bootstrap servers can be reached from this computer: {}. \

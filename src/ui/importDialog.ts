@@ -20,6 +20,8 @@ export function describeTarget(c: ConnectionConfig): string {
   const user = c.username ? c.username + "@" : "";
   const port = c.port != null ? ":" + c.port : "";
   const host = c.host && c.host.includes(":") ? `[${c.host}]` : c.host ?? "";
+  if (c.driver === "redis" && c.redis?.mode === "sentinel")
+    return `${user}sentinel: ${c.redis.masterName || "mymaster"} (${(c.redis.sentinels ?? []).join(", ")}) · db${c.database ?? "0"}${c.sslMode === "require" ? " · TLS" : ""}`;
   if (c.driver === "redis") return `${user}${host}${port} · db${c.database ?? "0"}${c.sslMode === "require" ? " · TLS" : ""}`;
   return `${user}${host}${port}${c.database ? "/" + c.database : ""}`;
 }
@@ -36,6 +38,8 @@ export function mergeForImport(cfg: ConnectionConfig, existing: ConnectionConfig
     sshProfileId: existing.sshProfileId ?? null,
     folder: existing.folder ?? null,
     scope: existing.scope ?? null,
+    // Sentinel setup is DataTrip-only (DataGrip has no Sentinel URL): keep it.
+    redis: cfg.redis ?? existing.redis ?? null,
   };
   if (!cfg.username && existing.username) merged.username = existing.username;
   return merged;

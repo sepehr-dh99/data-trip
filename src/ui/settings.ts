@@ -17,6 +17,7 @@ export type TabGroup = "source" | "database" | "kind" | "custom" | "none";
 export type TabNaming = "table" | "source" | "classic";
 export type KeymapPreset = "datatrip" | "datagrip" | "vscode";
 export type HistoryDays = 30 | 90 | 365 | 0;
+export type AiProvider = "codex" | "claude" | "openai" | "ollama";
 
 export interface CustomTabGroup {
   id: string;
@@ -67,6 +68,22 @@ export interface AppSettings {
     confirmRisky: boolean;
     autoReconnect: boolean;
   };
+  /** AI assistant in SQL consoles (v0.12). */
+  ai: {
+    provider: AiProvider;
+    /** Model for Codex / Claude Code / the API ("" = the provider's default). */
+    model: string;
+    /** OpenAI-compatible endpoint ("" = https://api.openai.com/v1). */
+    baseUrl: string;
+    /** Ollama model ("" = the first installed one). */
+    ollamaModel: string;
+    /** Send only the tables the request is about (+ FK neighbours) instead of the whole schema. */
+    autoTables: boolean;
+    /** Include 20 sample rows per picked table (never for read-only / production data sources). */
+    samples: boolean;
+    /** No AI at all for production data sources. */
+    blockProd: boolean;
+  };
 }
 
 export const FONT_STACKS: Record<EditorFont, string> = {
@@ -94,6 +111,7 @@ export function defaultSettings(): AppSettings {
     tabs: { placement: "top", sort: "manual", group: "source", naming: "table", customGroups: [], pinned: [] },
     keymap: { preset: "datatrip", overrides: {} },
     data: { historyDays: 90, restoreConsoles: true, confirmRisky: true, autoReconnect: true },
+    ai: { provider: "codex", model: "", baseUrl: "", ollamaModel: "", autoTables: true, samples: false, blockProd: true },
   };
 }
 
@@ -118,6 +136,7 @@ export function mergeSettings(raw: unknown): AppSettings {
   const t = isObj(raw.tabs) ? raw.tabs : {};
   const k = isObj(raw.keymap) ? raw.keymap : {};
   const x = isObj(raw.data) ? raw.data : {};
+  const ai = isObj(raw.ai) ? raw.ai : {};
 
   const tokenColors: Partial<Record<TokenKey, string>> = {};
   if (isObj(e.tokenColors)) {
@@ -181,6 +200,15 @@ export function mergeSettings(raw: unknown): AppSettings {
       restoreConsoles: bool(x.restoreConsoles, d.data.restoreConsoles),
       confirmRisky: bool(x.confirmRisky, d.data.confirmRisky),
       autoReconnect: bool(x.autoReconnect, d.data.autoReconnect),
+    },
+    ai: {
+      provider: oneOf<AiProvider>(ai.provider, ["codex", "claude", "openai", "ollama"], d.ai.provider),
+      model: str(ai.model, d.ai.model).trim(),
+      baseUrl: str(ai.baseUrl, d.ai.baseUrl).trim(),
+      ollamaModel: str(ai.ollamaModel, d.ai.ollamaModel).trim(),
+      autoTables: bool(ai.autoTables, d.ai.autoTables),
+      samples: bool(ai.samples, d.ai.samples),
+      blockProd: bool(ai.blockProd, d.ai.blockProd),
     },
   };
 }

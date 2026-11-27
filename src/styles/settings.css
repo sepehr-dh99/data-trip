@@ -514,12 +514,20 @@ html.grid-types .g-row.del .g-cell {
 }
 .st-fonts {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 16px;
 }
 .st-fonts-r {
   display: flex;
-  gap: 22px;
+  flex-wrap: wrap;
+  gap: 16px 22px;
+}
+.st-fonts-r > * {
+  flex-shrink: 0;
+}
+.st-fonts-r .seg-btn {
+  flex: 0 0 auto;
+  min-width: 64px;
 }
 .st-wrap {
   display: flex;

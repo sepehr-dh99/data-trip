@@ -72,6 +72,47 @@ pub struct ConnectionConfig {
     /// Kafka only. `host` holds the bootstrap servers ("b1:9092,b2:9092"); `username`/password are SASL creds.
     #[serde(default)]
     pub kafka: Option<KafkaConfig>,
+    /// Redis only: standalone (host/port) or Sentinel. None = standalone.
+    #[serde(default)]
+    pub redis: Option<RedisOptions>,
+}
+
+/// Redis topology. In sentinel mode `host`/`port` are ignored: the sentinels report the master.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedisOptions {
+    #[serde(default)]
+    pub mode: RedisMode,
+    /// "host:port" (port defaults to 26379), tried in order.
+    #[serde(default)]
+    pub sentinels: Vec<String>,
+    /// Monitored master name, e.g. "mymaster".
+    #[serde(default)]
+    pub master_name: String,
+    #[serde(default)]
+    pub read_from: RedisReadFrom,
+    /// ACL user for the sentinels (optional; used only when `sentinel_auth`).
+    #[serde(default)]
+    pub sentinel_username: Option<String>,
+    /// Sentinels have their own password (keychain user "<connection id>:sentinel").
+    #[serde(default)]
+    pub sentinel_auth: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RedisMode {
+    #[default]
+    Standalone,
+    Sentinel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RedisReadFrom {
+    #[default]
+    Master,
+    Replica,
 }
 
 /// Explorer visibility for one data source (UI-only; the backend just stores it).
@@ -244,6 +285,9 @@ pub struct VaultCheck {
 #[serde(rename_all = "camelCase")]
 pub struct ServerInfo {
     pub version: String,
+    /// Step-by-step report (Redis Sentinel): lines start with "✓ ", "✕ " or "! " (note).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

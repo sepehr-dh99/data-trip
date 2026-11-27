@@ -12,7 +12,7 @@ use crate::model::{
 use crate::session::Session;
 use crate::{vault, AppState};
 use std::time::Instant;
-use tauri::State;
+use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 #[tauri::command]
 pub async fn list_connections(state: State<'_, AppState>) -> AppResult<Vec<ConnectionConfig>> {
@@ -24,8 +24,13 @@ pub async fn save_connection(
     state: State<'_, AppState>,
     config: ConnectionConfig,
     password: Option<String>,
+    sentinel_password: Option<String>,
 ) -> AppResult<ConnectionConfig> {
     let saved = state.store.save_connection(config, password).await?;
+    // Redis Sentinel password: null keeps the stored one, "" clears it.
+    state
+        .store
+        .save_sentinel_password(&saved.id, sentinel_password);
     state.vault_cache.invalidate(&saved.id);
     Ok(saved)
 }
@@ -42,20 +47,26 @@ pub async fn test_connection(
     config: ConnectionConfig,
     password: Option<String>,
     vault_token: Option<String>,
+    sentinel_password: Option<String>,
 ) -> AppResult<ServerInfo> {
     // Unsaved edits: never read or populate the Vault credential cache.
     let creds = state.creds.clone();
     let connected = creds
-        .connect(
+        .connect_test(
             &config,
             password,
             vault_token.filter(|t| !t.trim().is_empty()),
-            false,
+            sentinel_password,
         )
         .await?;
     let version = connected.server_version.clone();
+    // Redis Sentinel: which sentinel answered, where the master is, PING.
+    let details = match &connected.conn {
+        crate::db::DbConn::Redis(r) if !r.details().is_empty() => Some(r.details().to_vec()),
+        _ => None,
+    };
     connected.conn.close().await;
-    Ok(ServerInfo { version })
+    Ok(ServerInfo { version, details })
 }
 
 #[tauri::command]
@@ -723,12 +734,20 @@ pub async fn federated_execute(
 /// Browser sign-in with Vault's OIDC auth method; stores the token like a pasted one.
 #[tauri::command]
 pub async fn vault_oidc_login(
+    app: AppHandle,
     state: State<'_, AppState>,
     profile_id: String,
     role: Option<String>,
 ) -> AppResult<VaultTokenInfo> {
     let profile = state.profiles.get_vault(&profile_id).await?;
-    let token = vault::oidc_login(&profile, role, &state.oidc).await?;
+    let window_app = app.clone();
+    let open = move |url: &str| -> AppResult<()> { open_oidc_window(&window_app, url) };
+    let result = vault::oidc_login(&profile, role, &state.oidc, &open).await;
+    // The sign-in window has done its job (or the login failed/was cancelled): close it.
+    if let Some(w) = app.get_webview_window(OIDC_WINDOW) {
+        let _ = w.close();
+    }
+    let token = result?;
     state.profiles.set_vault_token(&profile.id, &token);
     for conn_id in state.profiles.connections_using_vault(&profile.id).await? {
         state.vault_cache.invalidate(&conn_id);
@@ -737,6 +756,41 @@ pub async fn vault_oidc_login(
     vault::token_info(&cfg, None, Some(token), false)
         .await
         .map_err(|e| token_error(e, &profile.id, &profile.name))
+}
+
+const OIDC_WINDOW: &str = "vault-oidc";
+
+/// Shows Vault's OIDC sign-in page in a DataTrip window (no IPC access: it gets no capabilities).
+/// Closing that window cancels the sign-in. Falls back to the default browser if the window
+/// cannot be created.
+fn open_oidc_window(app: &AppHandle, url: &str) -> AppResult<()> {
+    let parsed: tauri::Url = match url.parse() {
+        Ok(u) => u,
+        Err(_) => return vault::open_browser(url),
+    };
+    if let Some(old) = app.get_webview_window(OIDC_WINDOW) {
+        let _ = old.close();
+    }
+    let built = WebviewWindowBuilder::new(app, OIDC_WINDOW, WebviewUrl::External(parsed))
+        .title("Sign in to Vault — DataTrip")
+        .inner_size(520.0, 720.0)
+        .min_inner_size(380.0, 480.0)
+        .center()
+        .focused(true)
+        .build();
+    match built {
+        Ok(w) => {
+            let handle = app.clone();
+            w.on_window_event(move |e| {
+                if let tauri::WindowEvent::Destroyed = e {
+                    // Closed by the user before finishing: stop waiting for the callback.
+                    let _ = handle.state::<AppState>().oidc.cancel();
+                }
+            });
+            Ok(())
+        }
+        Err(_) => vault::open_browser(url),
+    }
 }
 
 /// Aborts a pending `vault_oidc_login` (it fails with `OIDC_CANCELLED: …`).

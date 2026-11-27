@@ -107,7 +107,8 @@ export function autoName(t: TabPane): string {
   const naming = getSettings().tabs.naming;
   const cfg = connOf(t);
   const conn = cfg?.name ?? "";
-  const db = dbText(t);
+  // Cross-source consoles read several databases: no single database in the name.
+  const db = t.sourceBadge ? "" : dbText(t);
   if (t.kind !== "console") return naming === "source" && conn ? `${conn} / ${t.title}` : t.title;
   if (naming === "classic") return t.title;
   if (naming === "source") return `${conn || t.title}${db ? " / " + db : ""}${t.table ? " · " + t.table : ""}`;
@@ -512,6 +513,7 @@ export class TabStrip {
 
   private badge(t: TabPane): HTMLElement | null {
     if (getSettings().tabs.naming !== "table") return null;
+    if (t.sourceBadge) return h("span", { class: "tab-src multi" }, t.sourceBadge);
     const cfg = connOf(t);
     if (!cfg) return null;
     const c = connColor(cfg);

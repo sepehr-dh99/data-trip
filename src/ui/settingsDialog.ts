@@ -11,8 +11,9 @@ import { FONT_LABELS, FONT_STACKS, defaultSettings, effectiveTokenColors, getSet
 import type { AppSettings, EditorFont, KeymapPreset, LineHeight, PageSize } from "./settings";
 import { THEMES, TOKEN_KEYS, TOKEN_PALETTE } from "./themes";
 import type { TokenKey } from "./themes";
+import { buildAiSettings } from "./aiSettings";
 
-export type SettingsSection = "editor" | "appearance" | "results" | "tabs" | "keymap" | "data";
+export type SettingsSection = "editor" | "appearance" | "results" | "tabs" | "keymap" | "data" | "ai";
 
 interface SectionDef {
   id: SettingsSection;
@@ -29,6 +30,7 @@ const SECTIONS: SectionDef[] = [
   { id: "tabs", label: "Console tabs", short: "Tb", color: "#ff9f0a", sub: "Placement, sorting and names" },
   { id: "keymap", label: "Keymap", short: "Km", color: "#30b0c7", sub: "Keyboard shortcuts" },
   { id: "data", label: "Data & history", short: "Dh", color: "#34c759", sub: "History, safety and reconnects" },
+  { id: "ai", label: "AI assistant", short: "AI", color: "#bf5af2", sub: "Codex, Claude Code, API key or Ollama · what is sent" },
 ];
 
 const ACCENTS: [string, string][] = [
@@ -115,6 +117,12 @@ class SettingsWindow {
     this.buildTabs();
     this.buildKeymap();
     this.buildData();
+    this.section("ai", buildAiSettings({
+      row: (t, d, c, x) => this.row(t, d, c, x),
+      toggle: (l, g, st) => this.toggle(l, g, st),
+      textField: (l, g, st, m, w) => this.textField(l, g, st, m, w),
+      onSync: (f) => this.syncs.push(f),
+    }));
     for (const s of SECTIONS) {
       const sec = this.sections.get(s.id);
       if (sec) this.body.appendChild(sec.el);
@@ -207,6 +215,7 @@ class SettingsWindow {
       else if (id === "results") s.results = d.results;
       else if (id === "keymap") s.keymap = d.keymap;
       else if (id === "data") s.data = d.data;
+      else if (id === "ai") s.ai = d.ai;
       else {
         s.tabs.placement = d.tabs.placement;
         s.tabs.sort = d.tabs.sort;

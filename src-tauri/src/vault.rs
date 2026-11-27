@@ -853,7 +853,7 @@ async fn bind_callback_port(retry: bool) -> AppResult<TcpListener> {
 }
 
 /// Opens a URL in the default browser without going through a shell.
-fn open_browser(url: &str) -> AppResult<()> {
+pub fn open_browser(url: &str) -> AppResult<()> {
     let mut cmd = if cfg!(target_os = "macos") {
         let mut c = std::process::Command::new("open");
         c.arg(url);
@@ -904,10 +904,12 @@ async fn vault_json(addr: &str, what: &str, resp: reqwest::Response) -> AppResul
 
 /// Browser sign-in with Vault's OIDC auth method. Returns the new client token (never logged).
 /// `role`: explicit role, else the profile's `oidc_role`, else the mount's default role.
+/// `open` shows Vault's sign-in page (an in-app window, or the default browser).
 pub fn oidc_login<'a>(
     profile: &'a VaultProfile,
     role: Option<String>,
     logins: &'a OidcLogins,
+    open: &'a (dyn Fn(&str) -> AppResult<()> + Send + Sync),
 ) -> BoxFuture<'a, AppResult<String>> {
     Box::pin(async move {
         let cfg = config_from_profile(profile);
@@ -937,6 +939,7 @@ pub fn oidc_login<'a>(
             &role,
             listener,
             cancel.clone(),
+            open,
         )
         .await;
         logins.finish(&cancel);
@@ -952,6 +955,7 @@ async fn oidc_flow(
     role: &str,
     listener: TcpListener,
     cancel: Arc<Notify>,
+    open: &(dyn Fn(&str) -> AppResult<()> + Send + Sync),
 ) -> AppResult<String> {
     let nonce = format!(
         "{}{}",
@@ -988,7 +992,7 @@ async fn oidc_flow(
             "Vault returned an unexpected sign-in URL (not http/https).",
         ));
     }
-    open_browser(&auth_url)?;
+    open(&auth_url)?;
 
     let (code, state) =
         match tokio::time::timeout(OIDC_TIMEOUT, accept_callback(listener, cancel)).await {

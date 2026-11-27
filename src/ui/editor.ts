@@ -28,6 +28,9 @@ import { codeMirrorKey, matchAction, shortcutLabel } from "./keymap";
 import { onSettingsChange } from "./settings";
 import { REDIS_COMMANDS, redisLinesAt, splitRedisLines } from "./redis";
 import { CONSUME_FLAGS, KAFKA_COMMANDS, PRODUCE_FIELDS } from "./kafka";
+import { aiEditorExtension } from "./aiEditor";
+import { ViewPlugin, hoverTooltip } from "@codemirror/view";
+import type { DecorationSet, ViewUpdate } from "@codemirror/view";
 
 export interface EditorOptions {
   doc?: string;
@@ -39,6 +42,8 @@ export interface EditorOptions {
   onChange?: () => void;
   /** The caret / selection moved (restore-on-launch keeps the cursor position). */
   onCursor?: () => void;
+  /** Ask AI shortcut (⌘I) pressed in the editor (CodeMirror binds Mod-I itself otherwise). */
+  onAskAi?: () => void;
 }
 
 export interface Runnable {
@@ -416,6 +421,86 @@ function runGutterExtensions(initial: Driver, holder: RunHolder): Extension {
   ];
 }
 
+// ---- Cross-source helpers: `alias.` / `alias.schema.` completion, unattached-alias marks with a quick fix.
+
+/** A marked range (an alias-like prefix of a data source that isn't attached); `key` is the alias text. */
+export interface FedMark {
+  from: number;
+  to: number;
+  key: string;
+}
+
+export interface FedCompletion {
+  label: string;
+  /** Text inserted instead of the label (quoted names). */
+  apply?: string;
+  detail?: string;
+  type?: string;
+  boost?: number;
+}
+
+export interface FedHooks {
+  /** `path` = the dotted parts before the word being typed (["alias"] or ["alias", "schema"]); null = not ours. */
+  complete?(path: string[]): FedCompletion[] | null | Promise<FedCompletion[] | null>;
+  /** Ranges to underline in the whole document. */
+  marks?(doc: string): FedMark[];
+  /** Hover card of a mark (quick actions). */
+  tooltip?(m: FedMark): HTMLElement;
+}
+
+interface FedHolder {
+  hooks: FedHooks | null;
+  current: FedMark[];
+}
+
+const refreshFed = StateEffect.define<null>();
+const FED_MARK = Decoration.mark({ class: "cm-fed-unattached" });
+
+function fedExtensions(holder: FedHolder): Extension {
+  const build = (view: EditorView): DecorationSet => {
+    const hk = holder.hooks;
+    holder.current = [];
+    if (!hk?.marks || view.state.doc.length > 500_000) return Decoration.none;
+    const ms = hk.marks(view.state.doc.toString()).filter((m) => m.from < m.to && m.to <= view.state.doc.length);
+    holder.current = ms;
+    return Decoration.set(
+      ms.map((m) => FED_MARK.range(m.from, m.to)),
+      true,
+    );
+  };
+  const plugin = ViewPlugin.fromClass(
+    class {
+      decorations: DecorationSet;
+      constructor(view: EditorView) {
+        this.decorations = build(view);
+      }
+      update(u: ViewUpdate): void {
+        if (u.docChanged || u.transactions.some((tr: Transaction) => tr.effects.some((e) => e.is(refreshFed)))) this.decorations = build(u.view);
+      }
+    },
+    { decorations: (v: { decorations: DecorationSet }) => v.decorations },
+  );
+  const tip = hoverTooltip((_view: EditorView, pos: number) => {
+    const m = holder.current.find((x) => pos >= x.from && pos <= x.to);
+    const make = holder.hooks?.tooltip;
+    if (!m || !make) return null;
+    return { pos: m.from, end: m.to, above: true, create: () => ({ dom: make(m) }) };
+  });
+  const source = (ctx: CompletionContext): CompletionResult | null | Promise<CompletionResult | null> => {
+    const complete = holder.hooks?.complete;
+    if (!complete) return null;
+    const m = ctx.matchBefore(/[A-Za-z_][A-Za-z0-9_]*\.(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z0-9_]*$/);
+    if (!m || (m.from > 0 && ctx.state.sliceDoc(m.from - 1, m.from) === ".")) return null;
+    const parts = m.text.split(".");
+    const word = parts[parts.length - 1];
+    const finish = (opts: FedCompletion[] | null): CompletionResult | null =>
+      opts && opts.length ? { from: ctx.pos - word.length, options: opts as Completion[], validFor: /^[A-Za-z0-9_]*$/ } : null;
+    const res = complete(parts.slice(0, -1));
+    return res instanceof Promise ? res.then(finish, () => null) : finish(res);
+  };
+  return [plugin, tip, EditorState.languageData.of(() => [{ autocomplete: source }])];
+}
+
 export class SqlEditor {
   private view: EditorView;
   private lang = new Compartment();
@@ -425,6 +510,7 @@ export class SqlEditor {
   private runHolder: RunHolder = { cb: null };
   private keys = new Compartment();
   private offSettings: (() => void) | null = null;
+  private fedHolder: FedHolder = { hooks: null, current: [] };
 
   constructor(parent: HTMLElement, opts: EditorOptions) {
     this.driver = opts.driver;
@@ -434,6 +520,8 @@ export class SqlEditor {
     const extensions: Extension[] = [
       lineNumbers(),
       runGutterExtensions(opts.driver, this.runHolder),
+      aiEditorExtension(),
+      fedExtensions(this.fedHolder),
       highlightActiveLineGutter(),
       highlightActiveLine(),
       history(),
@@ -461,12 +549,18 @@ export class SqlEditor {
     parent.addEventListener(
       "keydown",
       (e: KeyboardEvent) => {
+        // Only keys typed in the editor itself (not in the AI prompt box floating over it).
+        if (e.target instanceof Node && !this.view.dom.contains(e.target)) return;
         const a = matchAction(e);
         if (a === "runStatement" || a === "runAll") {
           e.preventDefault();
           e.stopPropagation();
           if (a === "runAll") opts.onRunAll();
           else opts.onRun();
+        } else if (a === "askAi" && opts.onAskAi) {
+          e.preventDefault();
+          e.stopPropagation();
+          opts.onAskAi();
         }
       },
       true,
@@ -707,6 +801,11 @@ export class SqlEditor {
     }));
   }
 
+  /** The CodeMirror view, for the AI assistant (aiPanel.ts / aiEditor.ts). */
+  get cmView(): EditorView {
+    return this.view;
+  }
+
   setSchema(schema: Record<string, string[]>, driver: Driver): void {
     this.schema = schema;
     this.driver = driver;
@@ -714,6 +813,35 @@ export class SqlEditor {
   }
 
   focus(): void {
+    this.view.focus();
+  }
+
+  /** Cross-source completion / unattached-alias marks (null = off). */
+  setFedHooks(hooks: FedHooks | null): void {
+    this.fedHolder.hooks = hooks;
+    this.refreshFedMarks();
+  }
+
+  /** Recomputes the cross-source marks (attached sources changed). */
+  refreshFedMarks(): void {
+    this.view.dispatch({ effects: refreshFed.of(null) });
+  }
+
+  /** Document offset under a viewport point (drops), or null outside the text. */
+  posAtCoords(x: number, y: number): number | null {
+    return this.view.posAtCoords({ x, y });
+  }
+
+  /** Inserts `text` at `pos` (a drop) as its own undo step, caret after it. */
+  insertAt(pos: number, text: string): void {
+    const p = Math.max(0, Math.min(this.view.state.doc.length, pos));
+    this.view.dispatch({
+      changes: { from: p, to: p, insert: text },
+      selection: { anchor: p + text.length },
+      scrollIntoView: true,
+      userEvent: "input.drop",
+      annotations: isolateHistory.of("full"),
+    });
     this.view.focus();
   }
 

@@ -366,3 +366,199 @@ Approved designs (read them, they are the spec for look and behavior): `/home/cl
   source is connected in the explorer first when needed). Attached sources: null = the connection's default
   database. The console's own source: null = the console's current database. Sent as `FedSource.database` and
   persisted in the workspace.
+
+## v0.12 additions
+
+### Redis Sentinel
+
+Approved design: `/home/claude/canvas/project/RedisSentinel.dc.html`.
+
+| command | args (change) | returns |
+|---|---|---|
+| save_connection | + sentinelPassword: string\|null | ConnectionConfig. null = keep the stored sentinel password, "" = clear |
+| test_connection | + sentinelPassword: string\|null | ServerInfo (+ `details`). null/"" = use the stored one |
+
+- `ConnectionConfig.redis: RedisOptions | null` (null = standalone; all fields `#[serde(default)]`):
+  `{ mode: "standalone"|"sentinel", sentinels: string[] ("host:port", default port 26379, tried in order),
+  masterName: string, readFrom: "master"|"replica", sentinelUsername: string|null, sentinelAuth: boolean }`.
+  In sentinel mode `host`/`port` are ignored (kept so switching back restores them); `username`/password (keychain or
+  Vault), `database` (DB index), `sslMode` "require" (TLS) and `readOnly` apply to the resolved node.
+- Sentinel password: keychain service "DataTrip", user `<connection id>:sentinel` (never from Vault, never in JSON,
+  never sent to the UI; deleted with the connection). Used only when `sentinelAuth`.
+- `ServerInfo.details?: string[]` — test report lines, each starting with `"✓ "`, `"✕ "` or `"! "` (note), e.g.
+  `✕ 10.0.40.11:26379 — connection refused, trying next`, `✓ 10.0.40.12:26379 answered: master “mymaster” is
+  10.0.40.21:6379`, `✓ Replicas: 10.0.40.22:6379, 10.0.40.23:6379 (down)`, `✓ Connected to master · role master ·
+  AUTH ok · db 14 · PING 4 ms`. Absent for every other driver / standalone.
+- Resolution (backend `db/redis.rs`, on every physical connect, so reconnects follow a failover): for each sentinel in
+  order (through its own SSH forward when `sshProfileId` is set; SSH errors abort at once): connect (3 s), `AUTH
+  [user] pass` when `sentinelAuth`, `SENTINEL get-master-addr-by-name <master>` (nil → that sentinel doesn't know the
+  master → next), `SENTINEL replicas <master>` (fallback `SENTINEL slaves`). First answer wins. readFrom "replica"
+  → first replica whose flags lack s_down / o_down / disconnected and whose master-link-status is ok; none → the
+  master, with a `!` note. Then connect to that node like standalone (TLS uses the same setting as for the
+  sentinels; new SSH forward to the reported address, resolved on the SSH server), `ROLE`: a master that answers
+  `slave` → resolve once more, then error. PING latency closes the report. Whole connect capped at 45 s.
+- Errors: all sentinels failed → `Couldn't reach any sentinel: a:26379 (connection refused); b:26379 (timed out after
+  3 s).`; no sentinel knows the name → `Sentinel doesn't know master '<name>' (asked …). Check the master name.`;
+  sentinel AUTH → `Sentinel authentication failed: …` (NOAUTH → "needs a password (turn on “Sentinels need their own
+  password”)"); master AUTH → `Authentication failed at the master <addr>: …`; other master errors → `Couldn't connect
+  to the master <addr> reported by sentinel <addr>: …`.
+- Dialog: Redis gets Mode Standalone | Sentinel; sentinel shows the nodes chip input (Enter / comma / paste a comma- or
+  space-separated list, validated, ✕ removes, Backspace on empty input removes the last), Master name (empty =
+  "mymaster"), Read from Master | Replica, switch "Sentinels need their own password" → username (optional) +
+  password; the auth section is titled "Master authentication"; the SSH summary notes "tunnels the sentinels and the
+  master they report". Test connection renders `details` with ✓ / ✕ / ! and colours the chips' dots.
+- UI labels: `sentinelLabel(cfg)` in `src/ui/redis.ts` → `"sentinel: <master>"` (explorer tooltip, console result
+  pill, import preview) instead of host:port.
+- DataGrip import: DataGrip's Redis driver has no Sentinel URL, so `jdbc:redis:sentinel…` stays unsupported (message
+  points to Mode: Sentinel).
+
+### Navigation & cross-source UX
+
+Approved designs: `/home/claude/canvas/project/Navigation.dc.html` (M), `CrossSourceUX.dc.html` (O). Frontend only,
+except the macOS menu bar (`src-tauri/src/app_menu.rs`); no new commands.
+
+- **Sidebar**: the + next to the explorer filter only adds a connection. A toolbar at the bottom of the sidebar has
+  Settings (⌘,), Vault profiles, SSH configurations, Query history (⇧⌘H), Import from DataGrip (tooltips: name +
+  shortcut) and a "⌘K" pill (command palette). Density moved to View › Compact explorer / Settings › Appearance.
+- **Keymap**: new actions `commandPalette` (default Mod-K, all presets) and `askAi` (Mod-I). Both are matched by a
+  window *capture* keydown listener in `App` (so CodeMirror's Mod-I "select parent syntax" never sees them), except
+  while an `.overlay` dialog is open.
+- **Command palette** (`src/ui/palette.ts`): groups Actions (every command with its current shortcut label),
+  Data sources (→ open a console), Open tabs (→ activate), Tables (only metadata the explorer already loaded: each
+  connected SQL source's default database + databases whose introspection is ready; capped at 5000; → open data like
+  a double-click). Fuzzy subsequence filter (substring and word starts rank first), ↑↓ ↵ Esc.
+- **Command ids** (`MenuCommand` in `src/ui/appMenu.ts`, dispatched by `App.runCommand(id)`; the macOS menu uses the
+  same ids): about, settings, keyboardShortcuts, helpShortcuts, newConnection, newConsole, newCrossSource,
+  importDataGrip, vaultProfiles, sshProfiles, reopenTab, closeTab, undo, redo, cut, copy, paste, selectAll,
+  tabsTop, tabsLeft, tabsRight, toggleSidebar, compactExplorer, queryHistory, commandPalette, helpPalette,
+  runStatement, runAll, cancel, formatSql, askAi, attachSource, reconnect, nextTab, prevTab, jumpToTab,
+  crossSourceGuide.
+- **macOS menu bar**: `app_menu::with_app_menu(builder)` (cfg macOS; a no-op elsewhere) sets DataTrip (About, Settings…,
+  Keyboard shortcuts…, Hide, Hide others, Show all, Quit), File, Edit (predefined undo / redo / cut / copy / paste /
+  select all, which keep their accelerators), View, Console, Window (predefined minimize / zoom + tab items), Help.
+  Custom items have **no accelerators** (the webview handles and remaps those shortcuts; an accelerator would
+  double-fire) and emit the Tauri event **`menu`** with the item id as payload (`core:default` covers listening).
+- **Windows / Linux**: no native menu bar. A ☰ button at the left of the console tab bar opens the same structure
+  as a two-level in-app dropdown (menu titles → items, with shortcut hints and check marks). Its Edit items act on
+  the element that had focus before the menu opened (`execCommand`; paste via `navigator.clipboard.readText`).
+- **Ask AI hook**: `askAi` (shortcut, menu, palette) dispatches `window` CustomEvent **`dt-action`** with
+  `detail: { id: "askAi" }`, `cancelable: true`. The AI assistant listens for it and calls `preventDefault()` when it
+  handled it; unhandled → toast "Ask AI isn't available in this build".
+- **Explorer multi-select**: ⌘-click (Ctrl-click elsewhere) on data-source rows toggles them into a selection (the
+  first ⌘-click keeps the previously selected source); a plain click clears it. Right-click inside a selection of ≥ 2:
+  "N data sources selected", **New cross-source console (N sources)** (SQL sources only, needs 2), Reconnect all,
+  Disconnect all, Clear selection.
+- **New cross-source console** (explorer selection, File menu, palette; without a selection a picker of SQL data
+  sources asks for ≥ 2, the first picked is the console's own source): a console titled "cross-source" (then
+  "cross-source 2"…) with the others attached (alias = slug), the Sources strip open and the guide card. The tab
+  shows a badge "N sources" (`TabPane.sourceBadge`; the automatic name then omits the database) while sources are
+  attached. `WsConsole.crossSource?: boolean` restores it.
+- **Guide card**: three steps + "Insert an example query" over the editor; hidden on the first `beforeinput` (typing,
+  paste, delete) or ✕; "How does this work?" in the Sources strip (and Help › Cross-source queries guide) shows it
+  again. The example (`exampleQuery` in `src/ui/crossSource.ts`) connects / loads the sources if needed and picks one
+  table from each of the first two sources with tables: best join `a.<singular(b)>_id = b.id` (either way), then a
+  shared `*_id` column, then shared uuid/email/code/sku/name, then `id`; plain tables and the default schema first.
+  No join column → the first table of each with a first-column join and a comment to adjust it. Names are bare when
+  lower-case identifiers, else double-quoted.
+- **Completion**: `<alias>.` completes the source's schemas, `<alias>.<schema>.` its tables (own alias and attached
+  aliases, only while the Sources strip is in use); introspection comes from the explorer store and is loaded
+  lazily (the source is connected in the explorer if needed).
+- **Unattached alias**: in SQL consoles of a cross-source driver, `foo.schema.table` (outside strings / comments, not
+  preceded by `.`) where `foo` equals the alias slug of a SQL data source that is neither the console's nor
+  attached, and is not a database name of the console's server, gets a wavy underline; hovering shows "foo isn't
+  attached to this console" with **Attach <Source> (<driver>) as foo** and **Choose source…** (attaches the picked
+  one as foo).
+- **Drag a table in**: explorer table / view rows of SQL sources are draggable (`application/x-datatrip-table`, JSON
+  `{connId, database, schema, table}`; text/plain = the qualified name). Over a console editor a dashed overlay says
+  what the drop does. Same data source → inserts `schema.table` (dialect-qualified; `ownAlias.schema.table` while
+  the console runs cross-source). Another SQL source → attaches it (alias = slug, unique; its database = the table's
+  database when that isn't the default) unless already attached, and inserts `alias.schema.table` at the drop point.
+- `tauri.conf.json`: the main window has `dragDropEnabled: false` (no native file drops are used; on Windows the
+  native handler otherwise swallows HTML5 drag and drop inside the webview).
+
+### AI assistant
+
+Approved design: `/home/claude/canvas/project/AiAssist.dc.html` (N). Backend `src-tauri/src/ai.rs` (commands
+registered as `ai::…` in `lib.rs`, state `ai::AiState` managed separately from `AppState`); frontend
+`src/ui/ai.ts` (context, prod detection, providers), `aiPanel.ts` (prompt box, action bar, Fix with AI),
+`aiEditor.ts` (CodeMirror extension), `aiSettings.ts` (Settings › AI assistant), `src/styles/ai.css`.
+
+| command | args | returns |
+|---|---|---|
+| ai_providers | – | AiProviderStatus[] (codex, claude, openai, ollama — always in that order) |
+| ai_generate | request: AiRequest | AiResult |
+| ai_cancel | – | null |
+| ai_set_api_key | key: string\|null | null (null / "" clears) |
+
+- `AiProviderStatus { id, available, signedIn: bool|null, path: string|null, detail, models: string[] }`.
+  Codex/Claude: `available` = the CLI (`codex`, `claude`; Windows `.exe`/`.cmd`/`.bat`) is found on PATH or in
+  /opt/homebrew/bin, /usr/local/bin, /usr/bin, ~/.local/bin, ~/.npm-global/bin, ~/.volta/bin, ~/.bun/bin,
+  ~/.claude/local, ~/.cargo/bin, ~/.nvm/versions/node/*/bin (newest first), %APPDATA%\npm (GUI apps on macOS get a
+  minimal PATH). Codex `signedIn` = `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) exists (no process is
+  started); Claude `signedIn` = null. openai: `available` = an API key is stored. ollama: GET
+  `http://127.0.0.1:11434/api/tags` (1 s timeout) → `available` + `models`.
+- `AiRequest { provider: "codex"|"claude"|"openai"|"ollama", model?, baseUrl?, mode: "write"|"fix"|"explain"|"refine",
+  prompt, driver, dialectHint?, schemaContext, currentSql?, error? }` → `AiResult { sql: string|null, explanation:
+  string|null, elapsedMs, provider }`. The backend builds ONE prompt (rules: "You write <dialect> SQL for DataTrip …
+  exactly one ```sql code block and at most two short sentences …", the schema context, then per mode the request /
+  the failed statement + error / the previous SQL + requested change / the SQL to explain), runs the provider and
+  parses the first ```sql block (else the first fenced block, else the whole reply) as `sql`, the remaining prose as
+  `explanation`. `explain` → `sql` null, `explanation` = the reply without fences. **Generated SQL is never
+  executed.** Empty reply / no SQL → error.
+  - codex: `codex exec --skip-git-repo-check --sandbox read-only --color never --output-last-message <tmp>/answer.md
+    [--model m] -` with the prompt on stdin; reply = that file (stdout as fallback).
+  - claude: `claude -p --output-format text [--model m]`, prompt on stdin, reply = stdout.
+  - Both: `tokio::process`, no shell, cwd = a fresh empty temp dir (deleted afterwards, also on cancel), PATH = the
+    CLI's directory + the extra directories + the inherited PATH (node-based CLIs need `node`), `NO_COLOR=1`,
+    Windows CREATE_NO_WINDOW, `kill_on_drop`. Non-zero exit → error with the stderr tail; auth-looking errors say to
+    run `codex login` / `claude`. Not found → "Codex CLI not found. Install it with `npm i -g @openai/codex`, then run
+    `codex login` …".
+  - openai: POST `{baseUrl or https://api.openai.com/v1}/chat/completions` `{model (default gpt-4o-mini), messages:
+    [{role:"user", content: prompt}]}` with `Authorization: Bearer <key>`; reply = `choices[0].message.content`.
+  - ollama: POST `http://127.0.0.1:11434/api/chat` `{model (default: first installed), messages, stream:false}`;
+    reply = `message.content`.
+  - Timeout 120 s (error names the provider). One request at a time app-wide: a new `ai_generate` cancels the
+    previous one; `ai_cancel` kills the process / drops the HTTP request. Cancelled → error starting `AI_CANCELLED:`
+    (the UI drops it silently).
+- API key: keychain service `"DataTrip-AI"`, user `"openai-api-key"` (in-memory fallback for this run when no
+  keychain works). Never returned to the UI.
+- **Settings** `ai: { provider (default "codex"), model ("" = provider default; Codex / Claude / API), baseUrl,
+  ollamaModel ("" = first installed), autoTables (true), samples (false), blockProd (true) }`. Settings › AI assistant:
+  provider cards with live status (● Signed in / Not signed in / Not found, ● Installed, ● Key set / Not set,
+  ● Running / Not running) + "Check again", Model, API key (write-only: Save / Clear) + Base URL for the API, Ollama
+  model (+ installed models as chips), and the three toggles.
+- **Production data sources**: `readOnly`, or "prod" / "production" as a word of the name or folder
+  (`/(^|[^a-z0-9])prod(uction)?([^a-z0-9]|$)/i`, so "Prod PG", "eu-prod", "prod_db", folder "Production", not
+  "products"). With `blockProd` on they get no AI at all (Ask AI → info toast naming the setting; no Fix with AI
+  button); everything else works normally. Sample rows are never sent for them, whatever `samples` says.
+- **Schema context** (frontend, `buildSchemaContext`, from the explorer's cached introspection of the console's
+  database, loaded on demand): tables are scored against the words of the request + the SQL / error it is about
+  (table name or schema.table = 10, all parts of a multi-word name = 8, else 3 per name part; +1 per non-generic
+  column name, max 4; naive singular/plural). With `autoTables`: tables scoring ≥ 2 (max 25) + tables they
+  reference and tables referencing them (FKs) up to 25 in full; nothing matched → whole schema when ≤ 25 tables, else
+  table names only. Without `autoTables`: whole schema when ≤ 60 tables, else as with it. Full tables are rendered as
+  `CREATE TABLE schema.table (col type [NOT NULL], …, PRIMARY KEY (…), FOREIGN KEY (…) REFERENCES …);` (views as
+  `CREATE VIEW`, max 80 columns, schema-qualified for PostgreSQL / SQL Server, quoted only when needed), the rest as
+  one `-- Other tables (names only): …` line (max 300); total ≤ 60 000 chars. Samples (`samples` on, not prod): `SELECT
+  * … LIMIT 20` (MSSQL `TOP 20`) on the console's session for the 3 best tables, appended as comment lines (cells ≤ 40
+  chars). These sample queries go through `execute`, so they appear in the query history.
+- **UI** (SQL consoles only; Redis / Kafka and cross-source runs get no AI): "✦ Ask AI ⌘I" in the capsule controls
+  and the `askAi` action (`dt-action` event, handled by the visible console; no console → toast) open the prompt box
+  under the cursor line: input, Generate ↵ (Esc closes), chips "<source> · <database>", "Tables: … (picked from your
+  question)" (live), "Schema only · no row data" / "Schema + 20 sample rows", provider chip (→ Settings). With a
+  selection it also offers **Explain selection** (mode explain, shown in the box). Running: spinner + Cancel (button
+  or Esc) → `ai_cancel`. Errors stay in the box with "AI settings…".
+- **Pending insertion** (`aiEditor.ts`): the SQL is inserted after the statement under the cursor (or on the empty
+  cursor line; an unterminated previous statement gets a pending `;`) with `addToHistory: false`; its lines are
+  purple-tinted with a `+` in the line-number gutter (`gutterLineClass`) and a block widget action bar below:
+  "<Provider> · 2.1 s · used N tables", **Accept ⇥** (Tab), **Reject esc** (Esc), **Refine…** (box with the previous
+  prompt, mode refine with the pending SQL; the result replaces the pending one), **Explain** (the reply's sentences,
+  else a mode explain request; shown under the bar). Accept removes the pending text without history and re-applies
+  it as ONE isolated undo step (`isolateHistory "full"`, userEvent `input.ai`), then toasts "Inserted — nothing runs
+  until you press ⌘↵". Reject removes it without a trace in the history. Restore-on-launch saves the text without
+  pending AI text.
+- **Fix with AI**: the error view of a failed SQL statement (not connection-lost, not cross-source) shows "✦ Fix with
+  AI" + "Copy error" + the board's hint. It finds the statement in the editor (same normalized text, the one under
+  the cursor first; gone → toast), sends mode fix with the statement + error + context, and shows a line diff over
+  it: removed lines red / struck out with `−`, added lines green with `+` right after them, same action bar; Accept
+  replaces the statement (its `;` stays) as one undo step. An unchanged reply → toast "found nothing to change".

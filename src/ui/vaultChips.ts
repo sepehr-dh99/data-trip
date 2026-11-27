@@ -130,7 +130,7 @@ export class VaultChips {
       b.classList.toggle("oidc", oidc);
       b.classList.toggle("pending", vaults.oidcPending === p.id);
       b.title = oidc
-        ? `${p.name} — ${dotTitle[tone]} · ${eff === "expired" || eff === "invalid" ? "click to sign in with your browser" : "OIDC sign-in"}`
+        ? `${p.name} — ${dotTitle[tone]} · ${eff === "expired" || eff === "invalid" ? "click to sign in" : "OIDC sign-in"}`
         : `${p.name} — ${dotTitle[tone]} · click to paste a new token`;
       b.querySelector(".vchip-name")!.textContent = p.name;
       b.querySelector(".vchip-time")!.textContent = this.chipText(p.id);
@@ -216,7 +216,7 @@ export function openTokenPopover(profileId: string, anchor: HTMLElement): void {
     st.textContent = statusText(profileId);
     const info = vaults.state(profileId).info;
     renewBtn.style.display = info?.renewable && vaults.effective(profileId) === "valid" ? "" : "none";
-    if (isOidc) signIn.textContent = vaults.effective(profileId) === "valid" ? "Sign in again" : "Sign in with browser";
+    if (isOidc) signIn.textContent = vaults.effective(profileId) === "valid" ? "Sign in again" : "Sign in";
   };
   const unsub = vaults.subscribe(syncHead);
   renewBtn.onclick = async () => {
@@ -240,11 +240,11 @@ export function openTokenPopover(profileId: string, anchor: HTMLElement): void {
     close();
     openVaultProfilesDialog({ select: profileId });
   };
-  const signIn = h("button", { class: "btn primary sm oidc-signin", type: "button" }, "Sign in with browser");
+  const signIn = h("button", { class: "btn primary sm oidc-signin", type: "button" }, "Sign in");
   signIn.onclick = async () => {
     signIn.disabled = true;
     status.className = "vpop-status busy";
-    status.textContent = "Waiting for browser sign-in…";
+    status.textContent = "Waiting for sign-in…";
     const ok = await startOidcSignIn(profileId, status);
     signIn.disabled = false;
     if (ok) window.setTimeout(close, 1200);
@@ -279,7 +279,7 @@ export function openTokenPopover(profileId: string, anchor: HTMLElement): void {
 export async function startOidcSignIn(profileId: string, status?: HTMLElement): Promise<boolean> {
   const p = vaults.get(profileId);
   if (!p) return false;
-  if (!status) toast(`Finish signing in to ${p.name} in your browser…`, "info", 6000);
+  if (!status) toast(`Finish signing in to ${p.name} in the sign-in window…`, "info", 6000);
   try {
     const info = await vaults.oidcLogin(profileId);
     const who = info.displayName ? ` as ${info.displayName}` : "";

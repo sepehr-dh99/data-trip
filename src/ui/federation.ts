@@ -34,3 +34,56 @@ export function uniqueAlias(base: string, taken: string[]): string {
     if (!low.has(c.toLowerCase())) return c;
   }
 }
+
+// ---- dragging a table from the explorer into a console
+
+/** dataTransfer type of a table dragged from the explorer (JSON of `TableDrag`). */
+export const TABLE_DRAG_MIME = "application/x-datatrip-table";
+
+/** A table being dragged from the explorer. `database` is the real database name (never null for server sources). */
+export interface TableDrag {
+  connId: string;
+  database: string | null;
+  schema: string;
+  table: string;
+}
+
+let currentDrag: TableDrag | null = null;
+
+/**
+ * The table under an explorer drag right now (dragover can't read dataTransfer data, only its types; the drop
+ * target uses this to describe what dropping would do).
+ */
+export function tableDrag(): TableDrag | null {
+  return currentDrag;
+}
+
+export function setTableDrag(d: TableDrag | null): void {
+  currentDrag = d;
+}
+
+/** Reads the dropped table from a drop event (null when it isn't one). */
+export function droppedTable(ev: DragEvent): TableDrag | null {
+  const raw = ev.dataTransfer?.getData(TABLE_DRAG_MIME);
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as Partial<TableDrag>;
+    if (typeof v.connId !== "string" || typeof v.schema !== "string" || typeof v.table !== "string") return null;
+    return { connId: v.connId, database: typeof v.database === "string" ? v.database : null, schema: v.schema, table: v.table };
+  } catch {
+    return null;
+  }
+}
+
+export function hasTableDrag(ev: DragEvent): boolean {
+  return ev.dataTransfer?.types.includes(TABLE_DRAG_MIME) === true;
+}
+
+// A row removed from the virtualized tree mid-drag never gets its own dragend.
+window.addEventListener("dragend", () => setTableDrag(null));
+window.addEventListener("drop", () => window.setTimeout(() => setTableDrag(null), 0));
+
+/** A name part of an `alias.schema.table` reference: bare when it is a plain lower-case identifier, else "quoted". */
+export function refPart(name: string): string {
+  return /^[a-z_][a-z0-9_]*$/.test(name) ? name : `"${name.replace(/"/g, '""')}"`;
+}

@@ -6,12 +6,14 @@
 use super::{float_value, hex_value, int_value, Connected, DbConn, RowSink, StreamEnd};
 use crate::error::{AppError, AppResult};
 use crate::model::{
-    ColumnMeta, ConnectionConfig, DatabaseNode, ObjectGroup, ObjectItem, RedisKey, RedisScanResult,
-    RedisValue,
+    ColumnMeta, ConnectionConfig, DatabaseNode, Driver, ObjectGroup, ObjectItem, RedisKey,
+    RedisMode, RedisReadFrom, RedisScanResult, RedisValue,
 };
+use crate::ssh::{ForwardLease, TunnelManager};
 use futures::future::BoxFuture;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 /// A Redis connection plus the settings the driver needs per command.
 pub struct RedisConn {
@@ -19,6 +21,14 @@ pub struct RedisConn {
     read_only: bool,
     /// Selected database index.
     db: i64,
+    /// Sentinel resolution report (empty for standalone), shown by Test connection.
+    details: Vec<String>,
+}
+
+impl RedisConn {
+    pub fn details(&self) -> &[String] {
+        &self.details
+    }
 }
 
 /// Largest string value returned by `redis_get` (bytes).
@@ -59,11 +69,139 @@ fn app_err(e: ::redis::RedisError) -> AppError {
     AppError::new(err_text(&e))
 }
 
+fn trimmed(s: Option<&str>) -> Option<String> {
+    s.map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+}
+
+fn use_tls(cfg: &ConnectionConfig) -> bool {
+    cfg.ssl_mode.as_deref() == Some("require")
+}
+
+fn node_addr(host: String, port: u16, tls: bool) -> ::redis::ConnectionAddr {
+    if tls {
+        // VERIFY: field set of ConnectionAddr::TcpTls in redis 0.27 (host, port, insecure, tls_params).
+        ::redis::ConnectionAddr::TcpTls {
+            host,
+            port,
+            insecure: false,
+            tls_params: None,
+        }
+    } else {
+        ::redis::ConnectionAddr::Tcp(host, port)
+    }
+}
+
+/// Why a node could not be used: the text shown to the user, and whether the server rejected the credentials.
+struct NodeErr {
+    text: String,
+    auth: bool,
+}
+
+fn node_err(e: &::redis::RedisError) -> NodeErr {
+    let text = err_text(e);
+    let upper = text.to_uppercase();
+    let auth = e.kind() == ::redis::ErrorKind::AuthenticationFailed
+        || upper.contains("WRONGPASS")
+        || upper.contains("NOAUTH")
+        || upper.contains("INVALID PASSWORD")
+        || upper.contains("INVALID USERNAME");
+    NodeErr { text, auth }
+}
+
+/// Awaits `fut`, with a time limit when one is given.
+async fn limited<T, F>(limit: Option<Duration>, fut: F) -> Result<T, NodeErr>
+where
+    F: std::future::Future<Output = Result<T, ::redis::RedisError>>,
+{
+    match limit {
+        None => fut.await.map_err(|e| node_err(&e)),
+        Some(d) => match tokio::time::timeout(d, fut).await {
+            Ok(r) => r.map_err(|e| node_err(&e)),
+            Err(_) => Err(NodeErr {
+                text: format!("timed out after {} s", d.as_secs()),
+                auth: false,
+            }),
+        },
+    }
+}
+
+/// One command, raw reply or the redis-rs error (for classification).
+fn raw_query<'a>(
+    conn: &'a mut ::redis::aio::MultiplexedConnection,
+    cmd: ::redis::Cmd,
+) -> BoxFuture<'a, Result<::redis::Value, ::redis::RedisError>> {
+    Box::pin(async move {
+        let v: ::redis::Value = cmd.query_async(conn).await?;
+        Ok(v)
+    })
+}
+
+/// Opens a multiplexed connection to one node: AUTH (ACL user optional) and SELECT happen in the handshake.
+async fn open_node(
+    addr: ::redis::ConnectionAddr,
+    db: i64,
+    username: Option<String>,
+    password: Option<String>,
+    limit: Option<Duration>,
+) -> Result<::redis::aio::MultiplexedConnection, NodeErr> {
+    let info = ::redis::ConnectionInfo {
+        addr,
+        // VERIFY: RedisConnectionInfo has `db: i64`, `username`, `password` and implements Default.
+        redis: ::redis::RedisConnectionInfo {
+            db,
+            username,
+            password,
+            ..Default::default()
+        },
+    };
+    let client = ::redis::Client::open(info).map_err(|e| node_err(&e))?;
+    // VERIFY: exists in redis 0.27 with features "aio" + "tokio-comp".
+    limited(limit, client.get_multiplexed_async_connection()).await
+}
+
+/// Wraps an open connection (server version from INFO server).
+async fn finish(
+    conn: ::redis::aio::MultiplexedConnection,
+    cfg: &ConnectionConfig,
+    db: i64,
+    details: Vec<String>,
+    tunnel: Option<ForwardLease>,
+) -> Connected {
+    let mut rc = RedisConn {
+        conn,
+        read_only: cfg.read_only,
+        db,
+        details,
+    };
+    let version = match info_map(&mut rc.conn, "server").await {
+        Ok(m) => m
+            .get("redis_version")
+            .or_else(|| m.get("valkey_version"))
+            .cloned()
+            .unwrap_or_else(|| "Redis".to_string()),
+        Err(_) => "Redis".to_string(),
+    };
+    Connected {
+        conn: DbConn::Redis(rc),
+        server_version: version,
+        default_schema: None,
+        database: Some(db.to_string()),
+        backend_id: None,
+        tunnel,
+    }
+}
+
 pub fn connect<'a>(
     cfg: &'a ConnectionConfig,
     password: Option<&'a str>,
 ) -> BoxFuture<'a, AppResult<Connected>> {
     Box::pin(async move {
+        if is_sentinel(cfg) {
+            // Callers without the credentials layer: no sentinel password, no SSH tunnel.
+            return connect_sentinel(cfg, password, None, None).await;
+        }
         let db = db_index(cfg)?;
         let host = cfg
             .host
@@ -73,61 +211,508 @@ pub fn connect<'a>(
             .unwrap_or("127.0.0.1")
             .to_string();
         let port = cfg.port.unwrap_or(6379);
-        let tls = cfg.ssl_mode.as_deref() == Some("require");
-        let addr = if tls {
-            // VERIFY: field set of ConnectionAddr::TcpTls in redis 0.27 (host, port, insecure, tls_params).
-            ::redis::ConnectionAddr::TcpTls {
-                host,
-                port,
-                insecure: false,
-                tls_params: None,
-            }
-        } else {
-            ::redis::ConnectionAddr::Tcp(host, port)
-        };
-        let info = ::redis::ConnectionInfo {
-            addr,
-            // VERIFY: RedisConnectionInfo has `db: i64`, `username`, `password` and implements Default.
-            redis: ::redis::RedisConnectionInfo {
-                db,
-                username: cfg
-                    .username
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|u| !u.is_empty())
-                    .map(str::to_string),
-                password: password.filter(|p| !p.is_empty()).map(str::to_string),
-                ..Default::default()
-            },
-        };
-        let client = ::redis::Client::open(info).map_err(app_err)?;
-        // VERIFY: exists in redis 0.27 with features "aio" + "tokio-comp".
-        let conn = client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(app_err)?;
-        let mut rc = RedisConn {
-            conn,
-            read_only: cfg.read_only,
+        let conn = open_node(
+            node_addr(host, port, use_tls(cfg)),
             db,
-        };
-        let version = match info_map(&mut rc.conn, "server").await {
-            Ok(m) => m
-                .get("redis_version")
-                .or_else(|| m.get("valkey_version"))
-                .cloned()
-                .unwrap_or_else(|| "Redis".to_string()),
-            Err(_) => "Redis".to_string(),
-        };
-        Ok(Connected {
-            conn: DbConn::Redis(rc),
-            server_version: version,
-            default_schema: None,
-            database: Some(db.to_string()),
-            backend_id: None,
-            tunnel: None,
-        })
+            trimmed(cfg.username.as_deref()),
+            password.filter(|p| !p.is_empty()).map(str::to_string),
+            None,
+        )
+        .await
+        .map_err(|e| AppError::new(e.text))?;
+        Ok(finish(conn, cfg, db, Vec::new(), None).await)
     })
+}
+
+// ---------------------------------------------------------------------------
+// Sentinel
+// ---------------------------------------------------------------------------
+
+/// Default sentinel port when a node has none.
+pub const SENTINEL_PORT: u16 = 26379;
+/// Per sentinel: connect, AUTH and each SENTINEL command.
+const SENTINEL_TIMEOUT: Duration = Duration::from_secs(3);
+/// Connect / ROLE / PING on the resolved node.
+const NODE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Whole sentinel connect (several sentinels, one re-resolve).
+const SENTINEL_TOTAL: Duration = Duration::from_secs(45);
+
+/// True for a Redis connection in sentinel mode.
+pub fn is_sentinel(cfg: &ConnectionConfig) -> bool {
+    cfg.driver == Driver::Redis
+        && matches!(
+            cfg.redis.as_ref().map(|r| r.mode),
+            Some(RedisMode::Sentinel)
+        )
+}
+
+/// "host", "host:port", "[v6]:port" or a bare IPv6 address → (host, port).
+pub fn parse_node(s: &str, default_port: u16) -> Option<(String, u16)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let after = &rest[end + 1..];
+        if after.is_empty() {
+            (&rest[..end], None)
+        } else {
+            (&rest[..end], Some(after.strip_prefix(':')?))
+        }
+    } else {
+        match s.rsplit_once(':') {
+            Some((h, p)) if !h.contains(':') => (h, Some(p)),
+            _ => (s, None),
+        }
+    };
+    if host.is_empty() || host.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let port = match port {
+        None => default_port,
+        Some(p) => match p.trim().parse::<u16>() {
+            Ok(n) if n > 0 => n,
+            _ => return None,
+        },
+    };
+    Some((host.to_string(), port))
+}
+
+fn fmt_addr(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{}]:{}", host, port)
+    } else {
+        format!("{}:{}", host, port)
+    }
+}
+
+/// "Connection refused (os error 111)" → "connection refused".
+fn short_reason(text: &str) -> String {
+    let t = match text.find(" (os error") {
+        Some(i) => &text[..i],
+        None => text,
+    };
+    let t = t.trim();
+    let mut c = t.chars();
+    match c.next() {
+        Some(f) if f.is_uppercase() && !c.clone().next().is_some_and(char::is_uppercase) => {
+            f.to_lowercase().chain(c).collect()
+        }
+        _ => t.to_string(),
+    }
+}
+
+struct SentinelCtx<'a> {
+    sentinels: Vec<String>,
+    master_name: String,
+    tls: bool,
+    username: Option<String>,
+    password: Option<String>,
+    tunnels: Option<(&'a TunnelManager, &'a str)>,
+}
+
+struct Replica {
+    host: String,
+    port: u16,
+    healthy: bool,
+}
+
+struct Resolution {
+    /// The sentinel that answered.
+    sentinel: String,
+    master: (String, u16),
+    /// None = the sentinel did not list them.
+    replicas: Option<Vec<Replica>>,
+}
+
+/// Where to connect for `host:port`: a fresh SSH forward when the connection uses a tunnel.
+async fn reach(
+    tunnels: Option<(&TunnelManager, &str)>,
+    host: &str,
+    port: u16,
+) -> AppResult<(String, u16, Option<ForwardLease>)> {
+    match tunnels {
+        Some((tm, pid)) => {
+            let lease = tm.acquire(pid, host, port).await?;
+            Ok(("127.0.0.1".to_string(), lease.local_port(), Some(lease)))
+        }
+        None => Ok((host.to_string(), port, None)),
+    }
+}
+
+/// `SENTINEL replicas` (Redis 5+), falling back to `SENTINEL slaves`.
+async fn sentinel_replicas(
+    con: &mut ::redis::aio::MultiplexedConnection,
+    name: &str,
+) -> Option<Vec<Replica>> {
+    let mut reply = None;
+    for sub in ["replicas", "slaves"] {
+        let mut q = ::redis::cmd("SENTINEL");
+        q.arg(sub).arg(name);
+        if let Ok(v) = limited(Some(SENTINEL_TIMEOUT), raw_query(con, q)).await {
+            reply = Some(v);
+            break;
+        }
+    }
+    let reply = reply?;
+    let mut out = Vec::new();
+    for item in rv_items(&reply) {
+        let mut f: BTreeMap<String, String> = BTreeMap::new();
+        for (k, v) in rv_pairs(item) {
+            if let (Some(k), Some(v)) = (rv_text(k), rv_text(v)) {
+                f.insert(k, v);
+            }
+        }
+        let host = match f.get("ip") {
+            Some(h) if !h.is_empty() => h.clone(),
+            _ => continue,
+        };
+        let port = match f.get("port").and_then(|p| p.trim().parse::<u16>().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        let down = f.get("flags").is_some_and(|fl| {
+            fl.split(',')
+                .any(|x| matches!(x.trim(), "s_down" | "o_down" | "disconnected"))
+        });
+        let link_bad = match f.get("master-link-status") {
+            Some(s) => s != "ok",
+            None => false,
+        };
+        out.push(Replica {
+            host,
+            port,
+            healthy: !down && !link_bad,
+        });
+    }
+    Some(out)
+}
+
+/// Asks the sentinels in order; the first one that knows the master wins. Appends one report line per sentinel.
+async fn ask_sentinels(ctx: &SentinelCtx<'_>, lines: &mut Vec<String>) -> AppResult<Resolution> {
+    let name = ctx.master_name.as_str();
+    let mut unreachable: Vec<String> = Vec::new();
+    let mut auth_failed: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    let total = ctx.sentinels.len();
+    for (i, raw) in ctx.sentinels.iter().enumerate() {
+        let next = if i + 1 < total { ", trying next" } else { "" };
+        let (host, port) = match parse_node(raw, SENTINEL_PORT) {
+            Some(n) => n,
+            None => {
+                lines.push(format!("✕ {} — not a valid host:port{}", raw, next));
+                unreachable.push(format!("{} (not a valid host:port)", raw));
+                continue;
+            }
+        };
+        let addr = fmt_addr(&host, port);
+        // SSH problems (unknown host key, auth) abort at once so the UI can offer its fix.
+        let (h, p, _lease) = reach(ctx.tunnels, &host, port).await?;
+        let mut con = match open_node(
+            node_addr(h, p, ctx.tls),
+            0,
+            None,
+            None,
+            Some(SENTINEL_TIMEOUT),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let r = short_reason(&e.text);
+                lines.push(format!("✕ {} — {}{}", addr, r, next));
+                unreachable.push(format!("{} ({})", addr, r));
+                continue;
+            }
+        };
+        if let Some(pw) = ctx.password.as_deref() {
+            let mut c = ::redis::cmd("AUTH");
+            if let Some(u) = ctx.username.as_deref() {
+                c.arg(u);
+            }
+            c.arg(pw);
+            if let Err(e) = limited(Some(SENTINEL_TIMEOUT), raw_query(&mut con, c)).await {
+                let r = short_reason(&e.text);
+                lines.push(format!("✕ {} — AUTH failed: {}{}", addr, r, next));
+                auth_failed.push(format!("{} ({})", addr, r));
+                continue;
+            }
+        }
+        let mut q = ::redis::cmd("SENTINEL");
+        q.arg("get-master-addr-by-name").arg(name);
+        let reply = match limited(Some(SENTINEL_TIMEOUT), raw_query(&mut con, q)).await {
+            Ok(v) => v,
+            Err(e) => {
+                let r = short_reason(&e.text);
+                let upper = e.text.to_uppercase();
+                if e.auth {
+                    lines.push(format!("✕ {} — needs a password ({}){}", addr, r, next));
+                    auth_failed.push(format!(
+                        "{} needs a password (turn on \u{201c}Sentinels need their own password\u{201d})",
+                        addr
+                    ));
+                } else if upper.contains("UNKNOWN COMMAND") || upper.contains("UNKNOWN SUBCOMMAND")
+                {
+                    lines.push(format!("✕ {} — not a sentinel ({}){}", addr, r, next));
+                    unreachable.push(format!(
+                        "{} (not a sentinel; sentinels usually listen on {})",
+                        addr, SENTINEL_PORT
+                    ));
+                } else {
+                    lines.push(format!("✕ {} — {}{}", addr, r, next));
+                    unreachable.push(format!("{} ({})", addr, r));
+                }
+                continue;
+            }
+        };
+        let items = rv_items(&reply);
+        let master = match (items.first(), items.get(1)) {
+            (Some(h), Some(p)) => match (
+                rv_text(h),
+                rv_text(p).and_then(|p| p.trim().parse::<u16>().ok()),
+            ) {
+                (Some(h), Some(p)) if !h.is_empty() => Some((h, p)),
+                _ => None,
+            },
+            _ => None,
+        };
+        let (mh, mp) = match master {
+            Some(m) => m,
+            None => {
+                lines.push(format!(
+                    "✕ {} — doesn't know master \u{201c}{}\u{201d}{}",
+                    addr, name, next
+                ));
+                unknown.push(addr);
+                continue;
+            }
+        };
+        let replicas = sentinel_replicas(&mut con, name).await;
+        lines.push(format!(
+            "✓ {} answered: master \u{201c}{}\u{201d} is {}",
+            addr,
+            name,
+            fmt_addr(&mh, mp)
+        ));
+        return Ok(Resolution {
+            sentinel: addr,
+            master: (mh, mp),
+            replicas,
+        });
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if !unknown.is_empty() {
+        parts.push(format!(
+            "Sentinel doesn't know master '{}' (asked {}). Check the master name.",
+            name,
+            unknown.join(", ")
+        ));
+    }
+    if !auth_failed.is_empty() {
+        parts.push(format!(
+            "Sentinel authentication failed: {}.",
+            auth_failed.join("; ")
+        ));
+    }
+    if !unreachable.is_empty() {
+        let lead = if parts.is_empty() {
+            "Couldn't reach any sentinel"
+        } else {
+            "Unreachable"
+        };
+        parts.push(format!("{}: {}.", lead, unreachable.join("; ")));
+    }
+    if parts.is_empty() {
+        parts.push("No sentinels configured.".to_string());
+    }
+    Err(AppError::new(parts.join(" ")))
+}
+
+/// Sentinel mode: asks the sentinels where the master (or a healthy replica) is, then connects to it like
+/// standalone (TLS, ACL user / password, DB index), through new SSH forwards when `tunnels` is set.
+/// A reconnect calls this again, so a failover is followed. The report lines end up in `RedisConn::details`.
+pub fn connect_sentinel<'a>(
+    cfg: &'a ConnectionConfig,
+    password: Option<&'a str>,
+    sentinel_password: Option<&'a str>,
+    tunnels: Option<(&'a TunnelManager, &'a str)>,
+) -> BoxFuture<'a, AppResult<Connected>> {
+    Box::pin(async move {
+        let fut = sentinel_connect_inner(cfg, password, sentinel_password, tunnels);
+        match tokio::time::timeout(SENTINEL_TOTAL, fut).await {
+            Ok(r) => r,
+            Err(_) => Err(AppError::new(format!(
+                "Redis Sentinel connect timed out after {} seconds",
+                SENTINEL_TOTAL.as_secs()
+            ))),
+        }
+    })
+}
+
+async fn sentinel_connect_inner(
+    cfg: &ConnectionConfig,
+    password: Option<&str>,
+    sentinel_password: Option<&str>,
+    tunnels: Option<(&TunnelManager, &str)>,
+) -> AppResult<Connected> {
+    let opts = cfg.redis.clone().unwrap_or_default();
+    let master_name = opts.master_name.trim().to_string();
+    if master_name.is_empty() {
+        return Err(AppError::new(
+            "Enter the master name the sentinels monitor (often \u{201c}mymaster\u{201d}).",
+        ));
+    }
+    let sentinels: Vec<String> = opts
+        .sentinels
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if sentinels.is_empty() {
+        return Err(AppError::new(
+            "Add at least one sentinel (host:port, default port 26379).",
+        ));
+    }
+    let db = db_index(cfg)?;
+    let tls = use_tls(cfg);
+    let ctx = SentinelCtx {
+        sentinels,
+        master_name,
+        tls,
+        username: if opts.sentinel_auth {
+            trimmed(opts.sentinel_username.as_deref())
+        } else {
+            None
+        },
+        password: if opts.sentinel_auth {
+            sentinel_password
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+        } else {
+            None
+        },
+        tunnels,
+    };
+    let want_replica = opts.read_from == RedisReadFrom::Replica;
+    let username = trimmed(cfg.username.as_deref());
+    let node_password = password.filter(|p| !p.is_empty()).map(str::to_string);
+    let mut lines: Vec<String> = Vec::new();
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let res = ask_sentinels(&ctx, &mut lines).await?;
+        let replicas = res.replicas.unwrap_or_default();
+        if replicas.is_empty() {
+            lines.push("! No replicas reported".to_string());
+        } else {
+            let list: Vec<String> = replicas
+                .iter()
+                .map(|r| {
+                    let a = fmt_addr(&r.host, r.port);
+                    if r.healthy {
+                        a
+                    } else {
+                        format!("{} (down)", a)
+                    }
+                })
+                .collect();
+            lines.push(format!("✓ Replicas: {}", list.join(", ")));
+        }
+        let mut target = res.master.clone();
+        let mut kind = "master";
+        if want_replica {
+            match replicas.iter().find(|r| r.healthy) {
+                Some(r) => {
+                    target = (r.host.clone(), r.port);
+                    kind = "replica";
+                }
+                None => lines.push(
+                    "! No healthy replica \u{2014} connected to the master instead".to_string(),
+                ),
+            }
+        }
+        let target_addr = fmt_addr(&target.0, target.1);
+        let (h, p, lease) = reach(tunnels, &target.0, target.1).await?;
+        let tunneled = lease.is_some();
+        let opened = open_node(
+            node_addr(h, p, tls),
+            db,
+            username.clone(),
+            node_password.clone(),
+            Some(NODE_TIMEOUT),
+        )
+        .await;
+        let mut conn = match opened {
+            Ok(c) => c,
+            Err(e) => {
+                let mut msg = if e.auth {
+                    format!(
+                        "Authentication failed at the {} {}: {}",
+                        kind, target_addr, e.text
+                    )
+                } else {
+                    format!(
+                        "Couldn't connect to the {} {} reported by sentinel {}: {}",
+                        kind, target_addr, res.sentinel, e.text
+                    )
+                };
+                let lower = e.text.to_lowercase();
+                if tunneled && (lower.contains("certificate") || lower.contains("hostname")) {
+                    msg.push_str(" (through an SSH tunnel the TLS host name check sees 127.0.0.1)");
+                }
+                return Err(AppError::new(msg));
+            }
+        };
+        let role = match limited(
+            Some(NODE_TIMEOUT),
+            raw_query(&mut conn, ::redis::cmd("ROLE")),
+        )
+        .await
+        {
+            Ok(v) => rv_items(&v).into_iter().next().and_then(rv_text),
+            // ACL may deny ROLE: carry on without the check.
+            Err(_) => None,
+        };
+        if kind == "master" && role.as_deref() == Some("slave") {
+            if attempt < 2 {
+                lines.push(format!(
+                    "! {} answers ROLE slave (failover in progress?) \u{2014} asking the sentinels again",
+                    target_addr
+                ));
+                continue;
+            }
+            return Err(AppError::new(format!(
+                "The sentinels report {} as master \u{201c}{}\u{201d}, but it answers ROLE slave \u{2014} \
+                 a failover may be in progress. Try again in a few seconds.",
+                target_addr, ctx.master_name
+            )));
+        }
+        let started = Instant::now();
+        let ping = limited(
+            Some(NODE_TIMEOUT),
+            raw_query(&mut conn, ::redis::cmd("PING")),
+        )
+        .await;
+        let ms = started.elapsed().as_millis();
+        let mut parts: Vec<String> = Vec::new();
+        parts.push(if kind == "replica" {
+            format!("Connected to replica {}", target_addr)
+        } else {
+            "Connected to master".to_string()
+        });
+        parts.push(format!("role {}", role.as_deref().unwrap_or("unknown")));
+        if node_password.is_some() {
+            parts.push("AUTH ok".to_string());
+        }
+        parts.push(format!("db {}", db));
+        match ping {
+            Ok(_) => parts.push(format!("PING {} ms", ms)),
+            Err(e) => parts.push(format!("PING failed: {}", short_reason(&e.text))),
+        }
+        lines.push(format!("✓ {}", parts.join(" \u{b7} ")));
+        return Ok(finish(conn, cfg, db, lines, lease).await);
+    }
 }
 
 // ---------------------------------------------------------------------------

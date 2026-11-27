@@ -2,7 +2,7 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import { DEFAULT_PORTS, DRIVER_LABELS } from "../types";
-import type { AuthMethod, ConnectionConfig, Driver, KafkaConfig, VaultCheck, VaultConfig, VaultTokenSource } from "../types";
+import type { AuthMethod, ConnectionConfig, Driver, KafkaConfig, RedisMode, RedisOptions, RedisReadFrom, VaultCheck, VaultConfig, VaultTokenSource } from "../types";
 import { handleActionError } from "./recovery";
 import { openSshProfilesDialog, sshLabel, sshStore } from "./sshDialog";
 import { statusText, statusTone, vaults } from "./vault";
@@ -22,6 +22,30 @@ function fmtLease(secs: number): string {
   }
   if (secs >= 60) return Math.round(secs / 60) + "m";
   return secs + "s";
+}
+
+/** Sentinel address "host", "host:port" or "[v6]:port" → "host:port" (default port 26379); null when invalid. */
+export function normSentinel(s: string): string | null {
+  const t = s.trim();
+  if (!t) return null;
+  let host: string;
+  let port: string | null = null;
+  const m6 = /^\[([^\]]+)\](?::(\d+))?$/.exec(t);
+  if (m6) {
+    host = m6[1];
+    port = m6[2] ?? null;
+  } else if ((t.match(/:/g) ?? []).length > 1) {
+    host = t; // bare IPv6 address
+  } else {
+    const i = t.lastIndexOf(":");
+    host = i >= 0 ? t.slice(0, i) : t;
+    port = i >= 0 ? t.slice(i + 1) : null;
+  }
+  if (!host || /[\s/@?#[\]]/.test(host)) return null;
+  if (port !== null && !/^\d+$/.test(port)) return null;
+  const n = port === null ? 26379 : Number(port);
+  if (!Number.isInteger(n) || n < 1 || n > 65535) return null;
+  return (host.includes(":") ? `[${host}]` : host) + ":" + n;
 }
 
 const DRIVERS: Driver[] = ["postgres", "mysql", "sqlite", "mssql", "redis", "kafka"];
@@ -194,10 +218,12 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     h("label", { class: "check" }, chkSsh, h("span", null, "Connect through an SSH tunnel (bastion)")),
     field("SSH configuration", h("div", { class: "vault-stack" }, selSsh, hint("The database host and port are resolved from the SSH server, so use the address as the bastion sees it."))),
   );
+  // Redis Sentinel: every node it contacts goes through its own forward.
+  const sshSentNote = h("span", { class: "ssh-sent-note" }, "tunnels the sentinels and the master they report");
   const sshSec = h(
     "details",
     { class: "vault-adv ssh-sec", open: !!cfg.sshProfileId },
-    h("summary", null, icon("chevron", 12), "SSH tunnel", sshState),
+    h("summary", null, icon("chevron", 12), "SSH tunnel", sshSentNote, sshState),
     h("div", { class: "vault-adv-body" }, sshFields, sshKafkaNote),
   );
   let sshId: string | null = cfg.sshProfileId ?? null;
@@ -348,6 +374,196 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     lookLabel,
   );
 
+  // ----- Redis Sentinel -----
+  const r0: RedisOptions = existing?.redis ?? {};
+  let redisMode: RedisMode = r0.mode === "sentinel" ? "sentinel" : "standalone";
+  let readFrom: RedisReadFrom = r0.readFrom === "replica" ? "replica" : "master";
+  let sentAuth = r0.sentinelAuth === true;
+  const sentinels: string[] = (r0.sentinels ?? []).map((s) => normSentinel(s) ?? s);
+  /** Per sentinel, from the last test: answered or failed. */
+  const sentState = new Map<string, "ok" | "bad">();
+  const modeBtns = (["standalone", "sentinel"] as RedisMode[]).map((m) => {
+    const b = h("button", { type: "button", class: "seg-btn", role: "radio", onclick: () => setRedisMode(m) }, m === "sentinel" ? "Sentinel" : "Standalone");
+    b.dataset.m = m;
+    return b;
+  });
+  const modeField = field("Mode", h("div", { class: "seg redis-mode", role: "radiogroup", "aria-label": "Redis mode" }, modeBtns));
+  const inSent = h("input", { class: "sent-input", type: "text", placeholder: "add host:port ↵", spellcheck: false, autocomplete: "off", "aria-label": "Add sentinel" });
+  const chipList = h("div", { class: "sent-chip-list" });
+  const chipBox = h("div", { class: "sent-chips", onclick: (e: Event) => (e.target === chipBox || e.target === chipList) && inSent.focus() }, chipList, inSent);
+  const sentErr = h("div", { class: "sent-err", "aria-live": "polite" });
+  const renderChips = (): void => {
+    clear(chipList);
+    for (const addr of sentinels) {
+      const st = sentState.get(addr);
+      chipList.appendChild(
+        h(
+          "span",
+          { class: "sent-chip" },
+          h("span", { class: "sent-dot" + (st ? " " + st : ""), "aria-hidden": "true" }),
+          addr,
+          h(
+            "button",
+            {
+              type: "button",
+              class: "sent-x",
+              title: "Remove",
+              "aria-label": "Remove " + addr,
+              onclick: () => {
+                sentinels.splice(sentinels.indexOf(addr), 1);
+                renderChips();
+                inSent.focus();
+              },
+            },
+            icon("x", 10),
+          ),
+        ),
+      );
+    }
+  };
+  /** Adds every valid "host[:port]" in `text` (comma / space separated); returns the parts that aren't valid. */
+  const addSentinels = (text: string): string[] => {
+    const bad: string[] = [];
+    for (const part of text.split(/[\s,;]+/)) {
+      if (!part) continue;
+      const n = normSentinel(part);
+      if (n === null) bad.push(part);
+      else if (!sentinels.includes(n)) sentinels.push(n);
+    }
+    renderChips();
+    sentErr.textContent = bad.length ? `Not a host:port: ${bad.join(", ")}` : "";
+    return bad;
+  };
+  const flushSentInput = (): boolean => {
+    if (inSent.value.trim() === "") return true;
+    const bad = addSentinels(inSent.value);
+    inSent.value = bad.join(", ");
+    return bad.length === 0;
+  };
+  inSent.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === ",") {
+      if (e.metaKey || e.ctrlKey) {
+        flushSentInput();
+        return; // ⌘↵ still saves
+      }
+      e.preventDefault();
+      flushSentInput();
+    } else if (e.key === "Backspace" && inSent.value === "" && sentinels.length) {
+      sentinels.pop();
+      renderChips();
+    }
+  });
+  inSent.addEventListener("paste", (e) => {
+    const text = e.clipboardData?.getData("text") ?? "";
+    if (!/[\s,;]/.test(text.trim())) return;
+    e.preventDefault();
+    inSent.value = addSentinels(inSent.value + " " + text).join(", ");
+  });
+  inSent.addEventListener("blur", () => void flushSentInput());
+  const inMaster = h("input", { class: "input mono", type: "text", placeholder: "mymaster", value: r0.masterName ?? "", spellcheck: false, autocomplete: "off", "aria-label": "Master name" });
+  const readBtns = (["master", "replica"] as RedisReadFrom[]).map((r) => {
+    const b = h("button", { type: "button", class: "seg-btn", role: "radio", onclick: () => ((readFrom = r), syncRedis()) }, r === "replica" ? "Replica" : "Master");
+    b.dataset.r = r;
+    return b;
+  });
+  const swSentAuth = h("button", { class: "sw", type: "button", role: "switch", "aria-label": "Sentinels need their own password", onclick: () => ((sentAuth = !sentAuth), syncRedis()) });
+  const inSentUser = h("input", { class: "input", type: "text", placeholder: "default", value: r0.sentinelUsername ?? "", autocomplete: "off", spellcheck: false, "aria-label": "Sentinel username" });
+  const inSentPass = h("input", {
+    class: "input",
+    type: "password",
+    autocomplete: "new-password",
+    placeholder: editing && r0.sentinelAuth ? "Leave blank to keep saved password" : "",
+    "aria-label": "Sentinel password",
+  });
+  const sentCredRow = h("div", { class: "row2" }, field("Sentinel username (optional)", inSentUser), field("Sentinel password", inSentPass));
+  const sentinelFields = h(
+    "div",
+    { class: "sent-fields" },
+    h(
+      "div",
+      { class: "field" },
+      h("span", { class: "field-label" }, "Sentinel nodes ", h("span", { class: "sent-sub" }, "· host:port, default port 26379 · paste a comma-separated list")),
+      chipBox,
+      sentErr,
+    ),
+    h("div", { class: "row2" }, field("Master name", inMaster), field("Read from", h("div", { class: "seg", role: "radiogroup", "aria-label": "Read from" }, readBtns))),
+    h("div", { class: "sent-auth" }, swSentAuth, h("span", null, "Sentinels need their own password ", h("span", { class: "sent-sub" }, "(sentinel requirepass)"))),
+    sentCredRow,
+  );
+  const authTitle = h("div", { class: "sent-auth-title" }, "Master authentication");
+  const isSentinel = (): boolean => driver === "redis" && redisMode === "sentinel";
+  const setRedisMode = (m: RedisMode): void => {
+    redisMode = m;
+    sentState.clear();
+    result.className = "test-result";
+    clear(result);
+    syncRedis();
+  };
+  const syncRedis = (): void => {
+    const redis = driver === "redis";
+    const sent = isSentinel();
+    modeField.style.display = redis ? "" : "none";
+    for (const b of modeBtns) {
+      const on = b.dataset.m === redisMode;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-checked", String(on));
+    }
+    for (const b of readBtns) {
+      const on = b.dataset.r === readFrom;
+      b.classList.toggle("on", on);
+      b.setAttribute("aria-checked", String(on));
+    }
+    swSentAuth.classList.toggle("on", sentAuth);
+    swSentAuth.setAttribute("aria-checked", String(sentAuth));
+    sentinelFields.style.display = sent ? "" : "none";
+    sentCredRow.style.display = sentAuth ? "" : "none";
+    hostRow.style.display = sent ? "none" : "";
+    authTitle.style.display = sent ? "" : "none";
+    sshSentNote.style.display = sent ? "" : "none";
+  };
+  const collectRedis = (): RedisOptions => ({
+    mode: redisMode,
+    sentinels: [...sentinels],
+    masterName: inMaster.value.trim() || "mymaster",
+    readFrom,
+    sentinelUsername: sentAuth ? inSentUser.value.trim() || null : null,
+    sentinelAuth: sentAuth,
+  });
+  const sentinelProblem = (): string | null => {
+    if (!isSentinel()) return null;
+    if (!flushSentInput()) return `Not a valid sentinel address: ${inSent.value}. Use host:port (default port 26379).`;
+    if (sentinels.length === 0) return "Add at least one sentinel (host:port, default port 26379).";
+    return null;
+  };
+  /** Sentinel password for save / test: null = keep (or use) the stored one, "" = clear it. */
+  const sentinelPasswordArg = (forSave: boolean): string | null => {
+    if (driver !== "redis") return null;
+    if (!sentAuth) return forSave && editing && r0.sentinelAuth ? "" : null;
+    return inSentPass.value === "" ? null : inSentPass.value;
+  };
+  /** Chip dots from the last test's report (or the error that lists the sentinels). */
+  const markSentinels = (lines: string[], err: string | null): void => {
+    sentState.clear();
+    for (const addr of sentinels) {
+      if (lines.some((l) => l.startsWith("✓ " + addr + " answered"))) sentState.set(addr, "ok");
+      else if (lines.some((l) => l.startsWith("✕ " + addr + " ")) || (err !== null && err.includes(addr + " ("))) sentState.set(addr, "bad");
+    }
+    renderChips();
+  };
+  const renderReport = (lines: string[]): void => {
+    const bad = lines.some((l) => l.startsWith("✕") || l.startsWith("!"));
+    result.className = "test-result sent-report " + (bad ? "warn" : "ok");
+    clear(result);
+    result.append(
+      ...lines.map((l) => {
+        const g = l.charAt(0);
+        const cls = g === "✓" ? "ok" : g === "✕" ? "bad" : "note";
+        return h("div", { class: "sent-line " + cls }, h("span", { class: "sent-g", "aria-hidden": "true" }, g === "✓" || g === "✕" ? g : "!"), h("span", { class: "sent-text" }, l.slice(2)));
+      }),
+    );
+  };
+  renderChips();
+
   const passField = field("Password", inPass);
   const userLabel = h("span", { class: "field-label" }, "User");
   const userField = h("label", { class: "field" }, userLabel, inUser);
@@ -360,14 +576,18 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   const portField = field("Port", inPort, "port");
   const protoField = field("Security protocol", protoSeg);
   const credRow = h("div", { class: "row2" }, userField, passField);
+  const hostRow = h("div", { class: "row2" }, hostField, portField);
   const netFields = h(
     "div",
     { class: "net-fields" },
-    h("div", { class: "row2" }, hostField, portField),
+    modeField,
+    hostRow,
+    sentinelFields,
     protoField,
     saslField,
     dbField,
     dbIdxField,
+    authTitle,
     authField,
     credRow,
     editing ? clearRow : null,
@@ -457,6 +677,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     inUser.placeholder = redis ? "default (optional)" : "";
     if (userPick && !colorTouched) pick(redis ? DRIVER_COLORS.redis : kafka ? DRIVER_COLORS.kafka : CONN_COLORS[0], false);
     syncAuth();
+    syncRedis();
   };
 
   const fillVProfiles = (): void => {
@@ -578,7 +799,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     const vault = authMethod === "vault" && !sqlite && !(kafka && !kafkaSasl());
     return {
       id: cfg.id,
-      name: inName.value.trim() || (sqlite ? inFile.value.split(/[\\/]/).pop() || "SQLite" : inHost.value.trim() || DRIVER_LABELS[driver]),
+      name: inName.value.trim() || (sqlite ? inFile.value.split(/[\\/]/).pop() || "SQLite" : isSentinel() ? "Redis " + (inMaster.value.trim() || "mymaster") : inHost.value.trim() || DRIVER_LABELS[driver]),
       driver,
       host: sqlite ? null : kafka ? inHost.value.replace(/\s+/g, "") || null : inHost.value.trim() || null,
       port: sqlite ? null : port,
@@ -599,6 +820,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       folder: inFolder.value.trim() || null,
       scope: cfg.scope ?? null,
       kafka: kafka ? collectKafka() : null,
+      redis: driver === "redis" ? collectRedis() : null,
     };
   };
   const sslShown = (): boolean => (driver === "postgres" || driver === "mysql") && sslFiles.style.display !== "none";
@@ -644,7 +866,8 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   };
   const sslProblem = (): string | null => (sslShown() && inSslCert.value.trim() !== "" && inSslKey.value.trim() === "" ? "A client certificate needs its private key." : null);
   const sshProblem = (): string | null => (driver !== "sqlite" && driver !== "kafka" && chkSsh.checked && !sshId ? "Choose an SSH configuration for the tunnel (or turn the tunnel off)." : null);
-  const formProblem = (): string | null => (driver === "redis" && redisIndex() === null ? "Database index must be a whole number from 0 to 15." : kafkaProblem() ?? vaultProblem() ?? sslProblem() ?? sshProblem());
+  const formProblem = (): string | null =>
+    driver === "redis" && redisIndex() === null ? "Database index must be a whole number from 0 to 15." : sentinelProblem() ?? kafkaProblem() ?? vaultProblem() ?? sslProblem() ?? sshProblem();
   const showErr = (el: HTMLElement, msg: string): void => {
     el.className = el.className.replace(/\b(ok|err|busy)\b/g, "").trim() + " err";
     clear(el);
@@ -691,11 +914,18 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     result.className = "test-result busy";
     result.textContent = "Connecting…";
     try {
-      const info = await api.testConnection(collect(), passwordArg(), typedToken());
-      result.className = "test-result ok";
-      clear(result);
-      result.append(icon("check", 15), h("span", null, "Connected — " + info.version));
+      const info = await api.testConnection(collect(), passwordArg(), typedToken(), sentinelPasswordArg(false));
+      if (isSentinel() && info.details?.length) {
+        markSentinels(info.details, null);
+        const ver = info.version && info.version !== "Redis" ? " \u00b7 Redis " + info.version : "";
+        renderReport([...info.details.slice(0, -1), info.details[info.details.length - 1] + ver]);
+      } else {
+        result.className = "test-result ok";
+        clear(result);
+        result.append(icon("check", 15), h("span", null, "Connected — " + info.version));
+      }
     } catch (e) {
+      if (isSentinel()) markSentinels([], errMsg(e));
       result.className = "test-result err";
       clear(result);
       result.append(icon("alert", 15), h("span", null, errMsg(e)));
@@ -736,7 +966,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     if (problem) return showErr(result, problem);
     btnSave.disabled = true;
     try {
-      const saved = await api.saveConnection(collect(), passwordArg());
+      const saved = await api.saveConnection(collect(), passwordArg(), sentinelPasswordArg(true));
       const tok = typedToken();
       if (tok !== null) await api.setVaultToken(saved.id, tok);
       close();

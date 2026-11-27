@@ -1,7 +1,8 @@
 // Application shell: ambient backdrop, sidebar card (explorer), content sheet with the floating
 // capsule (console tabs + run controls + history), consoles, history drawer, shortcuts.
 import { api } from "../api";
-import type { ConnectionConfig } from "../types";
+import type { ConnectionConfig, SchemaNode } from "../types";
+import { DRIVER_LABELS } from "../types";
 import { confirmDialog } from "./confirm";
 import { ConsolePane } from "./console";
 import type { ConsoleHost } from "./console";
@@ -16,8 +17,18 @@ import { TopicPane } from "./kafkaTopic";
 import { KeyPane } from "./keyView";
 import type { KeyHost } from "./keyView";
 import type { TabPane } from "./tabs";
-import { TabStrip } from "./tabRail";
-import { matchAction, shortcutLabel } from "./keymap";
+import { TabStrip, autoName } from "./tabRail";
+import { formatBinding, matchAction, shortcutLabel } from "./keymap";
+import { IS_MAC as MENU_MAC, listenNativeMenu, showAppMenu } from "./appMenu";
+import type { AppMenuEntry, AppMenuSection, MenuCommand } from "./appMenu";
+import { isPaletteOpen, openPalette } from "./palette";
+import type { PaletteItem } from "./palette";
+import { pickCrossSources } from "./crossSource";
+import { FED_DRIVERS } from "./federation";
+import { closeMenu } from "./menu";
+import { qualifiedName } from "./sqlutil";
+import { openVaultProfilesDialog } from "./vaultDialog";
+import { openSshProfilesDialog } from "./sshDialog";
 import { openSettings } from "./settingsDialog";
 import { Navigator } from "./navigator";
 import { openScopePicker } from "./scopePicker";
@@ -26,7 +37,7 @@ import { loadLayout, onLookChange } from "./layout";
 import { toast } from "./toast";
 import { VAULT_TOKEN_RE, vaults } from "./vault";
 import { showTokenPastePrompt } from "./vaultChips";
-import { getSettings, onSettingsChange } from "./settings";
+import { getSettings, onSettingsChange, updateSettings } from "./settings";
 import { RestoredPane, WorkspaceSaver, loadWorkspace } from "./workspace";
 import type { Workspace, WsTab } from "./workspace";
 
@@ -77,6 +88,8 @@ export class App {
   private sheetEl!: HTMLElement;
   private capFitQueued = false;
   private sidebarHidden = false;
+  /** Focus before the ☰ menu opened (its Edit commands act on it). */
+  private menuFocus: HTMLElement | null = null;
   /** Restore on launch: saves the open tabs (debounced). */
   private saver = new WorkspaceSaver(() => this.collectWorkspace());
   /** False until the saved workspace was restored: nothing is saved before (it would overwrite it). */
@@ -109,6 +122,9 @@ export class App {
       topicDeleted: (id, topic) => {
         for (const t of this.tabs.filter((x) => x instanceof TopicPane && x.matches(id, topic))) void this.closeTab(t);
       },
+      toggleHistory: () => this.toggleHistory(),
+      openPalette: () => this.openCommandPalette(),
+      newCrossSource: (ids) => void this.newCrossSource(ids),
     });
     this.navigator = new Navigator({
       sheet: () => this.shell.querySelector<HTMLElement>(".sheet") ?? this.root,
@@ -164,6 +180,9 @@ export class App {
     });
     store.onSchema((id) => this.tabs.filter((t) => t.connId === id).forEach((t) => t.updateSchema()));
     window.addEventListener("keydown", (e) => this.onKey(e));
+    window.addEventListener("keydown", (e) => this.onKeyCapture(e), true);
+    // macOS: the native menu bar (lib.rs) sends the clicked item's id.
+    listenNativeMenu((id) => this.runCommand(id));
     window.addEventListener("paste", (e) => this.onPaste(e));
   }
 
@@ -368,6 +387,7 @@ export class App {
     const capsule = h(
       "div",
       { class: "capsule", role: "toolbar", "aria-label": "Console" },
+      this.appMenuButton(),
       this.strip.topEl,
       this.capSep,
       this.navigator.el,
@@ -447,6 +467,20 @@ export class App {
   private toggleSidebar(): void {
     this.sidebarHidden = !this.sidebarHidden;
     this.applySidebar();
+  }
+
+  /** Windows / Linux: ☰ at the left of the tab bar opens the app menu (macOS has the native menu bar). */
+  private appMenuButton(): HTMLElement | null {
+    if (MENU_MAC) return null;
+    const glyph = h("span", { class: "ico", "aria-hidden": "true" });
+    glyph.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>';
+    const btn = h("button", { class: "cap-icon cap-menu", type: "button", title: "Menu", "aria-label": "Menu", "aria-haspopup": "menu" }, glyph);
+    btn.addEventListener("pointerdown", () => {
+      const a = document.activeElement;
+      this.menuFocus = a instanceof HTMLElement && a !== btn ? a : null;
+    });
+    btn.addEventListener("click", () => showAppMenu(btn, this.menuSections(), (id) => this.runCommand(id)));
+    return btn;
   }
 
   private toggleHistory(): void {
@@ -807,9 +841,380 @@ export class App {
           h("span", null, h("kbd", null, shortcutLabel("newConsole")), " new console"),
           h("span", null, h("kbd", null, MOD + "⇧H"), " history"),
           h("span", null, h("kbd", null, shortcutLabel("settings")), " settings"),
+          h("span", null, h("kbd", null, shortcutLabel("commandPalette")), " command palette"),
         ),
       ),
     );
+  }
+
+  // ------------------------------------------------------------------ commands: menu, palette, toolbar
+
+  /**
+   * One entry point for every command: native menu items (macOS, Tauri event "menu"), the in-app ☰ menu
+   * (Windows / Linux), the command palette and the shortcuts that have no event of their own.
+   */
+  runCommand(id: string): void {
+    const c = this.activeConsole();
+    const needConsole = (): ConsolePane | null => {
+      if (!c) toast("Open a console first", "info");
+      return c;
+    };
+    switch (id as MenuCommand) {
+      case "about":
+        toast("DataTrip — a fast, lightweight database IDE", "info");
+        return;
+      case "settings":
+        openSettings();
+        return;
+      case "keyboardShortcuts":
+      case "helpShortcuts":
+        openSettings("keymap");
+        return;
+      case "newConnection":
+        this.addConnection();
+        return;
+      case "newConsole":
+        void this.newConsole();
+        return;
+      case "newCrossSource":
+        void this.newCrossSource();
+        return;
+      case "importDataGrip":
+        this.importDataGrip();
+        return;
+      case "vaultProfiles":
+        openVaultProfilesDialog();
+        return;
+      case "sshProfiles":
+        openSshProfilesDialog();
+        return;
+      case "reopenTab":
+        void this.reopenTab();
+        return;
+      case "closeTab":
+        if (this.active) void this.closeTab(this.active);
+        return;
+      case "undo":
+      case "redo":
+      case "cut":
+      case "copy":
+      case "paste":
+      case "selectAll":
+        this.editCommand(id as "undo" | "redo" | "cut" | "copy" | "paste" | "selectAll");
+        return;
+      case "find":
+        return;
+      case "tabsTop":
+      case "tabsLeft":
+      case "tabsRight": {
+        const placement = id === "tabsTop" ? "top" : id === "tabsLeft" ? "left" : "right";
+        updateSettings((s) => (s.tabs.placement = placement));
+        return;
+      }
+      case "toggleSidebar":
+        this.toggleSidebar();
+        return;
+      case "compactExplorer":
+        this.explorer.toggleCompact();
+        return;
+      case "queryHistory":
+        this.toggleHistory();
+        return;
+      case "commandPalette":
+      case "helpPalette":
+        this.openCommandPalette();
+        return;
+      case "runStatement":
+        if (needConsole()) void c?.runCurrent();
+        return;
+      case "runAll":
+        if (needConsole()) void c?.runAll();
+        return;
+      case "cancel":
+        if (c?.isRunning) c.cancelRun();
+        return;
+      case "formatSql":
+        if (needConsole() && c && !c.isLineBased) c.formatSql();
+        return;
+      case "askAi":
+        this.askAi();
+        return;
+      case "attachSource":
+        if (needConsole()) c?.openAttach();
+        return;
+      case "crossSourceGuide":
+        if (c && !c.isLineBased) c.showGuide();
+        else void this.newCrossSource();
+        return;
+      case "reconnect": {
+        const cid = this.active?.connId ?? this.selectedConn;
+        if (cid) void this.explorer.reconnect(cid);
+        else toast("Select a data source to reconnect", "info");
+        return;
+      }
+      case "nextTab":
+      case "prevTab":
+        this.cycleTab(id === "nextTab" ? 1 : -1);
+        return;
+      case "jumpToTab":
+        this.strip.jump();
+        return;
+    }
+  }
+
+  /**
+   * Ask AI: the AI assistant hooks the window event `dt-action` (`detail.id === "askAi"`) and calls
+   * preventDefault() when it handled it.
+   */
+  private askAi(): void {
+    const ev = new CustomEvent("dt-action", { detail: { id: "askAi" }, cancelable: true });
+    if (window.dispatchEvent(ev)) toast("Ask AI isn't available in this build", "info");
+  }
+
+  private cycleTab(d: number): void {
+    const list = this.strip.ordered();
+    if (list.length === 0) return;
+    const i = this.active ? list.indexOf(this.active) : -1;
+    const next = list[(i + d + list.length) % list.length];
+    if (next) this.activate(next);
+  }
+
+  /** Shortcuts that must win over CodeMirror's own bindings (⌘I selects the parent syntax node there). */
+  private onKeyCapture(e: KeyboardEvent): void {
+    if (e.defaultPrevented || e.isComposing) return;
+    const a = matchAction(e);
+    if (a !== "commandPalette" && a !== "askAi") return;
+    // Dialogs (the keymap recorder in Settings among them) keep their keys.
+    if (document.querySelector(".overlay:not(.leaving)")) return;
+    e.preventDefault();
+    e.stopPropagation();
+    this.runCommand(a);
+  }
+
+  /** In-app Edit commands (Windows / Linux ☰ menu): act on whatever had focus before the menu opened. */
+  private editCommand(cmd: "undo" | "redo" | "cut" | "copy" | "paste" | "selectAll"): void {
+    const t = this.menuFocus;
+    this.menuFocus = null;
+    const c = this.activeConsole();
+    const inConsole = t !== null && c !== null && c.el.contains(t) && t.closest(".c-editor") !== null;
+    if (t?.isConnected) t.focus();
+    if (cmd === "undo" || cmd === "redo") {
+      if (c && (inConsole || !this.inEditable(t))) {
+        if (cmd === "undo") c.undo();
+        else c.redo();
+      } else document.execCommand(cmd);
+      return;
+    }
+    if (cmd === "paste") {
+      void navigator.clipboard
+        .readText()
+        .then((text) => {
+          if (text) document.execCommand("insertText", false, text);
+        })
+        .catch(() => toast(`Paste with ${formatBinding("Mod-V")}`, "info"));
+      return;
+    }
+    document.execCommand(cmd);
+  }
+
+  private consoleTitle(base: string, connId: string): string {
+    const used = new Set(this.tabs.filter((t) => t.kind === "console" && t.connId === connId).map((t) => t.title));
+    let n = 1;
+    while (used.has(n === 1 ? base : `${base} ${n}`)) n++;
+    return n === 1 ? base : `${base} ${n}`;
+  }
+
+  /**
+   * New cross-source console over `ids` (≥ 2 SQL data sources; the first is the console's own source). Without
+   * them, a picker asks (starting with the active data source checked).
+   */
+  private async newCrossSource(ids?: string[]): Promise<void> {
+    let list = ids && ids.length >= 2 ? ids : null;
+    if (!list) {
+      const cur = this.active?.connId ?? this.selectedConn;
+      const pre = ids ?? (cur && FED_DRIVERS.has(store.conns.get(cur)?.config.driver ?? "redis") ? [cur] : []);
+      list = await pickCrossSources(pre);
+      if (!list || list.length < 2) return;
+    }
+    const [own, ...others] = list;
+    const pane = await this.openConsole(own, { title: this.consoleTitle("cross-source", own) });
+    pane?.setupCrossSource(others);
+  }
+
+  private openCommandPalette(): void {
+    if (isPaletteOpen()) return;
+    closeMenu();
+    openPalette(this.paletteItems());
+  }
+
+  private paletteItems(): PaletteItem[] {
+    const out: PaletteItem[] = [];
+    const c = this.activeConsole();
+    const act = (id: MenuCommand, label: string, ic: string, hint = "", keywords = "", disabled = false): void => {
+      out.push({ group: "Actions", label, icon: ic, hint, keywords, disabled, run: () => this.runCommand(id) });
+    };
+    const k = shortcutLabel;
+    const cur = this.active?.connId ?? this.selectedConn;
+    const curName = cur ? store.conns.get(cur)?.config.name : undefined;
+    act("settings", "Settings", "sliders", k("settings"), "preferences options");
+    act("runStatement", "Run statement", "run", k("runStatement"), "execute", !c);
+    act("runAll", "Run all", "playAll", k("runAll"), "execute", !c);
+    act("cancel", "Cancel query", "stop", k("cancel"), "stop", !c?.isRunning);
+    act("askAi", "Ask AI to write a query", "sparkle", k("askAi"), "assistant llm");
+    act("newCrossSource", "New cross-source console", "layers", "", "federated join several data sources");
+    act("attachSource", "Attach source to this console…", "layers", "", "cross-source federated", !c || c.isLineBased);
+    act("crossSourceGuide", "How do cross-source queries work?", "layers", "", "guide help example");
+    act("reconnect", curName ? `Reconnect ${curName}` : "Reconnect data source", "refresh", k("reconnect"), "connection", !cur);
+    act("formatSql", "Format SQL", "sort", k("formatSql"), "beautify pretty", !c || c.isLineBased);
+    act("newConsole", "New console", "terminal", k("newConsole"));
+    act("newConnection", "New connection…", "plus", "", "data source add");
+    act("importDataGrip", "Import from DataGrip…", "download", "", "data sources");
+    act("vaultProfiles", "Vault profiles…", "key", "", "token oidc hashicorp");
+    act("sshProfiles", "SSH configurations…", "server", "", "tunnel jump host");
+    act("queryHistory", "Query history", "clock", formatBinding("Mod-Shift-H"), "recent statements");
+    act("reopenTab", "Reopen closed tab", "undo", k("reopenTab"));
+    act("closeTab", "Close tab", "x", k("closeTab"), "", !this.active);
+    act("nextTab", "Next tab", "chevron", k("nextTab"));
+    act("prevTab", "Previous tab", "chevron", k("prevTab"));
+    act("jumpToTab", "Jump to tab…", "search", k("jumpToTab"));
+    act("toggleSidebar", this.sidebarHidden ? "Show sidebar" : "Hide sidebar", "sidebar", k("toggleSidebar"), "explorer");
+    act("compactExplorer", this.explorer.compact ? "Comfortable explorer" : "Compact explorer", "sliders", "", "density");
+    const place = getSettings().tabs.placement;
+    if (place !== "top") act("tabsTop", "Tabs on top", "sidebar", "", "placement");
+    if (place !== "left") act("tabsLeft", "Tabs on the left", "sidebar", "", "placement rail");
+    if (place !== "right") act("tabsRight", "Tabs on the right", "sidebar", "", "placement rail");
+    act("keyboardShortcuts", "Keyboard shortcuts…", "sliders", "", "keymap bindings");
+    for (const e of store.list()) {
+      const id = e.config.id;
+      out.push({
+        group: "Data sources",
+        label: e.config.name,
+        icon: "database",
+        detail: DRIVER_LABELS[e.config.driver].split(" / ")[0] + (e.status === "connected" ? " · connected" : ""),
+        hint: "open console",
+        keywords: e.config.folder ?? "",
+        run: () => void this.openConsole(id),
+      });
+    }
+    for (const t of this.strip.ordered()) {
+      const e = store.conns.get(t.connId);
+      out.push({ group: "Open tabs", label: autoName(t), icon: t.kind === "console" ? "terminal" : t.kind === "key" ? "key" : t.kind === "topic" ? "topic" : "group", detail: e?.config.name, run: () => this.activate(t) });
+    }
+    // Tables: only what the explorer already loaded (nothing is fetched for the palette).
+    let n = 0;
+    for (const e of store.list()) {
+      if (e.status !== "connected" || !FED_DRIVERS.has(e.config.driver)) continue;
+      const seen = new Set<string>();
+      const dbs: { db: string | null; schemas: SchemaNode[] }[] = [{ db: e.defaultDb, schemas: e.schemas }];
+      for (const d of e.dbs.values()) if (d.status === "ready" && d.name !== e.defaultDb) dbs.push({ db: d.name, schemas: d.schemas });
+      for (const { db, schemas } of dbs) {
+        if (seen.has(db ?? "")) continue;
+        seen.add(db ?? "");
+        for (const s of schemas) {
+          for (const tb of s.tables) {
+            if (++n > 5000) break;
+            const id = e.config.id;
+            const consoleDb = db === e.defaultDb ? null : db;
+            const q = qualifiedName(e.config.driver, s.name, tb.name);
+            const path = [db, s.name].filter((x, i, a) => x && (i === 0 || x !== a[0])).join(".");
+            out.push({
+              group: "Tables",
+              label: tb.name,
+              icon: tb.kind === "view" ? "view" : tb.kind === "materialized" ? "matview" : "table",
+              detail: `${path} · ${e.config.name}`,
+              run: () => void this.openConsole(id, { sql: `SELECT * FROM ${q} `, run: true, title: tb.name, table: tb.name, database: consoleDb, schema: s.name }),
+            });
+          }
+        }
+      }
+    }
+    return out;
+  }
+
+  /** The menu structure of the in-app ☰ menu (Windows / Linux); the native macOS menu in lib.rs mirrors it. */
+  private menuSections(): AppMenuSection[] {
+    const k = shortcutLabel;
+    const c = this.activeConsole();
+    const place = getSettings().tabs.placement;
+    const sep: AppMenuEntry = { sep: true };
+    return [
+      {
+        label: "DataTrip",
+        items: [{ id: "settings", label: "Settings…", hint: k("settings") }, { id: "keyboardShortcuts", label: "Keyboard shortcuts…" }],
+      },
+      {
+        label: "File",
+        items: [
+          { id: "newConnection", label: "New connection…" },
+          { id: "newConsole", label: "New console", hint: k("newConsole") },
+          { id: "newCrossSource", label: "New cross-source console" },
+          sep,
+          { id: "importDataGrip", label: "Import from DataGrip…" },
+          { id: "vaultProfiles", label: "Vault profiles…" },
+          { id: "sshProfiles", label: "SSH configurations…" },
+          sep,
+          { id: "reopenTab", label: "Reopen closed tab", hint: k("reopenTab") },
+          { id: "closeTab", label: "Close tab", hint: k("closeTab"), disabled: !this.active },
+        ],
+      },
+      {
+        label: "Edit",
+        items: [
+          { id: "undo", label: "Undo", hint: k("undo") },
+          { id: "redo", label: "Redo", hint: k("redo") },
+          sep,
+          { id: "cut", label: "Cut", hint: formatBinding("Mod-X") },
+          { id: "copy", label: "Copy", hint: formatBinding("Mod-C") },
+          { id: "paste", label: "Paste", hint: formatBinding("Mod-V") },
+          { id: "selectAll", label: "Select all", hint: formatBinding("Mod-A") },
+        ],
+      },
+      {
+        label: "View",
+        items: [
+          { id: "tabsTop", label: "Tabs on top", checked: place === "top" },
+          { id: "tabsLeft", label: "Tabs on the left", checked: place === "left" },
+          { id: "tabsRight", label: "Tabs on the right", checked: place === "right" },
+          sep,
+          { id: "toggleSidebar", label: "Show sidebar", hint: k("toggleSidebar"), checked: !this.sidebarHidden },
+          { id: "compactExplorer", label: "Compact explorer", checked: this.explorer.compact },
+          sep,
+          { id: "queryHistory", label: "Query history", hint: formatBinding("Mod-Shift-H") },
+          { id: "commandPalette", label: "Command palette…", hint: k("commandPalette") },
+        ],
+      },
+      {
+        label: "Console",
+        items: [
+          { id: "runStatement", label: "Run statement", hint: k("runStatement"), disabled: !c },
+          { id: "runAll", label: "Run all", hint: k("runAll"), disabled: !c },
+          { id: "cancel", label: "Cancel query", hint: k("cancel"), disabled: !c?.isRunning },
+          sep,
+          { id: "formatSql", label: "Format SQL", hint: k("formatSql"), disabled: !c || c.isLineBased },
+          { id: "askAi", label: "Ask AI…", hint: k("askAi") },
+          sep,
+          { id: "attachSource", label: "Attach source…", disabled: !c || c.isLineBased },
+          sep,
+          { id: "reconnect", label: "Reconnect data source", hint: k("reconnect") },
+        ],
+      },
+      {
+        label: "Window",
+        items: [
+          { id: "nextTab", label: "Next tab", hint: k("nextTab") },
+          { id: "prevTab", label: "Previous tab", hint: k("prevTab") },
+          { id: "jumpToTab", label: "Jump to tab…", hint: k("jumpToTab") },
+        ],
+      },
+      {
+        label: "Help",
+        items: [
+          { id: "keyboardShortcuts", label: "Keyboard shortcuts…" },
+          { id: "crossSourceGuide", label: "Cross-source queries guide" },
+          { id: "commandPalette", label: "Command palette…", hint: k("commandPalette") },
+        ],
+      },
+    ];
   }
 
   // ------------------------------------------------------------------ shortcuts

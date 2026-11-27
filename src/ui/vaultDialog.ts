@@ -243,7 +243,7 @@ export function openVaultProfilesDialog(opts: VaultDialogOpts = {}): void {
       if (pending) {
         oidcBox.className = "oidc-box waiting";
         oidcBox.append(
-          h("div", { class: "oidc-state" }, h("span", { class: "spinner oidc-spin", "aria-hidden": "true" }), h("div", null, h("div", { class: "oidc-title" }, "Waiting for browser sign-in…"), h("div", { class: "oidc-sub" }, "Finish signing in in the browser tab that just opened."))),
+          h("div", { class: "oidc-state" }, h("span", { class: "spinner oidc-spin", "aria-hidden": "true" }), h("div", null, h("div", { class: "oidc-title" }, "Waiting for sign-in…"), h("div", { class: "oidc-sub" }, "Finish signing in in the DataTrip sign-in window. Closing it cancels."))),
           h("div", { class: "oidc-actions" }, btn("Cancel", "sm", () => void vaults.cancelOidc())),
         );
         return;
@@ -281,7 +281,7 @@ export function openVaultProfilesDialog(opts: VaultDialogOpts = {}): void {
         return;
       }
       oidcBox.className = "oidc-box idle";
-      oidcBox.append(btn("Sign in with browser", "primary oidc-main", () => void signIn()), h("div", { class: "oidc-sub center" }, "Opens your browser at your company sign-in page. No token to copy."));
+      oidcBox.append(btn("Sign in", "primary oidc-main", () => void signIn()), h("div", { class: "oidc-sub center" }, "Opens your company sign-in page in a DataTrip window. No token to copy."));
       if (errLine) oidcBox.append(errLine);
     };
 

@@ -1,0 +1,407 @@
+/* AI assistant (board N): ✦ Ask AI button, inline prompt box, pending insertion / fix diff in the editor,
+   action bar, Fix with AI in the error view, and Settings › AI assistant. Imported by src/ui/aiPanel.ts. */
+
+/* ---- capsule button */
+.cap-btn.ai-ask {
+  gap: 6px;
+  background: rgba(191, 90, 242, 0.18);
+  color: #e2c2ff;
+  font-weight: 600;
+}
+.cap-btn.ai-ask:hover:not(:disabled) {
+  background: rgba(191, 90, 242, 0.28);
+}
+.cap-btn.ai-ask .ai-kbd {
+  color: #b79ad6;
+  font-weight: 400;
+}
+.cap-btn.ai-ask .ai-kbd:empty {
+  display: none;
+}
+.ai-spark {
+  color: #d9a6ff;
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* ---- prompt box (floats in .c-editor) */
+.ai-box {
+  position: absolute;
+  z-index: 20;
+  width: min(640px, calc(100% - 24px));
+  box-sizing: border-box;
+  padding: 12px;
+  border-radius: 14px;
+  background: rgba(44, 40, 52, 0.97);
+  box-shadow: inset 0 0 0 1px rgba(191, 90, 242, 0.45), 0 18px 50px rgba(0, 0, 0, 0.55);
+  font-family: var(--font-ui);
+  color: var(--text);
+}
+.ai-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.ai-row .ai-spark {
+  font-size: 15px;
+}
+.ai-input {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  border: 0;
+  background: transparent;
+  outline: 0;
+  font: inherit;
+  font-size: 13.5px;
+  color: var(--text);
+}
+.ai-input::placeholder {
+  color: #7c7c84;
+}
+.ai-input:disabled {
+  opacity: 0.7;
+}
+.ai-gen {
+  flex: none;
+  height: 30px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: var(--pill);
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.ai-gen:hover {
+  background: var(--accent-hover);
+}
+.ai-gen.cancel {
+  background: var(--fill);
+  color: var(--text);
+}
+.ai-x {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: var(--pill);
+  background: transparent;
+  color: var(--text-3, #8e8e96);
+  font-size: 12px;
+}
+.ai-x:hover {
+  background: var(--hover);
+  color: var(--text);
+}
+.ai-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 11.5px;
+}
+.ai-chips .spacer {
+  flex: 1;
+}
+.ai-chip {
+  height: 22px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: var(--pill);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-body, #e8e8ec);
+  font: inherit;
+  font-size: 11.5px;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ai-chip.ok {
+  background: rgba(48, 209, 88, 0.12);
+  color: #8fe0a6;
+}
+.ai-chip.amber,
+.ai-chip.warn {
+  background: var(--warn-soft);
+  color: var(--warn-text);
+}
+.ai-chip.ai-prov {
+  background: rgba(191, 90, 242, 0.14);
+  color: #e2c2ff;
+  cursor: pointer;
+}
+.ai-chip.ai-prov.warn {
+  background: var(--warn-soft);
+  color: var(--warn-text);
+}
+.ai-chip.ai-prov:hover {
+  background: rgba(191, 90, 242, 0.24);
+}
+.ai-chip-btn {
+  cursor: pointer;
+}
+.ai-chip-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+.ai-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+}
+.ai-dim {
+  color: #8e8e96;
+}
+.ai-sel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: 11.5px;
+}
+.ai-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  user-select: text;
+  -webkit-user-select: text;
+}
+.ai-status[hidden] {
+  display: none;
+}
+.ai-status.err {
+  color: var(--danger-text);
+  line-height: 1.5;
+}
+.ai-status.explain {
+  align-items: flex-start;
+  color: var(--text-body, #e8e8ec);
+  line-height: 1.55;
+}
+.ai-explain-text {
+  flex: 1;
+  min-width: 0;
+}
+.ai-link {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--accent-text);
+  font: inherit;
+  cursor: pointer;
+}
+.ai-link:hover {
+  color: var(--accent-text-hover);
+  text-decoration: underline;
+}
+
+/* ---- pending insertion / fix diff in the editor */
+.c-editor .cm-line.cm-ai-add {
+  background-color: rgba(191, 90, 242, 0.1);
+}
+.c-editor .cm-line.cm-ai-add.cm-ai-diff {
+  background-color: rgba(48, 209, 88, 0.12);
+}
+.c-editor .cm-line.cm-ai-del {
+  background-color: rgba(255, 69, 58, 0.12);
+  text-decoration: line-through;
+  text-decoration-color: rgba(255, 143, 135, 0.7);
+  opacity: 0.6;
+}
+.c-editor .cm-lineNumbers .cm-gutterElement.cm-ai-g-add,
+.c-editor .cm-lineNumbers .cm-gutterElement.cm-ai-g-del {
+  background-color: transparent;
+}
+.c-editor .cm-lineNumbers .cm-gutterElement.cm-ai-g-add::before,
+.c-editor .cm-lineNumbers .cm-gutterElement.cm-ai-g-del::before {
+  float: left;
+  width: 10px;
+  margin-left: -4px;
+  text-align: center;
+  font-weight: 600;
+}
+.c-editor .cm-lineNumbers .cm-gutterElement.cm-ai-g-add::before {
+  content: "+";
+  color: #d9a6ff;
+}
+.c-editor .cm-lineNumbers .cm-gutterElement.cm-ai-g-add.cm-ai-g-diff::before {
+  color: #6ee08f;
+}
+.c-editor .cm-lineNumbers .cm-gutterElement.cm-ai-g-del::before {
+  content: "\2212";
+  color: #ff8f87;
+}
+
+/* action bar (a block widget under the pending lines) */
+.ai-barwrap {
+  padding: 6px 12px 8px;
+  font-family: var(--font-ui);
+  white-space: normal;
+  cursor: default;
+}
+.ai-bar {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: 100%;
+  box-sizing: border-box;
+  padding: 5px 6px 5px 12px;
+  border-radius: 18px;
+  background: rgba(44, 40, 52, 0.97);
+  box-shadow: inset 0 0 0 1px rgba(191, 90, 242, 0.4), 0 14px 40px rgba(0, 0, 0, 0.5);
+  font-size: 12px;
+  line-height: 1.2;
+  color: var(--text);
+}
+.ai-bartext {
+  color: #c8c8ce;
+  margin-right: 4px;
+}
+.ai-bbtn {
+  height: 26px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: var(--pill);
+  background: var(--fill);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.ai-bbtn:hover {
+  background: var(--fill-hover);
+}
+.ai-bbtn.primary {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.ai-bbtn.primary:hover {
+  background: var(--accent-hover);
+}
+.ai-explain {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 640px;
+  margin-top: 6px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(44, 40, 52, 0.97);
+  box-shadow: inset 0 0 0 1px rgba(191, 90, 242, 0.3), 0 10px 30px rgba(0, 0, 0, 0.4);
+  color: var(--text-body, #e8e8ec);
+  font-size: 12.5px;
+  line-height: 1.55;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+/* ---- Fix with AI (error view) */
+.ai-fix {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.ai-fix-row {
+  display: flex;
+  gap: 8px;
+}
+.btn.ai-fix-btn {
+  background: rgba(191, 90, 242, 0.2);
+  color: #e2c2ff;
+  font-weight: 600;
+}
+.btn.ai-fix-btn:hover {
+  background: rgba(191, 90, 242, 0.3);
+}
+.ai-fix-hint {
+  max-width: 520px;
+  color: #8e8e96;
+  font-size: 11.5px;
+}
+
+/* ---- Settings › AI assistant */
+.st-row.ai-off {
+  display: none !important;
+}
+.ai-provhead {
+  display: flex;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.ai-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  width: 100%;
+}
+.ai-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 12px 14px;
+  border: 0;
+  border-radius: 14px;
+  text-align: left;
+  background: rgba(255, 255, 255, 0.04);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.ai-card:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+.ai-card.on {
+  background: rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 0 0 1.5px var(--accent);
+}
+.ai-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  font-size: 13px;
+  font-weight: 600;
+}
+.ai-card-head .spacer {
+  flex: 1;
+}
+.ai-card-st {
+  font-size: 11px;
+  font-weight: 500;
+  color: #8e8e96;
+  white-space: nowrap;
+}
+.ai-card-st.ok {
+  color: #6ee08f;
+}
+.ai-card-st.warn {
+  color: var(--warn-text);
+}
+.ai-card-sub {
+  font-size: 11.5px;
+  line-height: 16px;
+  color: #a6a6ae;
+  overflow-wrap: anywhere;
+}
+.ai-models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}

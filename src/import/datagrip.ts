@@ -150,7 +150,8 @@ function parseJdbc(url: string, raw: RawSource, base: ConnectionConfig): Parsed 
 
   // Redis: jdbc:redis://[user[:pass]@]host[:port][/db] and jdbc:redis:ssl://… (Sentinel / Cluster are not supported)
   if (/^jdbc:redis:(?:sentinel|cluster)/i.test(u)) {
-    return unsupported(/sentinel/i.test(u.slice(0, 20)) ? "Redis Sentinel isn't supported" : "Redis Cluster isn't supported");
+    // DataGrip's Redis driver has no Sentinel URL format; a hand-written one can't be mapped reliably.
+    return unsupported(/sentinel/i.test(u.slice(0, 20)) ? "Redis Sentinel URL — add it in DataTrip with Mode: Sentinel" : "Redis Cluster isn't supported");
   }
   let m = /^jdbc:redis(:ssl)?:\/\/(?:([^@/?]*)@)?([^/?]*)(?:\/(\d*))?(?:\?(.*))?$/i.exec(u);
   if (m) {

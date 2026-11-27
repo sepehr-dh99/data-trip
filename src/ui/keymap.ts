@@ -23,7 +23,9 @@ export type ActionId =
   | "nextTab"
   | "prevTab"
   | "jumpToTab"
-  | "toggleSidebar";
+  | "toggleSidebar"
+  | "commandPalette"
+  | "askAi";
 
 export interface ActionInfo {
   id: ActionId;
@@ -50,6 +52,8 @@ export const ACTIONS: ActionInfo[] = [
   { id: "prevTab", name: "Previous tab" },
   { id: "jumpToTab", name: "Jump to tab" },
   { id: "toggleSidebar", name: "Toggle sidebar" },
+  { id: "commandPalette", name: "Command palette" },
+  { id: "askAi", name: "Ask AI" },
 ];
 
 type Table = Record<ActionId, string>;
@@ -72,6 +76,8 @@ const DATATRIP: Table = {
   prevTab: "Ctrl-Shift-Tab",
   jumpToTab: "Mod-P",
   toggleSidebar: "Mod-B",
+  commandPalette: "Mod-K",
+  askAi: "Mod-I",
 };
 
 export const PRESETS: Record<KeymapPreset, Table> = {

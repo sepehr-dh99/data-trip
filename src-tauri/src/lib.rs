@@ -1,5 +1,7 @@
 //! DataTrip backend: Tauri builder, shared state and command registration.
 
+pub mod ai;
+pub mod app_menu;
 pub mod commands;
 pub mod credentials;
 pub mod db;
@@ -30,7 +32,8 @@ pub struct AppState {
 }
 
 pub fn run() {
-    tauri::Builder::default()
+    // macOS: native menu bar (custom items emit the "menu" event); Windows / Linux: none.
+    app_menu::with_app_menu(tauri::Builder::default())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let config_dir = app.path().app_config_dir()?;
@@ -48,6 +51,7 @@ pub fn run() {
                 profiles.clone(),
                 tunnels.clone(),
             );
+            app.manage(ai::AiState::default());
             app.manage(AppState {
                 store,
                 vault_cache,
@@ -117,6 +121,10 @@ pub fn run() {
             commands::federated_execute,
             commands::vault_oidc_login,
             commands::vault_oidc_cancel,
+            ai::ai_providers,
+            ai::ai_generate,
+            ai::ai_cancel,
+            ai::ai_set_api_key,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DataTrip");

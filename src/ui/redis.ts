@@ -1,6 +1,6 @@
 // Redis helpers shared by the explorer, key viewer, console and navigator. No DOM, no CodeMirror.
 import { api } from "../api";
-import type { DatabaseNode, RedisKey, SessionInfo } from "../types";
+import type { ConnectionConfig, DatabaseNode, RedisKey, SessionInfo } from "../types";
 import { store } from "./state";
 
 // ---------------------------------------------------------------- key types
@@ -65,6 +65,12 @@ export function parseTtlInput(text: string): number | null | undefined {
 // ---------------------------------------------------------------- databases
 
 export const dbLabel = (name: string | null | undefined): string => `db${name ?? "0"}`;
+
+/** "sentinel: mymaster" for a Redis Sentinel connection (shown instead of host:port); null otherwise. */
+export function sentinelLabel(c: ConnectionConfig | null | undefined): string | null {
+  if (!c || c.driver !== "redis" || c.redis?.mode !== "sentinel") return null;
+  return "sentinel: " + (c.redis.masterName?.trim() || "mymaster");
+}
 
 /** Key count from a DatabaseNode comment ("12 keys"); null when unknown. */
 export function redisKeyCount(d: DatabaseNode): number | null {
