@@ -22,11 +22,12 @@ export interface SettingsKit {
   onSync(f: () => void): void;
 }
 
-const ORDER: AiProviderId[] = ["codex", "claude", "openai", "ollama"];
+const ORDER: AiProviderId[] = ["codex", "claude", "opencode", "openai", "ollama"];
 
 const SUBS: Record<AiProviderId, string> = {
   codex: "Detected on your PATH · uses your ChatGPT sign-in, no API key",
   claude: "Uses the claude command and your Claude sign-in if installed",
+  opencode: "Uses the opencode command with any provider you signed in to (opencode auth login)",
   openai: "OpenAI-compatible endpoint + key, stored in the keychain",
   ollama: "Runs on this computer; nothing leaves your machine",
 };
@@ -35,6 +36,7 @@ function statusOf(p: AiProviderStatus | undefined, id: AiProviderId): { text: st
   if (!p) return { text: "Checking…", cls: "" };
   if (id === "codex") return p.available ? (p.signedIn ? { text: "● Signed in", cls: "ok" } : { text: "Not signed in", cls: "warn" }) : { text: "Not found", cls: "" };
   if (id === "claude") return p.available ? { text: "● Installed", cls: "ok" } : { text: "Not found", cls: "" };
+  if (id === "opencode") return p.available ? (p.signedIn ? { text: "● Signed in", cls: "ok" } : { text: "Installed", cls: "warn" }) : { text: "Not found", cls: "" };
   if (id === "openai") return p.available ? { text: "● Key set", cls: "ok" } : { text: "Not set", cls: "" };
   return p.available ? { text: "● Running", cls: "ok" } : { text: "Not running", cls: "" };
 }
@@ -83,7 +85,7 @@ export function buildAiSettings(kit: SettingsKit): SettingsItem[] {
 
   const providers: SettingsItem = {
     el: h("div", { class: "st-row col ai-provider-row" }, h("div", { class: "ai-provhead" }, h("div", { class: "st-row-title" }, "Provider"), h("span", { class: "spacer" }), recheck), grid),
-    text: "ai assistant provider codex chatgpt claude code openai api key ollama local model",
+    text: "ai assistant provider codex chatgpt claude code opencode openai api key ollama local model",
   };
 
   // model (Codex / Claude Code / API)
@@ -92,7 +94,7 @@ export function buildAiSettings(kit: SettingsKit): SettingsItem[] {
     const p = S().ai.provider;
     model.placeholder = p === "codex" ? "default (Codex config)" : p === "claude" ? "default" : "gpt-4o-mini";
   });
-  const modelRow = kit.row("Model", "Leave empty for the provider’s default", model, "model gpt");
+  const modelRow = kit.row("Model", "Leave empty for the provider’s default · OpenCode: provider/model, e.g. anthropic/claude-sonnet-4-5", model, "model gpt");
 
   // API key (write-only)
   const keyInput = h("input", { class: "st-input mono", type: "password", spellcheck: false, autocomplete: "off", "aria-label": "API key", placeholder: "sk-…", style: "width:220px" });

@@ -64,7 +64,7 @@ Passwords are stored in the system keychain (macOS Keychain, Windows Credential 
 - **Command palette** (Cmd+K / Ctrl+K): every action with its shortcut, plus your data sources, the tables the explorer has loaded and the open tabs; fuzzy filter, arrow keys, Enter to run.
 - **App menu**: a native menu bar on macOS (DataTrip, File, Edit, View, Console, Window, Help; Settings… sits under DataTrip); on Windows and Linux the same menus open from the ☰ button at the left of the tab bar. A toolbar at the bottom of the sidebar opens Settings, Vault profiles, SSH configurations, Query history and Import from DataGrip.
 - **Cross-source queries** in any SQL console: refer to a table of any data source in your list as `dataSource.database.table` and DataTrip joins them for you, e.g. `select * from asia32.postgres.users a join stage_mysql.shop.users b on b.email = a.email`. The data source name is its name in the explorer in lowercase with `_` for spaces and other characters ("Stage MySQL" → `stage_mysql`; the explorer tooltip shows it), or the exact name quoted (`"Stage MySQL".shop.users`). PostgreSQL and SQL Server take an optional schema (`asia32.postgres.sales.orders`; default `public` / `dbo`); SQLite also accepts `source.table`. Filters on one table run at the source, the join runs in memory, and a "How it ran" panel shows each pull. Nothing needs to be attached; the older `alias.schema.table` form with attached aliases keeps working. Cmd-click (Ctrl-click) two or more data sources → **New cross-source console** opens a console with a short guide and an example query built from real tables; `source.`, `source.database.` and `source.database.schema.` autocomplete databases, schemas and tables; dragging a table from another data source inserts `source.database.table`.
-- **AI assistant in consoles** (Cmd+I / Ctrl+I or **✦ Ask AI**): describe a query in words and the **Codex CLI** you are already signed in to with ChatGPT writes it — no API key. Claude Code, an OpenAI-compatible API key (kept in the keychain) or a local Ollama model work too (Settings › AI assistant). Only the schema of the tables your question is about is sent (names and types, never rows unless you turn on sample rows); the SQL appears as a highlighted insertion you **Accept** (Tab), **Reject** (Esc), **Refine…** or **Explain** — nothing runs until you run it. A failed statement gets **✦ Fix with AI**, shown as a diff; with text selected, **Explain selection**. Production data sources (read-only, or "prod" in the name or folder) are blocked by default. Install Codex with `npm i -g @openai/codex`, then run `codex login` once.
+- **AI assistant in consoles** (Cmd+I / Ctrl+I or **✦ Ask AI**): describe a query in words and the **Codex CLI** you are already signed in to with ChatGPT writes it — no API key. Claude Code, **OpenCode** (any provider you signed in to with `opencode auth login`; model as `provider/model`), an OpenAI-compatible API key (kept in the keychain) or a local Ollama model work too (Settings › AI assistant). Only the schema of the tables your question is about is sent (names and types, never rows unless you turn on sample rows); the SQL appears as a highlighted insertion you **Accept** (Tab), **Reject** (Esc), **Refine…** or **Explain** — nothing runs until you run it. A failed statement gets **✦ Fix with AI**, shown as a diff; with text selected, **Explain selection**. Production data sources (read-only, or "prod" in the name or folder) are blocked by default. Install Codex with `npm i -g @openai/codex`, then run `codex login` once.
 - **Redis Sentinel**: list the sentinels and the master name; DataTrip asks the sentinels where the master (or a healthy replica) is, connects to it with TLS / ACL user / DB index like a standalone server, and follows a failover on reconnect. Sentinels may have their own password (kept in the keychain), SSH tunnels cover the sentinels and the nodes they report, and Test connection shows which sentinel answered, the master, its replicas and the PING time.
 
 ## Keyboard shortcuts
@@ -134,7 +134,7 @@ src-tauri/
     commands.rs          Tauri commands
     model.rs, error.rs   IPC types and error type
     store.rs             connection configs, keychain passwords, history
-    ai.rs                AI assistant: provider detection (Codex / Claude Code CLI, API key, Ollama) and generation
+    ai.rs                AI assistant: provider detection (Codex / Claude Code / OpenCode CLI, API key, Ollama) and generation
     session.rs           open sessions, cancel, transaction mode
     export.rs            CSV and JSON export
     db/                  drivers: postgres, mysql, sqlite, mssql
@@ -151,3 +151,9 @@ scripts/make_icons.py    regenerates the application icons with Pillow
 ## License
 
 DataTrip is released under the [MIT License](LICENSE).
+
+## CI builds
+
+Every push runs a quick check (type-check, web build, `cargo check`, clippy). The installers for macOS,
+Windows and Linux are built only for a version tag (`v*`, which also creates a draft release), for a manual
+run (GitHub › Actions › release › Run workflow), or for a push whose commit message contains `[build]`.

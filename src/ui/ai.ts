@@ -9,6 +9,7 @@ import { quoteIdent } from "./sqlutil";
 export const AI_PROVIDER_NAMES: Record<AiProviderId, string> = {
   codex: "Codex CLI",
   claude: "Claude Code CLI",
+  opencode: "OpenCode CLI",
   openai: "API key",
   ollama: "Ollama (local)",
 };
@@ -67,6 +68,8 @@ export function providerChip(s: AppSettings, status: AiProviderStatus | undefine
       return status?.signedIn ? "Codex · ChatGPT sign-in" : a.model ? `Codex · ${a.model}` : "Codex";
     case "claude":
       return a.model ? `Claude Code · ${a.model}` : "Claude Code";
+    case "opencode":
+      return a.model ? `OpenCode · ${a.model}` : "OpenCode";
     case "openai":
       return `API · ${a.model || "gpt-4o-mini"}`;
     case "ollama":

@@ -631,3 +631,9 @@ commands; `federated_execute` keeps its signature (v0.10) with new naming rules,
   attaches it. The own source's table inserts `schema.table`, or `slug.database.table` when the statement at the
   drop point runs across sources.
 - **Explorer**: the tooltip of a SQL data source ends with "Use in SQL as <slug>".
+
+- **OpenCode** (provider id `"opencode"`): `opencode run [--model provider/model] <prompt>` in an empty temp dir,
+  with `OPENCODE_CONFIG_CONTENT={"permission":{"edit":"deny","bash":"deny","webfetch":"deny"}}`; prompts over
+  24 000 characters are written to `request.md` in that dir and the model is asked to read it (Windows command
+  lines are capped at 32 767 chars). Signed in = `$XDG_DATA_HOME/opencode/auth.json` (default
+  `~/.local/share/opencode`) exists. Also found in `~/.opencode/bin`.

@@ -17,7 +17,7 @@ export type TabGroup = "source" | "database" | "kind" | "custom" | "none";
 export type TabNaming = "table" | "source" | "classic";
 export type KeymapPreset = "datatrip" | "datagrip" | "vscode";
 export type HistoryDays = 30 | 90 | 365 | 0;
-export type AiProvider = "codex" | "claude" | "openai" | "ollama";
+export type AiProvider = "codex" | "claude" | "opencode" | "openai" | "ollama";
 
 export interface CustomTabGroup {
   id: string;
@@ -202,7 +202,7 @@ export function mergeSettings(raw: unknown): AppSettings {
       autoReconnect: bool(x.autoReconnect, d.data.autoReconnect),
     },
     ai: {
-      provider: oneOf<AiProvider>(ai.provider, ["codex", "claude", "openai", "ollama"], d.ai.provider),
+      provider: oneOf<AiProvider>(ai.provider, ["codex", "claude", "opencode", "openai", "ollama"], d.ai.provider),
       model: str(ai.model, d.ai.model).trim(),
       baseUrl: str(ai.baseUrl, d.ai.baseUrl).trim(),
       ollamaModel: str(ai.ollamaModel, d.ai.ollamaModel).trim(),

@@ -54,7 +54,7 @@ impl AiState {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiProviderStatus {
-    /// "codex" | "claude" | "openai" | "ollama"
+    /// "codex" | "claude" | "opencode" | "openai" | "ollama"
     pub id: String,
     /// Installed / configured / running.
     pub available: bool,
@@ -71,7 +71,7 @@ pub struct AiProviderStatus {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiRequest {
-    /// "codex" | "claude" | "openai" | "ollama"
+    /// "codex" | "claude" | "opencode" | "openai" | "ollama"
     pub provider: String,
     #[serde(default)]
     pub model: Option<String>,
@@ -135,6 +135,29 @@ pub async fn ai_providers(state: State<'_, AiState>) -> AppResult<Vec<AiProvider
         detail: match &claude {
             Some(p) => format!("Found {} · uses your Claude sign-in", p.display()),
             None => "Install Claude Code, then sign in by running `claude` once".into(),
+        },
+        models: Vec::new(),
+    });
+
+    let opencode = find_binary("opencode");
+    let opencode_auth = opencode_signed_in();
+    out.push(AiProviderStatus {
+        id: "opencode".into(),
+        available: opencode.is_some(),
+        signed_in: if opencode.is_some() {
+            Some(opencode_auth)
+        } else {
+            None
+        },
+        path: opencode.as_ref().map(|p| p.display().to_string()),
+        detail: match &opencode {
+            Some(p) if opencode_auth => format!("Found {} · uses your OpenCode providers", p.display()),
+            Some(p) => format!(
+                "Found {} · run `opencode auth login` in a terminal (or set a provider key)",
+                p.display()
+            ),
+            None => "Install with `npm i -g opencode-ai` (or the opencode.ai installer), then run `opencode auth login`"
+                .into(),
         },
         models: Vec::new(),
     });
@@ -277,6 +300,7 @@ fn provider_label(id: &str) -> &'static str {
     match id {
         "codex" => "Codex",
         "claude" => "Claude Code",
+        "opencode" => "OpenCode",
         "openai" => "The API",
         "ollama" => "Ollama",
         _ => "The AI provider",
@@ -449,6 +473,7 @@ async fn run_provider(r: &AiRequest, prompt: &str, api_key: Option<String>) -> A
     match r.provider.as_str() {
         "codex" => run_codex(prompt, model).await,
         "claude" => run_claude(prompt, model).await,
+        "opencode" => run_opencode(prompt, model).await,
         "openai" => run_openai(prompt, model, r.base_url.as_deref(), api_key).await,
         "ollama" => run_ollama(prompt, model).await,
         other => Err(AppError::new(format!("Unknown AI provider \"{}\"", other))),
@@ -480,6 +505,17 @@ struct CliOutput {
 
 /// Runs a CLI (no shell) in `cwd` with the prompt on stdin; the process is killed when the future is dropped.
 async fn run_cli(bin: &Path, args: &[String], cwd: &Path, input: &str) -> AppResult<CliOutput> {
+    run_cli_with_env(bin, args, cwd, input, &[]).await
+}
+
+/// `run_cli` with extra environment variables for the child.
+async fn run_cli_with_env(
+    bin: &Path,
+    args: &[String],
+    cwd: &Path,
+    input: &str,
+    extra_env: &[(&str, &str)],
+) -> AppResult<CliOutput> {
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args(args)
         .current_dir(cwd)
@@ -494,6 +530,9 @@ async fn run_cli(bin: &Path, args: &[String], cwd: &Path, input: &str) -> AppRes
         cmd.env("PATH", path);
     }
     cmd.env("NO_COLOR", "1");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     // Windows: no console window flashing up for the CLI (CREATE_NO_WINDOW).
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000);
@@ -601,6 +640,75 @@ async fn run_claude(prompt: &str, model: Option<String>) -> AppResult<String> {
         return Err(AppError::new(format!("Claude Code failed: {}", err)));
     }
     Ok(out.stdout)
+}
+
+/// OpenCode's inline config for a DataTrip run: no file edits, shell commands or web access —
+/// it only has to answer with SQL.
+const OPENCODE_CONFIG: &str = r#"{"permission":{"edit":"deny","bash":"deny","webfetch":"deny"}}"#;
+
+/// Longest prompt passed as a command-line argument (Windows caps a command line at 32 767
+/// characters); longer prompts go through a file the model reads.
+const OPENCODE_MAX_ARG: usize = 24_000;
+
+async fn run_opencode(prompt: &str, model: Option<String>) -> AppResult<String> {
+    let bin = find_binary("opencode").ok_or_else(|| {
+        AppError::new(
+            "OpenCode CLI not found. Install it with `npm i -g opencode-ai` (or the installer from \
+             opencode.ai), run `opencode auth login` in a terminal, then try again.",
+        )
+    })?;
+    let dir = TempDir::new()?;
+    let mut args: Vec<String> = vec!["run".into()];
+    if let Some(m) = model {
+        // OpenCode models are "provider/model", e.g. "anthropic/claude-sonnet-4-5".
+        args.push("--model".into());
+        args.push(m);
+    }
+    if prompt.len() > OPENCODE_MAX_ARG {
+        std::fs::write(dir.0.join("request.md"), prompt)?;
+        args.push(
+            "Read the file request.md in the current directory and follow its instructions exactly. \
+             Reply only as it asks."
+                .into(),
+        );
+    } else {
+        args.push(prompt.to_string());
+    }
+    let out = run_cli_with_env(
+        &bin,
+        &args,
+        &dir.0,
+        "",
+        &[("OPENCODE_CONFIG_CONTENT", OPENCODE_CONFIG)],
+    )
+    .await?;
+    if !out.ok {
+        let msg = if out.stderr.trim().is_empty() {
+            &out.stdout
+        } else {
+            &out.stderr
+        };
+        let err = tail(msg, 600);
+        if looks_like_auth_error(msg) {
+            return Err(AppError::new(format!(
+                "OpenCode has no provider signed in. Run `opencode auth login` in a terminal, then try again. ({})",
+                err
+            )));
+        }
+        return Err(AppError::new(format!("OpenCode failed: {}", err)));
+    }
+    Ok(out.stdout)
+}
+
+/// OpenCode keeps provider sign-ins in `$XDG_DATA_HOME/opencode/auth.json`
+/// (default `~/.local/share/opencode`).
+fn opencode_signed_in() -> bool {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join(".local").join("share")));
+    data.map(|d| d.join("opencode").join("auth.json").is_file())
+        .unwrap_or(false)
 }
 
 fn http_client(timeout: Duration) -> AppResult<reqwest::Client> {
@@ -765,6 +873,7 @@ fn extra_dirs() -> Vec<PathBuf> {
             ".volta/bin",
             ".bun/bin",
             ".claude/local",
+            ".opencode/bin",
             ".cargo/bin",
         ] {
             dirs.push(home.join(rel));

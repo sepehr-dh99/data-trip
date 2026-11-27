@@ -429,7 +429,7 @@ export interface FedResult {
 }
 
 // ── v0.12: AI assistant (src-tauri/src/ai.rs) ──
-export type AiProviderId = "codex" | "claude" | "openai" | "ollama";
+export type AiProviderId = "codex" | "claude" | "opencode" | "openai" | "ollama";
 export type AiMode = "write" | "fix" | "explain" | "refine";
 
 export interface AiProviderStatus {
