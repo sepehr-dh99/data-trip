@@ -29,6 +29,7 @@ import { onSettingsChange } from "./settings";
 import { REDIS_COMMANDS, redisLinesAt, splitRedisLines } from "./redis";
 import { CONSUME_FLAGS, KAFKA_COMMANDS, PRODUCE_FIELDS } from "./kafka";
 import { aiEditorExtension } from "./aiEditor";
+import { refPathBefore } from "./federation";
 import { ViewPlugin, hoverTooltip } from "@codemirror/view";
 import type { DecorationSet, ViewUpdate } from "@codemirror/view";
 
@@ -421,13 +422,15 @@ function runGutterExtensions(initial: Driver, holder: RunHolder): Extension {
   ];
 }
 
-// ---- Cross-source helpers: `alias.` / `alias.schema.` completion, unattached-alias marks with a quick fix.
+// ---- Cross-source helpers: `source.` / `source.db.` / `source.db.schema.` completion, marks of unknown data
+// source names with a quick fix.
 
-/** A marked range (an alias-like prefix of a data source that isn't attached); `key` is the alias text. */
+/** A marked range (the first part of a cross-source reference); `key` is its text, `message` an error to show. */
 export interface FedMark {
   from: number;
   to: number;
   key: string;
+  message?: string;
 }
 
 export interface FedCompletion {
@@ -440,8 +443,8 @@ export interface FedCompletion {
 }
 
 export interface FedHooks {
-  /** `path` = the dotted parts before the word being typed (["alias"] or ["alias", "schema"]); null = not ours. */
-  complete?(path: string[]): FedCompletion[] | null | Promise<FedCompletion[] | null>;
+  /** `path` = the dotted parts before the word being typed (1–3, quotes removed); null result = not ours. */
+  complete?(path: { text: string; quoted: boolean }[]): FedCompletion[] | null | Promise<FedCompletion[] | null>;
   /** Ranges to underline in the whole document. */
   marks?(doc: string): FedMark[];
   /** Hover card of a mark (quick actions). */
@@ -489,13 +492,13 @@ function fedExtensions(holder: FedHolder): Extension {
   const source = (ctx: CompletionContext): CompletionResult | null | Promise<CompletionResult | null> => {
     const complete = holder.hooks?.complete;
     if (!complete) return null;
-    const m = ctx.matchBefore(/[A-Za-z_][A-Za-z0-9_]*\.(?:[A-Za-z_][A-Za-z0-9_]*\.)?[A-Za-z0-9_]*$/);
-    if (!m || (m.from > 0 && ctx.state.sliceDoc(m.from - 1, m.from) === ".")) return null;
-    const parts = m.text.split(".");
-    const word = parts[parts.length - 1];
+    const line = ctx.state.doc.lineAt(ctx.pos);
+    const ref = refPathBefore(ctx.state.sliceDoc(Math.max(line.from, ctx.pos - 400), ctx.pos));
+    if (!ref) return null;
+    const word = ref.word;
     const finish = (opts: FedCompletion[] | null): CompletionResult | null =>
       opts && opts.length ? { from: ctx.pos - word.length, options: opts as Completion[], validFor: /^[A-Za-z0-9_]*$/ } : null;
-    const res = complete(parts.slice(0, -1));
+    const res = complete(ref.path);
     return res instanceof Promise ? res.then(finish, () => null) : finish(res);
   };
   return [plugin, tip, EditorState.languageData.of(() => [{ autocomplete: source }])];

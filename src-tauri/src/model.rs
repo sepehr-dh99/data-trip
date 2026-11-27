@@ -815,13 +815,15 @@ pub struct ReconnectResult {
     pub elapsed_ms: u64,
 }
 
-/// A data source attached to a cross-source query under `alias`.
+/// A data source a cross-source query may refer to under `alias` (its slug or an attached alias; also by its
+/// exact name, quoted). The same connection may come several times (different aliases / databases).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FedSource {
     pub alias: String,
     pub connection_id: String,
-    /// Database to connect to instead of the connection's default (ignored for SQLite).
+    /// Database for `alias.table` / `alias.schema.table` references instead of the connection's default
+    /// (ignored for SQLite). `alias.database.table` names its database itself.
     #[serde(default)]
     pub database: Option<String>,
 }
@@ -833,6 +835,9 @@ pub struct FedStep {
     pub alias: String,
     pub connection_id: String,
     pub source_name: String,
+    /// Database the pull ran in (None for the in-memory join).
+    #[serde(default)]
+    pub database: Option<String>,
     pub sql: String,
     pub rows: u64,
     pub elapsed_ms: u64,

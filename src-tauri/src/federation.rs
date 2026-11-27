@@ -1,12 +1,13 @@
 //! Cross-source queries (`federated_execute`): every table the SQL references as
-//! `alias.schema.table` / `alias.table` is pulled from its source over a temporary session
+//! `source.database.table` / `source.database.schema.table` (or the older `alias.schema.table` /
+//! `alias.table`) is pulled from its source over a temporary session per (source, database)
 //! (with the projection / WHERE pushdown planned by `fedsql`), loaded into an in-memory SQLite
 //! database, and the rewritten query runs there.
 
 use crate::credentials::CredentialSource;
 use crate::db::{self, DbConn};
 use crate::error::{AppError, AppResult};
-use crate::fedsql::{self, Dialect, PlannedTable};
+use crate::fedsql::{self, Dialect, Middle, Name, PlannedTable, SourceDef};
 use crate::model::{
     ColumnMeta, ConnectionConfig, Driver, FedResult, FedSource, FedStep, QueryResult,
 };
@@ -15,7 +16,9 @@ use crate::store::Store;
 use futures::future::BoxFuture;
 use serde_json::Value;
 use sqlx::Connection;
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Rows pulled per table at most.
@@ -24,9 +27,12 @@ const PULL_CAP: usize = 200_000;
 const SQLITE_MAX_VARS: usize = 32_000;
 const MAX_ROWS_PER_INSERT: usize = 500;
 
-struct Attached {
-    alias: String,
+/// One (connection, database) pair the UI sent, with every alias it answers to.
+struct Src {
+    aliases: Vec<String>,
+    /// The connection with `database` overridden by the FedSource's database.
     config: ConnectionConfig,
+    dialect: Dialect,
 }
 
 struct Pulled {
@@ -149,18 +155,59 @@ fn column_type(rows: &[Vec<Value>], i: usize, source_type: &str) -> &'static str
     ""
 }
 
-/// Opens a temporary session on one source, pulls its tables, and always closes the session.
-fn pull_source<'a>(
+/// A temporary session and the database it is connected to.
+struct Open {
+    session: Arc<Session>,
+    database: Option<String>,
+}
+
+/// Opens a temporary session on a source, on `database` instead of its default when given.
+fn open_session<'a>(
     creds: &'a CredentialSource,
-    attached: &'a Attached,
-    tables: Vec<PlannedTable>,
-) -> BoxFuture<'a, AppResult<Vec<Pulled>>> {
+    src: &'a Src,
+    database: Option<&'a str>,
+) -> BoxFuture<'a, AppResult<Open>> {
     Box::pin(async move {
-        let (session, _info) = Session::open(attached.config.clone(), creds.clone())
+        let mut config = src.config.clone();
+        if let Some(db) = database {
+            config.database = Some(db.to_string());
+        }
+        let ctx = match database {
+            Some(db) => format!("{} \u{b7} {}", src.config.name, db),
+            None => src.config.name.clone(),
+        };
+        let fallback = config.database.clone();
+        let (session, info) = Session::open(config, creds.clone())
             .await
-            .map_err(|e| {
-                with_context(&format!("{} ({})", attached.alias, attached.config.name), e)
-            })?;
+            .map_err(|e| with_context(&ctx, e))?;
+        Ok(Open {
+            session,
+            database: info.database.or(fallback),
+        })
+    })
+}
+
+async fn close_all(open: HashMap<usize, Open>) {
+    for o in open.into_values() {
+        o.session.close().await;
+    }
+}
+
+/// Pulls the tables of one (source, database) pair over `open` (else a new temporary session) and always
+/// closes the session. Returns the rows and the database they came from.
+fn pull_group<'a>(
+    creds: &'a CredentialSource,
+    src: &'a Src,
+    database: Option<String>,
+    open: Option<Open>,
+    tables: Vec<PlannedTable>,
+) -> BoxFuture<'a, AppResult<(Vec<Pulled>, Option<String>)>> {
+    Box::pin(async move {
+        let open = match open {
+            Some(o) => o,
+            None => open_session(creds, src, database.as_deref()).await?,
+        };
+        let session = &open.session;
         let mut out: Vec<Pulled> = Vec::with_capacity(tables.len());
         let mut failure: Option<AppError> = None;
         for t in tables {
@@ -192,8 +239,90 @@ fn pull_source<'a>(
         session.close().await;
         match failure {
             Some(e) => Err(e),
-            None => Ok(out),
+            None => Ok((out, open.database)),
         }
+    })
+}
+
+/// Schemas of the session's database (PostgreSQL / SQL Server), lower case.
+fn list_schemas<'a>(
+    session: &'a Arc<Session>,
+    d: Dialect,
+) -> BoxFuture<'a, AppResult<Vec<String>>> {
+    Box::pin(async move {
+        let sql = match d {
+            Dialect::Postgres => "SELECT nspname FROM pg_catalog.pg_namespace",
+            Dialect::Mssql => "SELECT name FROM sys.schemas",
+            Dialect::Mysql | Dialect::Sqlite => return Ok(Vec::new()),
+        };
+        let r = session.execute(sql.to_string(), 100_000).await?;
+        Ok(r.rows
+            .iter()
+            .filter_map(|row| row.first().and_then(Value::as_str).map(str::to_lowercase))
+            .collect())
+    })
+}
+
+/// Middle-part answers keyed by (source id, lower-case part).
+type Answers = HashMap<(usize, String), Result<Middle, String>>;
+
+/// Decides database vs schema for every `source.x.table` middle part: `x` is a database when the server
+/// lists one of that name (case-insensitive; database list cached per run), else a schema of the source's
+/// default database when that has one, else an error. Opens (and keeps in `open`) one session per source
+/// on its default database.
+fn classify_middles<'a>(
+    creds: &'a CredentialSource,
+    srcs: &'a [Src],
+    requests: Vec<(usize, Name)>,
+    open: &'a mut HashMap<usize, Open>,
+) -> BoxFuture<'a, AppResult<Answers>> {
+    Box::pin(async move {
+        let mut answers: Answers = HashMap::new();
+        let mut databases: HashMap<usize, Vec<String>> = HashMap::new();
+        let mut schemas: HashMap<usize, Vec<String>> = HashMap::new();
+        for (id, name) in requests {
+            let src = &srcs[id];
+            let session = match open.get(&id) {
+                Some(o) => o.session.clone(),
+                None => {
+                    let o = open_session(creds, src, None).await?;
+                    let s = o.session.clone();
+                    open.insert(id, o);
+                    s
+                }
+            };
+            if let Entry::Vacant(v) = databases.entry(id) {
+                let list = session.list_databases().await.map_err(|e| {
+                    with_context(&format!("Listing the databases of {}", src.config.name), e)
+                })?;
+                v.insert(list.into_iter().map(|d| d.name).collect());
+            }
+            let low = name.text.to_lowercase();
+            let exact = databases
+                .get(&id)
+                .and_then(|l| l.iter().find(|d| d.to_lowercase() == low).cloned());
+            let answer = match exact {
+                Some(db) => Ok(Middle::Database(db)),
+                None => {
+                    if let Entry::Vacant(v) = schemas.entry(id) {
+                        let list = list_schemas(&session, src.dialect).await.map_err(|e| {
+                            with_context(&format!("Listing the schemas of {}", src.config.name), e)
+                        })?;
+                        v.insert(list);
+                    }
+                    if schemas.get(&id).is_some_and(|l| l.contains(&low)) {
+                        Ok(Middle::Schema)
+                    } else {
+                        Err(format!(
+                            "'{}' is neither a database nor a schema on {}",
+                            name.text, src.config.name
+                        ))
+                    }
+                }
+            };
+            answers.insert((id, low), answer);
+        }
+        Ok(answers)
     })
 }
 
@@ -281,7 +410,78 @@ fn run_in_memory<'a>(
     })
 }
 
-/// Runs one SELECT / WITH across several data sources (see CONTRACT.md v0.10).
+/// Merges the UI's sources into (connection, database) pairs; each pair answers to all of its aliases,
+/// the first pair of a connection also to the data source's exact name (and its slug).
+fn merge_sources(entries: Vec<(FedSource, ConnectionConfig)>) -> AppResult<Vec<Src>> {
+    let mut srcs: Vec<Src> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for (s, mut config) in entries {
+        let alias = s.alias.trim().to_string();
+        if !valid_alias(&alias) {
+            return Err(AppError::new(format!(
+                "'{}' is not a valid source alias (letters, digits and _, not starting with a digit).",
+                alias
+            )));
+        }
+        if !seen.insert(alias.to_lowercase()) {
+            return Err(AppError::new(format!(
+                "The source alias '{}' is used twice.",
+                alias
+            )));
+        }
+        let dialect = match dialect_of(config.driver) {
+            Some(d) => d,
+            None => {
+                return Err(AppError::new(format!(
+                    "Cross-source queries support PostgreSQL, MySQL, SQLite and SQL Server; \
+                     '{}' ({}) is not one of them.",
+                    config.name, alias
+                )))
+            }
+        };
+        if config.driver != Driver::Sqlite {
+            if let Some(db) = s
+                .database
+                .as_deref()
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+            {
+                config.database = Some(db.to_string());
+            }
+        }
+        let db_key = |c: &ConnectionConfig| c.database.as_deref().unwrap_or("").to_lowercase();
+        match srcs
+            .iter()
+            .position(|x| x.config.id == config.id && db_key(&x.config) == db_key(&config))
+        {
+            Some(i) => srcs[i].aliases.push(alias),
+            None => srcs.push(Src {
+                aliases: vec![alias],
+                config,
+                dialect,
+            }),
+        }
+    }
+    Ok(srcs)
+}
+
+fn source_defs(srcs: &[Src]) -> Vec<SourceDef> {
+    let mut named: HashSet<&str> = HashSet::new();
+    srcs.iter()
+        .map(|s| SourceDef {
+            label: s.config.name.clone(),
+            dialect: s.dialect,
+            aliases: s.aliases.clone(),
+            names: if named.insert(s.config.id.as_str()) {
+                vec![s.config.name.clone()]
+            } else {
+                Vec::new()
+            },
+        })
+        .collect()
+}
+
+/// Runs one SELECT / WITH across several data sources (see CONTRACT.md v0.10 and v0.13).
 pub fn federated_execute<'a>(
     store: &'a Store,
     creds: &'a CredentialSource,
@@ -293,86 +493,103 @@ pub fn federated_execute<'a>(
         let started = Instant::now();
         if sources.is_empty() {
             return Err(AppError::new(
-                "Attach at least one data source to run a cross-source query.",
+                "Refer to at least one data source to run a cross-source query.",
             ));
         }
-        let mut attached: Vec<Attached> = Vec::with_capacity(sources.len());
-        let mut aliases: Vec<(String, Dialect)> = Vec::with_capacity(sources.len());
-        let mut seen: HashSet<String> = HashSet::new();
-        for s in &sources {
-            let alias = s.alias.trim().to_string();
-            if !valid_alias(&alias) {
-                return Err(AppError::new(format!(
-                    "'{}' is not a valid source alias (letters, digits and _, not starting with a digit).",
-                    alias
-                )));
-            }
-            if !seen.insert(alias.to_lowercase()) {
-                return Err(AppError::new(format!(
-                    "The source alias '{}' is used twice.",
-                    alias
-                )));
-            }
-            let mut config = store.get_connection(&s.connection_id).await?;
-            let dialect = match dialect_of(config.driver) {
-                Some(d) => d,
-                None => {
-                    return Err(AppError::new(format!(
-                        "Cross-source queries support PostgreSQL, MySQL, SQLite and SQL Server; \
-                         '{}' ({}) is not one of them.",
-                        config.name, alias
-                    )))
-                }
-            };
-            if config.driver != Driver::Sqlite {
-                if let Some(db) = s
-                    .database
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|d| !d.is_empty())
-                {
-                    config.database = Some(db.to_string());
-                }
-            }
-            aliases.push((alias.clone(), dialect));
-            attached.push(Attached { alias, config });
+        let mut entries: Vec<(FedSource, ConnectionConfig)> = Vec::with_capacity(sources.len());
+        for s in sources {
+            let config = store.get_connection(&s.connection_id).await?;
+            entries.push((s, config));
         }
+        let srcs = merge_sources(entries)?;
+        let defs = source_defs(&srcs);
 
-        let plan = fedsql::plan(&sql, &aliases).map_err(AppError::new)?;
-
-        // One temporary session per referenced source; sources are pulled concurrently.
-        let mut jobs = Vec::new();
-        for a in &attached {
-            let tables: Vec<PlannedTable> = plan
-                .tables
-                .iter()
-                .filter(|t| t.source == a.alias.to_lowercase())
+        // `source.x.table` on PostgreSQL / SQL Server: is x a database or a schema? Ask the servers.
+        let requests = fedsql::middle_parts(&sql, &defs).map_err(AppError::new)?;
+        let mut open: HashMap<usize, Open> = HashMap::new();
+        let answers = if requests.is_empty() {
+            HashMap::new()
+        } else {
+            match classify_middles(creds, &srcs, requests, &mut open).await {
+                Ok(a) => a,
+                Err(e) => {
+                    close_all(open).await;
+                    return Err(e);
+                }
+            }
+        };
+        let classify = |id: usize, n: &Name| -> Result<Middle, String> {
+            answers
+                .get(&(id, n.text.to_lowercase()))
                 .cloned()
-                .collect();
-            if !tables.is_empty() {
-                jobs.push(pull_source(creds, a, tables));
+                .unwrap_or(Ok(Middle::Schema))
+        };
+        let plan = match fedsql::plan(&sql, &defs, &classify) {
+            Ok(p) => p,
+            Err(e) => {
+                close_all(open).await;
+                return Err(AppError::new(e));
+            }
+        };
+
+        // One temporary session per (source, database) pair; pairs are pulled concurrently. A session
+        // opened for the database list is reused for its source's default database.
+        let mut groups: Vec<(usize, Option<String>, Vec<PlannedTable>)> = Vec::new();
+        for t in &plan.tables {
+            let default_db = open
+                .get(&t.source)
+                .and_then(|o| o.database.clone())
+                .or_else(|| srcs[t.source].config.database.clone());
+            // The source's default database by name → the default pair (one session less).
+            let db = t.database.clone().filter(|d| {
+                !matches!(default_db.as_deref(), Some(x) if x.to_lowercase() == d.to_lowercase())
+            });
+            let key = db.as_ref().map(|d| d.to_lowercase());
+            match groups
+                .iter()
+                .position(|g| g.0 == t.source && g.1.as_ref().map(|d| d.to_lowercase()) == key)
+            {
+                Some(i) => groups[i].2.push(t.clone()),
+                None => groups.push((t.source, db, vec![t.clone()])),
             }
         }
+        let mut jobs = Vec::with_capacity(groups.len());
+        for (id, db, tables) in groups {
+            let reuse = if db.is_none() { open.remove(&id) } else { None };
+            jobs.push(pull_group(creds, &srcs[id], db, reuse, tables));
+        }
+        close_all(open).await;
         let outcomes = futures::future::join_all(jobs).await;
-        let mut pulled: Vec<Pulled> = Vec::new();
+        let mut pulled: Vec<(Pulled, Option<String>)> = Vec::new();
+        let mut failure: Option<AppError> = None;
         for o in outcomes {
-            pulled.extend(o?);
+            match o {
+                Ok((ps, db)) => pulled.extend(ps.into_iter().map(|p| (p, db.clone()))),
+                Err(e) => {
+                    if failure.is_none() {
+                        failure = Some(e);
+                    }
+                }
+            }
+        }
+        if let Some(e) = failure {
+            return Err(e);
         }
 
         let mut steps: Vec<FedStep> = Vec::with_capacity(pulled.len() + 1);
-        for p in &pulled {
-            let a = attached
-                .iter()
-                .find(|a| a.alias.to_lowercase() == p.table.source);
+        for (p, db) in &pulled {
+            let src = &srcs[p.table.source];
             steps.push(FedStep {
-                alias: a.map(|a| a.alias.clone()).unwrap_or_default(),
-                connection_id: a.map(|a| a.config.id.clone()).unwrap_or_default(),
-                source_name: a.map(|a| a.config.name.clone()).unwrap_or_default(),
+                alias: p.table.alias.clone(),
+                connection_id: src.config.id.clone(),
+                source_name: src.config.name.clone(),
+                database: db.clone(),
                 sql: p.table.pull_sql.clone(),
                 rows: p.result.rows.len() as u64,
                 elapsed_ms: p.elapsed_ms,
             });
         }
+        let pulled: Vec<Pulled> = pulled.into_iter().map(|(p, _)| p).collect();
 
         let join_started = Instant::now();
         let mut result = run_in_memory(&pulled, &plan.sql, max_rows).await?;
@@ -381,6 +598,7 @@ pub fn federated_execute<'a>(
             alias: String::new(),
             connection_id: String::new(),
             source_name: "DataTrip".to_string(),
+            database: None,
             sql: format!(
                 "join \u{b7} {} {} (in memory)",
                 n,

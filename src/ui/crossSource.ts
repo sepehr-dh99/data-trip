@@ -1,16 +1,22 @@
 // Cross-source consoles: the "pick SQL data sources" dialog and the example query of the guide card, built from
 // real tables of the attached sources.
-import type { SchemaNode, TableNode } from "../types";
+import type { Driver, SchemaNode, TableNode } from "../types";
 import { DRIVER_LABELS } from "../types";
 import { h, icon } from "./dom";
-import { FED_DRIVERS, refPart } from "./federation";
+import { FED_DRIVERS, refPart, tableRef } from "./federation";
 import { connColor } from "./sqlutil";
 import { store } from "./state";
 
 // ---------------------------------------------------------------- example query
 
 export interface ExampleSource {
-  alias: string;
+  /** How the source is written in SQL: its slug (or quoted name / attached alias). */
+  ref: string;
+  /** Data source name (for the comment line). */
+  name: string;
+  driver: Driver;
+  /** Database the tables come from (null = unknown: the older `source.schema.table` form is written). */
+  database: string | null;
   schemas: SchemaNode[];
   /** Schema unqualified names resolve to (tried first). */
   defaultSchema: string | null;
@@ -97,7 +103,8 @@ export function exampleQuery(sources: ExampleSource[]): string | null {
   const b = best?.b ?? B.c[0];
   const aa = tableAlias(a.t.name, "");
   const ba = tableAlias(b.t.name, aa);
-  const ref = (src: ExampleSource, c: Cand): string => `${src.alias}.${refPart(c.schema)}.${refPart(c.t.name)}`;
+  // source.database.table (PostgreSQL / SQL Server schemas other than public / dbo: source.database.schema.table).
+  const ref = (src: ExampleSource, c: Cand): string => tableRef(src.ref, src.driver, src.database, c.schema, c.t.name);
   const strong = best !== null && best.j.score >= 2;
   const j = best?.j ?? null;
   const pick = (c: Cand, n: number, skip: string | null): string[] =>
@@ -111,8 +118,8 @@ export function exampleQuery(sources: ExampleSource[]): string | null {
   const lines: string[] = [];
   lines.push(
     strong
-      ? `-- Example: ${a.t.name} (${A.s.alias}) joined with ${b.t.name} (${B.s.alias})`
-      : `-- Example: ${a.t.name} (${A.s.alias}) next to ${b.t.name} (${B.s.alias}) — adjust the join condition`,
+      ? `-- Example: ${a.t.name} (${A.s.name}) joined with ${b.t.name} (${B.s.name})`
+      : `-- Example: ${a.t.name} (${A.s.name}) next to ${b.t.name} (${B.s.name}) — adjust the join condition`,
   );
   lines.push(`SELECT ${cols.length ? cols.join(", ") : `${aa}.*, ${ba}.*`}`);
   lines.push(`FROM ${ref(A.s, a)} ${aa}`);
@@ -193,7 +200,7 @@ export function pickCrossSources(preselect: string[] = []): Promise<string[] | n
         h(
           "div",
           { class: "dialog-body" },
-          h("p", { class: "xs-lead" }, "Pick the data sources to query together. The first one you pick is the console's own source; each gets a short alias for alias.schema.table."),
+          h("p", { class: "xs-lead" }, "Pick the data sources to query together. The first one you pick is the console's own source. In SQL each one is its name in lower case with _ for spaces: dataSource.database.table."),
           cands.length >= 2 ? h("div", { class: "xs-list" }, rows) : h("p", { class: "xs-lead" }, "You need at least two PostgreSQL, MySQL, SQLite or SQL Server data sources."),
         ),
         h("div", { class: "dialog-foot" }, countEl, h("div", { class: "spacer" }), h("button", { class: "btn ghost", type: "button", onclick: () => done(null) }, "Cancel"), okBtn),

@@ -283,7 +283,7 @@ Approved designs (read them, they are the spec for look and behavior): `/home/cl
   physical connection and reconnect now (fresh Vault credentials, fresh SSH forward) keeping the session id. In a
   transaction → that session is skipped and reported. `ReconnectResult { sessions: number, skippedInTx: number,
   elapsedMs: number }`. No open session → `sessions: 0` (frontend then just connects).
-- **federated_execute**: `FedSource { alias: string, connectionId: string, database: string|null }`. The SQL
+- **federated_execute** (naming superseded by v0.13 — cross-source naming): `FedSource { alias: string, connectionId: string, database: string|null }`. The SQL
   refers to tables as `alias.schema.table` or `alias.table` (alias case-insensitive, `[A-Za-z_][A-Za-z0-9_]*`).
   For each distinct referenced table the backend pulls rows from that source (a temporary session per source),
   then loads them into an in-memory SQLite database and runs the query there (SQLite dialect for the outer query;
@@ -460,7 +460,7 @@ except the macOS menu bar (`src-tauri/src/app_menu.rs`); no new commands.
   shared `*_id` column, then shared uuid/email/code/sku/name, then `id`; plain tables and the default schema first.
   No join column → the first table of each with a first-column join and a comment to adjust it. Names are bare when
   lower-case identifiers, else double-quoted.
-- **Completion**: `<alias>.` completes the source's schemas, `<alias>.<schema>.` its tables (own alias and attached
+- **Completion** (v0.13 changes completion, the underline and drag insertion — see below): `<alias>.` completes the source's schemas, `<alias>.<schema>.` its tables (own alias and attached
   aliases, only while the Sources strip is in use); introspection comes from the explorer store and is loaded
   lazily (the source is connected in the explorer if needed).
 - **Unattached alias**: in SQL consoles of a cross-source driver, `foo.schema.table` (outside strings / comments, not
@@ -562,3 +562,72 @@ registered as `ai::…` in `lib.rs`, state `ai::AiState` managed separately from
   the cursor first; gone → toast), sends mode fix with the statement + error + context, and shows a line diff over
   it: removed lines red / struck out with `−`, added lines green with `+` right after them, same action bar; Accept
   replaces the statement (its `;` stays) as one undo step. An unchanged reply → toast "found nothing to change".
+
+## v0.13 — cross-source naming
+
+Request: "select * from dataSource1.DbName.TableName join dataSource2.DbName.TableName" in any console. No new
+commands; `federated_execute` keeps its signature (v0.10) with new naming rules, and `FedStep` gains `database`.
+
+- **References**: `<source>.<database>.<table>`; PostgreSQL / SQL Server also `<source>.<database>.<schema>.<table>`.
+  `<source>` is a data source of the connection list written as its **slug** — lower case, every run of characters
+  other than ASCII a–z / 0–9 → `_`, trimmed of `_` ("Asia32" → `asia32`, "Stage MySQL" → `stage_mysql`;
+  `fedsql::slug` = `sourceSlug` in `src/ui/federation.ts`) — or its **exact name quoted** with `"…"`, `` `…` `` or
+  `[…]` (`"Stage MySQL".shop.users`), case-insensitive. Attached aliases (Sources strip) stay extra names. A slug two
+  data sources share → error `'x' matches more than one data source (A, B). Quote the exact name, e.g.
+  "A".database.table, or rename one of them.` (frontend before running, backend too). A slug that isn't a plain
+  identifier (empty, leading digit) can only be written quoted.
+- **Parts** (backend `fedsql::plan`): `source.table` → the FedSource's database, unqualified (search_path /
+  default schema). `source.x.table`: SQLite → x is the database ("main", the file's name, anything: ignored);
+  MySQL → x is the database (= schema; no listing); PostgreSQL / SQL Server → x is a **database** when the server
+  lists one of that name (case-insensitive, its exact name is used; schema = `public` / `dbo`), else a **schema** of
+  the FedSource's database (the pre-v0.13 `alias.schema.table` form), else error `'x' is neither a database nor a
+  schema on <Source>`. `source.db.schema.table` (PG / MSSQL): db must be a listed database (else `'x' is not a
+  database on <Source>`). MySQL / SQLite 4 parts and 5+ parts → errors. First part matching no source → `No data
+  source named 'x'. Write dataSource.database.table — …`.
+- **Source lookup** (`fedsql::lookup_source`, per tier; two different sources on one tier → the ambiguity error):
+  quoted first part → exact data source names; then the FedSource aliases; then slugs of the names. The backend
+  merges FedSources with the same (connection, database) into one source answering to all their aliases; only the
+  first source of a connection answers to its exact name / slug.
+- **Database vs schema**: `fedsql::middle_parts(sql, sources)` lists the (source, x) pairs to decide (a dry run of
+  the planner); `federation.rs` opens one temporary session per such source on its default database, lists the
+  databases (`list_databases`, cached per run) and, only when x isn't one, the schemas (`pg_namespace` /
+  `sys.schemas`). `fedsql::plan(sql, sources, classify)` takes the answers as a closure (`Middle::Database(exact)
+  | Middle::Schema | Err`), so it stays std-only and unit-tested.
+- **Pulls** run per (source, database) pair: one temporary session per pair with `ConnectionConfig.database`
+  overridden to that database (the default pair reuses the listing session; a named database equal to the
+  connected one counts as the default pair); pairs are pulled concurrently, every session is closed (also on
+  errors). Unchanged: 200 000-row cap, projection / WHERE pushdown rules, SQLite in-memory tables named by the full
+  reference (`asia32.postgres.users`), one plan step per pull + the join step. Two spellings of one table
+  (`lite.users`, `lite_file.main.users`) are pulled once.
+- `FedStep { alias (the first part as written), connectionId, sourceName, database: string|null (the database the
+  pull ran in; null for the join step), sql (the pull SQL), rows, elapsedMs }`. "How it ran" shows
+  `<source> · <database>`.
+- **Routing in every SQL console** (PostgreSQL / MySQL / SQLite / SQL Server; frontend, `routeStatement` in
+  `src/ui/federation.ts`, node tests `node scripts/test-federation.mjs`): `findTableRefs` finds dotted names in
+  table positions (after FROM / JOIN / INTO / UPDATE, a comma of a FROM list; outside strings / comments) and
+  `resolveSource` maps a first part: attached alias / the strip's own alias → that source; a database of the
+  console's server or a schema of its database (cached explorer lists) → native; quoted → exact data source name;
+  else slug. Slug / name references need 3+ parts (SQLite sources: 2+). A statement runs through
+  `federated_execute` when a reference names a data source other than the console's own, or (with sources
+  attached) an attached alias / the own alias; otherwise on the session as before (MSSQL `db.schema.table`, MySQL
+  `db.table` stay native). Each statement of Run all is routed on its own. `fedSourcesFor` sends: attached aliases
+  (their database), the strip's own alias, the console's own connection under its slug (database = the console's
+  current database), and every other referenced source under its slug (database = its attachment's, else null);
+  aliases unique, valid identifiers (a source without one gets `aliasSlug`, written quoted in SQL). Ambiguous slug →
+  error result before running. Cross-source errors get no "Fix with AI"; "Load more" re-runs with the same sources.
+- **Editor**: completion `source.` → the source's databases (SQLite: also its tables; attached / own alias: also the
+  schemas of its database), `source.db.` → tables of the default schema + schemas (PG / MSSQL; MySQL: the
+  database's tables; not a database → tables of that schema, older form), `source.db.schema.` → tables;
+  introspection loaded lazily (explorer connect, `ensureDb`). Quoted first parts complete too. The "isn't attached"
+  underline is gone; references of 3+ parts whose first part is no data source / database / schema get a wavy
+  underline "No data source named 'x'." (with "Use a data source as x…", which attaches the picked one under that
+  alias); an ambiguous slug is underlined with the ambiguity message. Marks only once the console's source is
+  connected.
+- **Guide card** step 2: "Write dataSource.database.table — e.g. asia32.postgres.users JOIN stage_mysql.shop.users —
+  the data source name is its name in the explorer, in lowercase with _ for spaces (or quote it)" (with the
+  console's own source names when known); step 1 says nothing needs attaching. **Example query** and **drag a
+  table** insert `tableRef(...)`: `slug.database.table` (PG / MSSQL schema other than public / dbo → 4 parts; SQLite
+  `slug.main.table`; a source without a plain slug → its quoted name). Dragging from another data source no longer
+  attaches it. The own source's table inserts `schema.table`, or `slug.database.table` when the statement at the
+  drop point runs across sources.
+- **Explorer**: the tooltip of a SQL data source ends with "Use in SQL as <slug>".

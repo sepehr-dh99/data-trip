@@ -403,16 +403,21 @@ export interface ReconnectResult {
   elapsedMs: number;
 }
 
+/** A data source a cross-source query may refer to: `alias` = its slug or an attached alias (its exact name, quoted, works too). */
 export interface FedSource {
   alias: string;
   connectionId: string;
+  /** Database for `alias.table` / `alias.schema.table`; `alias.database.table` names its own. null = connection default. */
   database: string | null;
 }
 
 export interface FedStep {
+  /** The source's name as written in the SQL ("" for the in-memory join). */
   alias: string;
   connectionId: string;
   sourceName: string;
+  /** Database the pull ran in (null for the in-memory join). */
+  database: string | null;
   sql: string;
   rows: number;
   elapsedMs: number;

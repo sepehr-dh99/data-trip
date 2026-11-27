@@ -1,6 +1,7 @@
 //! Pure SQL analysis for cross-source (federated) queries: a small tokenizer, the finder for
-//! `alias.schema.table` / `alias.table` references, projection / WHERE pushdown and the rewrite of
-//! the outer query for the in-memory SQLite database. Std only, so it is easy to unit test.
+//! `source.database.table` / `source.database.schema.table` references (plus the older
+//! `alias.schema.table` and `alias.table` forms), projection / WHERE pushdown and the rewrite of the
+//! outer query for the in-memory SQLite database. Std only, so it is easy to unit test.
 //!
 //! Everything here is deliberately conservative: when a pushdown cannot be proven safe by these
 //! simple rules, the whole table is pulled (`SELECT *`, no WHERE).
@@ -307,11 +308,169 @@ fn is_keyword(word: &str) -> bool {
 /// Keywords allowed inside a pushed-down WHERE conjunct.
 const PUSH_KEYWORDS: &[&str] = &["AND", "OR", "NOT", "IS", "NULL", "IN", "BETWEEN", "LIKE"];
 
+/// `"Stage MySQL"` → `stage_mysql`, `Asia32` → `asia32`: lower case, every run of characters other than
+/// ASCII letters / digits → `_`, trimmed of `_`. The name a data source answers to in SQL.
+pub fn slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+/// A data source a cross-source query may reference (its index in the slice is its id).
+#[derive(Clone, Debug)]
+pub struct SourceDef {
+    /// Shown in messages (the data source name).
+    pub label: String,
+    pub dialect: Dialect,
+    /// Names given by the UI (slugs, attached aliases); matched case-insensitively.
+    pub aliases: Vec<String>,
+    /// Exact data source names: matched case-insensitively by a quoted first part, and through their slug.
+    pub names: Vec<String>,
+}
+
+/// What the middle part of `source.x.table` names on a PostgreSQL / SQL Server source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Middle {
+    /// A database on that server (its exact name).
+    Database(String),
+    /// A schema of the source's default database (the pre-v0.13 `alias.schema.table` form).
+    Schema,
+}
+
+/// Decides [`Middle`] for (source id, middle part); errors when it is neither.
+pub type Classify<'c> = dyn Fn(usize, &Name) -> Result<Middle, String> + 'c;
+
+/// The source a reference's first part names: a quoted first part tries the exact data source names
+/// first; then the aliases; then the slugs of the names. Two different sources on one tier → error.
+fn lookup_source(sources: &[SourceDef], first: &Name) -> Result<Option<usize>, String> {
+    let key = first.text.to_lowercase();
+    let tiers: [&dyn Fn(&SourceDef) -> bool; 3] = [
+        &|s: &SourceDef| first.quoted && s.names.iter().any(|n| n.to_lowercase() == key),
+        &|s: &SourceDef| s.aliases.iter().any(|a| a.to_lowercase() == key),
+        &|s: &SourceDef| s.names.iter().any(|n| !key.is_empty() && slug(n) == key),
+    ];
+    for tier in tiers {
+        let hits: Vec<usize> = sources
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| tier(s))
+            .map(|(i, _)| i)
+            .collect();
+        match hits.len() {
+            0 => continue,
+            1 => return Ok(Some(hits[0])),
+            _ => {
+                let labels: Vec<&str> = hits.iter().map(|&i| sources[i].label.as_str()).collect();
+                return Err(format!(
+                    "'{}' matches more than one data source ({}). Quote the exact name, e.g. \"{}\".database.table, or rename one of them.",
+                    first.text,
+                    labels.join(", "),
+                    labels[0]
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// A table reference resolved against its source.
+struct Resolved {
+    database: Option<String>,
+    schema: Option<Name>,
+    table: Name,
+}
+
+/// `rest` = the parts after the source: `[table]`, `[database|schema, table]` or `[database, schema, table]`.
+fn resolve_parts(
+    sources: &[SourceDef],
+    id: usize,
+    rest: &[Name],
+    display: &str,
+    classify: &Classify<'_>,
+) -> Result<Resolved, String> {
+    let src = &sources[id];
+    let default_schema = |d: Dialect| -> Option<Name> {
+        let s = match d {
+            Dialect::Postgres => "public",
+            Dialect::Mssql => "dbo",
+            Dialect::Mysql | Dialect::Sqlite => return None,
+        };
+        Some(Name {
+            text: s.to_string(),
+            quoted: false,
+        })
+    };
+    match (rest, src.dialect) {
+        ([t], _) => Ok(Resolved {
+            database: None,
+            schema: None,
+            table: t.clone(),
+        }),
+        // SQLite: the middle part is the database ("main", the file's name…) — any value is fine.
+        ([_, t], Dialect::Sqlite) => Ok(Resolved {
+            database: None,
+            schema: None,
+            table: t.clone(),
+        }),
+        // MySQL: database = schema.
+        ([d, t], Dialect::Mysql) => Ok(Resolved {
+            database: Some(d.text.clone()),
+            schema: None,
+            table: t.clone(),
+        }),
+        ([m, t], d) => match classify(id, m)? {
+            Middle::Database(db) => Ok(Resolved {
+                database: Some(db),
+                schema: default_schema(d),
+                table: t.clone(),
+            }),
+            Middle::Schema => Ok(Resolved {
+                database: None,
+                schema: Some(m.clone()),
+                table: t.clone(),
+            }),
+        },
+        ([db, s, t], Dialect::Postgres | Dialect::Mssql) => match classify(id, db)? {
+            Middle::Database(exact) => Ok(Resolved {
+                database: Some(exact),
+                schema: Some(s.clone()),
+                table: t.clone(),
+            }),
+            Middle::Schema => Err(format!(
+                "'{}' is not a database on {} (in {}) — write source.database.schema.table",
+                db.text, src.label, display
+            )),
+        },
+        ([_, _, _], Dialect::Mysql) => Err(format!(
+            "'{}': MySQL has no schemas inside a database — write source.database.table",
+            display
+        )),
+        ([_, _, _], Dialect::Sqlite) => Err(format!(
+            "'{}': write source.table or source.main.table for SQLite",
+            display
+        )),
+        _ => Err(format!(
+            "'{}' has too many name parts — use source.database.table or source.database.schema.table",
+            display
+        )),
+    }
+}
+
 /// One table pulled from a source.
 #[derive(Clone, Debug)]
 pub struct PlannedTable {
-    /// Source alias, lower case.
-    pub source: String,
+    /// Index of the source in the `sources` given to [`plan`].
+    pub source: usize,
+    /// The source's first name part as written (unquoted), e.g. `asia32` or `Stage MySQL`.
+    pub alias: String,
+    /// Database to read from; None = the source's default database.
+    pub database: Option<String>,
     /// The reference as written, e.g. `pg.public.users`.
     pub display: String,
     /// Name of the table in the in-memory SQLite database (unquoted).
@@ -344,12 +503,16 @@ struct Level {
 }
 
 struct DTable {
-    source: String,
+    source: usize,
+    alias: String,
+    database: Option<String>,
     schema: Option<Name>,
     table: Name,
     display: String,
     sqlite_name: String,
     uses: Vec<usize>,
+    /// Every way the query spells this table: (source id, keys of the parts after the source).
+    spellings: Vec<(usize, Vec<String>)>,
 }
 
 struct Use {
@@ -456,12 +619,26 @@ impl<'a> Analyzer<'a> {
     }
 }
 
-/// Plans a federated query. `sources` = (alias, dialect) of every attached source.
-pub fn plan(sql: &str, sources: &[(String, Dialect)]) -> Result<Plan, String> {
-    let dialects: HashMap<String, Dialect> = sources
-        .iter()
-        .map(|(a, d)| (a.to_lowercase(), *d))
-        .collect();
+/// The middle parts a [`plan`] of this query would ask `classify` about (3-part references on PostgreSQL /
+/// SQL Server sources, and the database part of 4-part ones), deduplicated, in query order. Errors that
+/// don't depend on the classification (unknown source, not a SELECT…) surface here already.
+pub fn middle_parts(sql: &str, sources: &[SourceDef]) -> Result<Vec<(usize, Name)>, String> {
+    let seen: std::cell::RefCell<Vec<(usize, Name)>> = std::cell::RefCell::new(Vec::new());
+    let record = |id: usize, n: &Name| -> Result<Middle, String> {
+        let mut v = seen.borrow_mut();
+        if !v.iter().any(|(i, x)| *i == id && x.ci() == n.ci()) {
+            v.push((id, n.clone()));
+        }
+        // "Database" never fails, so every reference is visited.
+        Ok(Middle::Database(n.text.clone()))
+    };
+    plan(sql, sources, &record)?;
+    Ok(seen.into_inner())
+}
+
+/// Plans a federated query over `sources`; `classify` decides database vs schema for `source.x.table`
+/// on PostgreSQL / SQL Server (see [`Middle`]).
+pub fn plan(sql: &str, sources: &[SourceDef], classify: &Classify<'_>) -> Result<Plan, String> {
     let toks = tokenize(sql);
     let mut sig: Vec<usize> = toks
         .iter()
@@ -631,39 +808,39 @@ pub fn plan(sql: &str, sources: &[(String, Dialect)]) -> Result<Plan, String> {
                 let last = *ch.parts.last().expect("parts");
                 let display = az.raw(p, last);
                 let src = az.name(p);
-                if !dialects.contains_key(&src.ci()) {
-                    return Err(format!(
-                        "Unknown source alias '{}' — attach it or use alias.schema.table",
-                        src.text
-                    ));
-                }
-                if ch.parts.len() > 3 {
-                    return Err(format!(
-                        "'{}' has too many name parts — use alias.schema.table or alias.table",
-                        display
-                    ));
-                }
-                let schema = if ch.parts.len() == 3 {
-                    Some(az.name(ch.parts[1]))
-                } else {
-                    None
-                };
-                let table = az.name(last);
-                let source = src.ci();
-                let idx = match tables.iter().position(|d| {
-                    d.source == source
-                        && d.table.key() == table.key()
-                        && d.schema.as_ref().map(Name::key) == schema.as_ref().map(Name::key)
-                }) {
-                    Some(i) => i,
+                let id = match lookup_source(sources, &src)? {
+                    Some(id) => id,
                     None => {
-                        let mut base = source.clone();
-                        if let Some(s) = &schema {
-                            base.push('.');
-                            base.push_str(&s.key());
+                        return Err(format!(
+                            "No data source named '{}'. Write dataSource.database.table — the data source's \
+                             name in lower case with _ for spaces (e.g. stage_mysql.shop.users), or quoted.",
+                            src.text
+                        ))
+                    }
+                };
+                let rest: Vec<Name> = ch.parts[1..].iter().map(|&q| az.name(q)).collect();
+                let r = resolve_parts(sources, id, &rest, &display, classify)?;
+                let table = r.table;
+                let spelling: Vec<String> = rest.iter().map(Name::key).collect();
+                let db_key = r.database.as_ref().map(|d| d.to_lowercase());
+                let idx = match tables.iter().position(|d| {
+                    d.source == id
+                        && d.database.as_ref().map(|x| x.to_lowercase()) == db_key
+                        && d.table.key() == table.key()
+                        && d.schema.as_ref().map(Name::key) == r.schema.as_ref().map(Name::key)
+                }) {
+                    Some(i) => {
+                        if !tables[i].spellings.contains(&(id, spelling.clone())) {
+                            tables[i].spellings.push((id, spelling));
                         }
-                        base.push('.');
-                        base.push_str(&table.key());
+                        i
+                    }
+                    None => {
+                        let mut base = src.ci();
+                        for part in &spelling {
+                            base.push('.');
+                            base.push_str(part);
+                        }
                         let mut name = base.clone();
                         let mut k = 2;
                         while sqlite_names.contains(&name.to_lowercase()) {
@@ -672,12 +849,15 @@ pub fn plan(sql: &str, sources: &[(String, Dialect)]) -> Result<Plan, String> {
                         }
                         sqlite_names.insert(name.to_lowercase());
                         tables.push(DTable {
-                            source,
-                            schema,
+                            source: id,
+                            alias: src.text.clone(),
+                            database: r.database,
+                            schema: r.schema,
                             table: table.clone(),
                             display,
                             sqlite_name: name,
                             uses: Vec::new(),
+                            spellings: vec![(id, spelling)],
                         });
                         tables.len() - 1
                     }
@@ -742,7 +922,7 @@ pub fn plan(sql: &str, sources: &[(String, Dialect)]) -> Result<Plan, String> {
 
     if tables.is_empty() {
         return Err(
-            "No attached source is referenced. Refer to tables as alias.schema.table (e.g. pg.public.users)."
+            "No data source is referenced. Refer to tables as dataSource.database.table (e.g. asia32.postgres.users)."
                 .to_string(),
         );
     }
@@ -781,22 +961,15 @@ pub fn plan(sql: &str, sources: &[(String, Dialect)]) -> Result<Plan, String> {
             }
             continue;
         }
-        let src = cr.qual[0].ci();
-        if !dialects.contains_key(&src) {
-            continue;
-        }
-        let (schema, table) = if cr.qual.len() == 2 {
-            (None, &cr.qual[1])
-        } else if cr.qual.len() == 3 {
-            (Some(&cr.qual[1]), &cr.qual[2])
-        } else {
-            continue;
+        // `source.….table.col`: a full reference used as a column qualifier.
+        let id = match lookup_source(sources, &cr.qual[0]) {
+            Ok(Some(id)) => id,
+            _ => continue,
         };
-        let found = tables.iter().position(|d| {
-            d.source == src
-                && d.table.key() == table.key()
-                && d.schema.as_ref().map(Name::key) == schema.map(Name::key)
-        });
+        let spelling: Vec<String> = cr.qual[1..].iter().map(Name::key).collect();
+        let found = tables
+            .iter()
+            .position(|d| d.spellings.iter().any(|(i, s)| *i == id && *s == spelling));
         if let Some(ti) = found {
             add_col(&mut cols, &mut star, ti, &cr.col);
             let u = &uses[tables[ti].uses[0]];
@@ -895,10 +1068,7 @@ pub fn plan(sql: &str, sources: &[(String, Dialect)]) -> Result<Plan, String> {
                     if !pushable(ti) {
                         continue;
                     }
-                    let dialect = dialects
-                        .get(&tables[ti].source)
-                        .copied()
-                        .unwrap_or(Dialect::Postgres);
+                    let dialect = sources[tables[ti].source].dialect;
                     filters[ti].push(render_conjunct(&toks, sig[a], sig[b - 1], &chains, dialect));
                 }
             }
@@ -908,10 +1078,7 @@ pub fn plan(sql: &str, sources: &[(String, Dialect)]) -> Result<Plan, String> {
     // ----- pull statements -----
     let mut planned: Vec<PlannedTable> = Vec::new();
     for (ti, d) in tables.iter().enumerate() {
-        let dialect = dialects
-            .get(&d.source)
-            .copied()
-            .unwrap_or(Dialect::Postgres);
+        let dialect = sources[d.source].dialect;
         let select_list = if projection_ok && !ambiguous[ti] && !star[ti] && !cols[ti].is_empty() {
             cols[ti]
                 .iter()
@@ -934,7 +1101,9 @@ pub fn plan(sql: &str, sources: &[(String, Dialect)]) -> Result<Plan, String> {
             pull.push_str(&w.join(" AND "));
         }
         planned.push(PlannedTable {
-            source: d.source.clone(),
+            source: d.source,
+            alias: d.alias.clone(),
+            database: d.database.clone(),
             display: d.display.clone(),
             sqlite_name: d.sqlite_name.clone(),
             pull_sql: pull,
@@ -1062,13 +1231,48 @@ fn render_conjunct(
 mod tests {
     use super::*;
 
-    fn srcs() -> Vec<(String, Dialect)> {
+    fn def(label: &str, dialect: Dialect, aliases: &[&str]) -> SourceDef {
+        SourceDef {
+            label: label.to_string(),
+            dialect,
+            aliases: aliases.iter().map(|a| a.to_string()).collect(),
+            names: vec![label.to_string()],
+        }
+    }
+
+    fn srcs() -> Vec<SourceDef> {
         vec![
-            ("pg".to_string(), Dialect::Postgres),
-            ("my".to_string(), Dialect::Mysql),
-            ("ms".to_string(), Dialect::Mssql),
-            ("lite".to_string(), Dialect::Sqlite),
+            def("PG main", Dialect::Postgres, &["pg"]),
+            def("My orders", Dialect::Mysql, &["my"]),
+            def("MS sales", Dialect::Mssql, &["ms"]),
+            def("Lite file", Dialect::Sqlite, &["lite"]),
+            def("Asia32", Dialect::Postgres, &[]),
+            def("Stage MySQL", Dialect::Mysql, &[]),
         ]
+    }
+
+    /// Databases of the test servers: PostgreSQL sources have `postgres` and `Analytics`, SQL Server
+    /// has `master` and `Sales`; anything else is a schema, except names starting with `nope`.
+    fn classify(id: usize, n: &Name) -> Result<Middle, String> {
+        let dbs: &[&str] = match id {
+            0 | 4 => &["postgres", "Analytics"],
+            2 => &["master", "Sales"],
+            _ => &[],
+        };
+        if let Some(d) = dbs
+            .iter()
+            .find(|d| d.to_lowercase() == n.text.to_lowercase())
+        {
+            return Ok(Middle::Database(d.to_string()));
+        }
+        if n.text.starts_with("nope") {
+            return Err(format!("'{}' is neither a database nor a schema", n.text));
+        }
+        Ok(Middle::Schema)
+    }
+
+    fn plan(sql: &str, sources: &[SourceDef]) -> Result<Plan, String> {
+        super::plan(sql, sources, &classify)
     }
 
     fn table<'a>(p: &'a Plan, name: &str) -> &'a PlannedTable {
@@ -1339,24 +1543,201 @@ mod tests {
         )
         .expect("plan");
         assert_eq!(p.tables.len(), 1);
+        // SQLite: the middle part names the database ("main"), so the table is pulled unqualified.
         assert_eq!(
             table(&p, "lite.main.users").pull_sql,
-            "SELECT \"id\" FROM \"main\".\"users\""
+            "SELECT \"id\" FROM \"users\""
         );
     }
 
     #[test]
     fn errors() {
         let e = plan("SELECT * FROM foo.bar.baz", &srcs()).expect_err("unknown");
-        assert!(e.starts_with("Unknown source alias 'foo'"), "{}", e);
+        assert!(e.starts_with("No data source named 'foo'"), "{}", e);
         let e = plan("DELETE FROM pg.users", &srcs()).expect_err("dml");
         assert!(e.contains("only SELECT"), "{}", e);
         let e = plan("SELECT * FROM pg.t; DROP TABLE x", &srcs()).expect_err("multi");
         assert!(e.contains("one statement"), "{}", e);
         let e = plan("SELECT 1", &srcs()).expect_err("none");
-        assert!(e.contains("No attached source"), "{}", e);
-        let e = plan("SELECT * FROM pg.a.b.c", &srcs()).expect_err("parts");
+        assert!(e.contains("No data source is referenced"), "{}", e);
+        let e = plan("SELECT * FROM pg.postgres.a.b.c", &srcs()).expect_err("parts");
         assert!(e.contains("too many name parts"), "{}", e);
+        let e = plan("SELECT * FROM my.shop.s.t", &srcs()).expect_err("mysql 4");
+        assert!(e.contains("MySQL has no schemas"), "{}", e);
+        let e = plan("SELECT * FROM lite.main.s.t", &srcs()).expect_err("sqlite 4");
+        assert!(e.contains("SQLite"), "{}", e);
+        let e = plan("SELECT * FROM pg.public.s.t", &srcs()).expect_err("4 with schema");
+        assert!(e.contains("'public' is not a database on PG main"), "{}", e);
+        let e = plan("SELECT * FROM pg.nope.t", &srcs()).expect_err("neither");
+        assert!(e.contains("neither a database nor a schema"), "{}", e);
+    }
+
+    #[test]
+    fn slugs() {
+        assert_eq!(slug("Asia32"), "asia32");
+        assert_eq!(slug("Stage MySQL"), "stage_mysql");
+        assert_eq!(slug("  --Prod  PG (eu-1)-- "), "prod_pg_eu_1");
+        assert_eq!(slug("a__b"), "a_b");
+        assert_eq!(slug("سرور"), "");
+    }
+
+    #[test]
+    fn source_database_table_across_servers() {
+        let sql = "select * from asia32.postgres.users a join stage_mysql.shop.users b on b.email = a.email";
+        let p = plan(sql, &srcs()).expect("plan");
+        assert_eq!(p.tables.len(), 2);
+        let a = table(&p, "asia32.postgres.users");
+        assert_eq!(a.source, 4);
+        assert_eq!(a.alias, "asia32");
+        assert_eq!(a.database.as_deref(), Some("postgres"));
+        assert_eq!(a.pull_sql, "SELECT * FROM \"public\".\"users\"");
+        let b = table(&p, "stage_mysql.shop.users");
+        assert_eq!(b.source, 5);
+        assert_eq!(b.database.as_deref(), Some("shop"));
+        assert_eq!(b.pull_sql, "SELECT * FROM `users`");
+        assert_eq!(
+            p.sql,
+            "select * from \"asia32.postgres.users\" a join \"stage_mysql.shop.users\" b on b.email = a.email"
+        );
+    }
+
+    #[test]
+    fn database_names_resolve_to_their_exact_case() {
+        let p = plan("SELECT e.id FROM pg.analytics.events e", &srcs()).expect("plan");
+        let t = table(&p, "pg.analytics.events");
+        assert_eq!(t.database.as_deref(), Some("Analytics"));
+        assert_eq!(t.pull_sql, "SELECT \"id\" FROM \"public\".\"events\"");
+        let p = plan("SELECT * FROM ms.sales.Orders", &srcs()).expect("plan");
+        let t = table(&p, "ms.sales.orders");
+        assert_eq!(t.database.as_deref(), Some("Sales"));
+        assert_eq!(t.pull_sql, "SELECT * FROM [dbo].[Orders]");
+    }
+
+    #[test]
+    fn four_parts_name_database_and_schema() {
+        let p = plan(
+            "SELECT o.id FROM asia32.postgres.sales.orders o JOIN ms.Sales.crm.Clients c ON c.id = o.cid",
+            &srcs(),
+        )
+        .expect("plan");
+        let o = table(&p, "asia32.postgres.sales.orders");
+        assert_eq!(o.database.as_deref(), Some("postgres"));
+        assert_eq!(
+            o.pull_sql,
+            "SELECT \"id\", \"cid\" FROM \"sales\".\"orders\""
+        );
+        let c = table(&p, "ms.sales.crm.clients");
+        assert_eq!(c.database.as_deref(), Some("Sales"));
+        assert_eq!(c.pull_sql, "SELECT [id] FROM [crm].[Clients]");
+    }
+
+    #[test]
+    fn old_alias_schema_table_form_still_works() {
+        // `public` is not a database of PG main → a schema of its default database.
+        let p = plan("SELECT u.id FROM pg.public.users u", &srcs()).expect("plan");
+        let t = table(&p, "pg.public.users");
+        assert_eq!(t.database, None);
+        assert_eq!(t.pull_sql, "SELECT \"id\" FROM \"public\".\"users\"");
+        // Two-part on a server source: default database, unqualified (search_path / default schema).
+        let p = plan("SELECT * FROM asia32.users", &srcs()).expect("plan");
+        let t = table(&p, "asia32.users");
+        assert_eq!(t.database, None);
+        assert_eq!(t.pull_sql, "SELECT * FROM \"users\"");
+    }
+
+    #[test]
+    fn quoted_exact_names() {
+        for q in ["\"Stage MySQL\"", "`stage mysql`", "[STAGE MYSQL]"] {
+            let sql = format!("SELECT u.id FROM {}.shop.users u", q);
+            let p = plan(&sql, &srcs()).expect("plan");
+            assert_eq!(p.tables.len(), 1, "{}", q);
+            assert_eq!(p.tables[0].source, 5, "{}", q);
+            assert_eq!(p.tables[0].alias, q[1..q.len() - 1].to_string());
+            assert_eq!(p.tables[0].database.as_deref(), Some("shop"));
+            assert_eq!(p.tables[0].pull_sql, "SELECT `id` FROM `users`");
+        }
+        // The exact name of a source that also has an alias.
+        let p = plan("SELECT * FROM \"PG main\".postgres.t", &srcs()).expect("plan");
+        assert_eq!(p.tables[0].source, 0);
+        // Its slug works too.
+        let p = plan("SELECT * FROM pg_main.postgres.t", &srcs()).expect("plan");
+        assert_eq!(p.tables[0].source, 0);
+    }
+
+    #[test]
+    fn sqlite_two_and_three_parts() {
+        let p = plan(
+            "SELECT a.id FROM lite.users a JOIN lite_file.whatever.users b ON b.id = a.id",
+            &srcs(),
+        )
+        .expect("plan");
+        // Two spellings of one table (alias and slug, with / without the database): pulled once.
+        assert_eq!(p.tables.len(), 1);
+        let t = table(&p, "lite.users");
+        assert_eq!((t.source, t.database.clone()), (3, None));
+        assert_eq!(t.pull_sql, "SELECT \"id\" FROM \"users\"");
+        assert_eq!(
+            p.sql,
+            "SELECT a.id FROM \"lite.users\" a JOIN \"lite.users\" b ON b.id = a.id"
+        );
+        let p = plan("SELECT * FROM lite.main.users", &srcs()).expect("plan");
+        assert_eq!(
+            table(&p, "lite.main.users").pull_sql,
+            "SELECT * FROM \"users\""
+        );
+    }
+
+    #[test]
+    fn shared_slug_is_ambiguous_unless_quoted() {
+        let mut s = srcs();
+        s.push(def("Asia32 ", Dialect::Mysql, &[]));
+        let e = plan("SELECT * FROM asia32.postgres.users", &s).expect_err("ambiguous");
+        assert!(
+            e.contains("matches more than one data source (Asia32, Asia32 )"),
+            "{}",
+            e
+        );
+        assert!(e.contains("Quote the exact name"), "{}", e);
+        let p = plan("SELECT * FROM \"Asia32 \".shop.users", &s).expect("quoted");
+        assert_eq!(p.tables[0].source, 6);
+        // An alias given by the UI wins over a shared slug.
+        s[4].aliases.push("asia32".to_string());
+        let p = plan("SELECT * FROM asia32.postgres.users", &s).expect("alias");
+        assert_eq!(p.tables[0].source, 4);
+    }
+
+    #[test]
+    fn middle_parts_lists_what_needs_classifying() {
+        let m = middle_parts(
+            "SELECT * FROM pg.public.a JOIN pg.PUBLIC.b ON 1 = 1 JOIN my.shop.c ON 1 = 1 \
+             JOIN asia32.postgres.s.d ON 1 = 1 JOIN lite.main.e ON 1 = 1 JOIN ms.t ON 1 = 1",
+            &srcs(),
+        )
+        .expect("parts");
+        let got: Vec<(usize, String)> = m.into_iter().map(|(i, n)| (i, n.text)).collect();
+        assert_eq!(
+            got,
+            vec![(0, "public".to_string()), (4, "postgres".to_string())]
+        );
+        let e = middle_parts("SELECT * FROM nobody.x.y", &srcs()).expect_err("unknown");
+        assert!(e.contains("No data source named 'nobody'"), "{}", e);
+    }
+
+    #[test]
+    fn full_reference_as_column_qualifier() {
+        let p = plan(
+            "SELECT asia32.postgres.public.users.name FROM asia32.postgres.public.users WHERE users.id = 1",
+            &srcs(),
+        )
+        .expect("plan");
+        assert_eq!(
+            p.sql,
+            "SELECT users.name FROM \"asia32.postgres.public.users\" AS users WHERE users.id = 1"
+        );
+        assert_eq!(
+            table(&p, "asia32.postgres.public.users").pull_sql,
+            "SELECT \"name\", \"id\" FROM \"public\".\"users\" WHERE (\"id\" = 1)"
+        );
     }
 
     #[test]

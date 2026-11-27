@@ -15,8 +15,9 @@ import { store } from "./state";
 import { buildCompletionSchema, buildFilteredSql, connColor, countSql, detectEditContext, nextOrder, orderMarks, pagedSql, pagingFirstPageOnly, parseFilterable, qualifiedName, quoteIdent } from "./sqlutil";
 import { getSettings } from "./settings";
 import { handleActionError } from "./recovery";
-import { FED_DRIVERS, aliasSlug, droppedTable, hasTableDrag, isAlias, refPart, tableDrag, uniqueAlias } from "./federation";
-import type { TableDrag } from "./federation";
+import { FED_DRIVERS, aliasSlug, defaultSchemaOf, droppedTable, fedSourcesFor, findTableRefs, hasTableDrag, isAlias, refPart, resolveSource, routeStatement, sourceRef, tableDrag, tableRef, uniqueAlias } from "./federation";
+import type { CatalogSource, Route, RouteContext, TableDrag } from "./federation";
+import { statementAt } from "../sqlsplit";
 import { exampleQuery } from "./crossSource";
 import type { ExampleSource } from "./crossSource";
 import type { FedCompletion, FedHooks, FedMark } from "./editor";
@@ -72,6 +73,8 @@ interface ResultItem {
   paging?: PagingState | null;
   /** Cross-source result (read-only, not re-runnable through the session). */
   fed?: boolean;
+  /** The sources it ran with ("Load more" runs it again with them). */
+  fedSources?: FedSource[];
 }
 
 /** An extra data source attached to a console for cross-source queries. */
@@ -794,59 +797,75 @@ export class ConsolePane implements TabPane {
 
   /**
    * Runs the statements one by one. `append`: keep the current results and add the new ones as extra result tabs
-   * (gutter ▶ with Alt/Option). With attached sources the statements run as cross-source queries.
+   * (gutter ▶ with Alt/Option). A statement that refers to other data sources (`source.database.table`, attached
+   * aliases) runs as a cross-source query; the others run on the console's session.
    */
   private async runList(stmts: string[], opts: { append?: boolean } = {}): Promise<void> {
     if (this.running || stmts.length === 0) return;
     if (!(await this.confirmRisky(stmts))) return;
     if (this.running) return;
-    const fed = this.fedActive;
+    const routes = stmts.map((sql) => this.routeOf(sql));
+    const allFed = routes.every((r) => r.kind !== "native");
     const base = opts.append ? this.items.length : 0;
     const total = base + stmts.length;
-    this.setRunning(true, fed ? "Running across sources…" : "Connecting…");
+    this.setRunning(true, allFed ? "Running across sources…" : "Connecting…");
     if (opts.append && this.items.length > 0) this.waitEl.remove();
     else this.clearResults();
     this.items.forEach((it) => it.view.classList.add("hidden"));
     this.bodyEl.appendChild(this.waitEl);
     let schemaTouched = false;
     let autoCount: ResultItem | null = null;
+    let sess: SessionInfo | null = null;
     try {
-      if (fed) {
-        const sources = this.fedSources();
-        for (let i = 0; i < stmts.length; i++) {
-          const sql = stmts[i];
-          this.setRunning(true, stmts.length > 1 ? `Running ${i + 1} of ${stmts.length} across sources…` : "Running across sources…");
+      for (let i = 0; i < stmts.length; i++) {
+        const sql = stmts[i];
+        const route = routes[i];
+        const label = stmts.length > 1 ? `Running ${i + 1} of ${stmts.length}` : "Running";
+        if (route.kind === "error") {
+          this.addError(sql, route.message, base + i + 1, total, false, true);
+          toast(route.message, "error");
+          break;
+        }
+        if (route.kind === "federated") {
+          this.setRunning(true, `${label} across sources…`);
+          const sources = this.fedSourcesFor(route);
           try {
             const fr = await api.federatedExecute(sources, sql, DEFAULT_MAX_ROWS);
             if (!this.alive) return;
-            this.addFedResult(sql, fr, base + i + 1, total);
+            this.addFedResult(sql, fr, base + i + 1, total, sources);
           } catch (e) {
             if (!this.alive) return;
-            this.addError(sql, errMsg(e), base + i + 1, total);
+            this.addError(sql, errMsg(e), base + i + 1, total, false, true);
             if (!handleActionError(e)) toast(errMsg(e), "error");
             break;
           }
+          continue;
         }
-        return;
-      }
-      // A console restored on launch connects its data source on first use.
-      if (this.needsConnect) await this.wake();
-      const sess = await this.ensureSession();
-      for (let i = 0; i < stmts.length; i++) {
-        const sql = stmts[i];
-        this.setRunning(true, stmts.length > 1 ? `Running ${i + 1} of ${stmts.length}…` : "Running…");
+        if (!sess) {
+          try {
+            // A console restored on launch connects its data source on first use.
+            if (this.needsConnect) await this.wake();
+            sess = await this.ensureSession();
+          } catch (e) {
+            this.addError("", `Could not open a session: ${errMsg(e)}`, base + i + 1, total);
+            toast(errMsg(e), "error");
+            break;
+          }
+        }
+        const sid = sess.sessionId;
+        this.setRunning(true, `${label}…`);
         /** Runs the statement; returns its result when it should get an automatic row count. */
         const runOne = async (): Promise<ResultItem | null> => {
           const size = stmts.length === 1 ? this.pageSizeFor(sql) : 0;
           if (size > 0) {
             // A single SELECT: run its first page (n + 1 rows tell whether more exist).
-            const pg = await this.fetchPage(sess.sessionId, sql, 0, size);
+            const pg = await this.fetchPage(sid, sql, 0, size);
             const firstOnly = pagingFirstPageOnly(this.driver, sql);
             const paging: PagingState = { offset: 0, pageSize: size, hasMore: pg.hasMore, total: null, enabled: !firstOnly, disabledReason: firstOnly ? MSSQL_PAGE_REASON : undefined };
             const item = this.addResult(sql, pg.res, size, base + i + 1, total, paging);
             return item && getSettings().results.countRows && !firstOnly ? item : null;
           }
-          const res = await api.execute(sess.sessionId, sql, DEFAULT_MAX_ROWS);
+          const res = await api.execute(sid, sql, DEFAULT_MAX_ROWS);
           this.addResult(sql, res, DEFAULT_MAX_ROWS, base + i + 1, total);
           return null;
         };
@@ -871,9 +890,6 @@ export class ConsolePane implements TabPane {
           break;
         }
       }
-    } catch (e) {
-      this.addError("", `Could not open a session: ${errMsg(e)}`, base + 1, total);
-      toast(errMsg(e), "error");
     } finally {
       this.waitEl.remove();
       if (this.items.length > 0 && this.activeItem >= 0) this.activate(this.activeItem);
@@ -1134,7 +1150,7 @@ export class ConsolePane implements TabPane {
   }
 
   /** A cross-source result: "How it ran" (one line per pull + the in-memory join) above a read-only grid. */
-  private addFedResult(sql: string, fr: FedResult, n: number, total: number): void {
+  private addFedResult(sql: string, fr: FedResult, n: number, total: number, sources: FedSource[]): void {
     const res = fr.result;
     this.status.elapsedMs = res.elapsedMs;
     let ref!: ResultItem;
@@ -1152,6 +1168,7 @@ export class ConsolePane implements TabPane {
     ref.grid = grid;
     ref.last = res;
     ref.fed = true;
+    ref.fedSources = sources;
     ref.maxRows = DEFAULT_MAX_ROWS;
     this.setItemLabel(ref, res.rows.length, res.truncated);
     this.status.rows = res.rows.length;
@@ -1168,7 +1185,12 @@ export class ConsolePane implements TabPane {
         "div",
         { class: "fed-step" + (st.alias === "" ? " local" : "") },
         h("span", { class: "fed-dot", style: `--c:${color}`, "aria-hidden": "true" }),
-        h("span", { class: "fed-src", title: st.alias ? `${st.sourceName} (${st.alias})` : st.sourceName }, st.sourceName),
+        h(
+          "span",
+          { class: "fed-src", title: st.alias ? `${st.sourceName}${st.database ? " · " + st.database : ""} (written as ${st.alias})` : st.sourceName },
+          st.sourceName,
+          st.database ? h("span", { class: "fed-step-db" }, ` · ${st.database}`) : null,
+        ),
         h("span", { class: "fed-sql mono", title: st.sql }, st.sql),
         h("span", { class: "fed-rows" }, `${st.rows.toLocaleString()} row${st.rows === 1 ? "" : "s"}`),
         h("span", { class: "fed-ms" }, `${st.elapsedMs.toLocaleString()} ms`),
@@ -1212,7 +1234,7 @@ export class ConsolePane implements TabPane {
   }
 
   /** `reconnect`: the connection was lost — offer a Reconnect button. */
-  private addError(sql: string, msg: string, n: number, total: number, reconnect = false): void {
+  private addError(sql: string, msg: string, n: number, total: number, reconnect = false, fed = false): void {
     this.status.text = "Error";
     this.status.rows = null;
     this.status.affected = null;
@@ -1235,7 +1257,7 @@ export class ConsolePane implements TabPane {
       h("div", { class: "r-error-text" }, msg),
       sql ? h("pre", { class: "r-sql" }, sql) : null,
       btn,
-      reconnect || this.fedActive ? null : this.ai.fixActions(sql, msg),
+      reconnect || fed ? null : this.ai.fixActions(sql, msg),
     );
     this.addItem(total > 1 ? `Error · ${n}` : "Error", sql, view, "err");
   }
@@ -1363,10 +1385,10 @@ export class ConsolePane implements TabPane {
   private async rerun(item: ResultItem): Promise<void> {
     if (item.fed) {
       // "Load more" on a cross-source result: run it again with the larger row limit.
-      if (this.running || !item.grid || this.fed.length === 0) return;
+      if (this.running || !item.grid || !item.fedSources) return;
       this.setRunning(true, "Reloading across sources…");
       try {
-        const fr = await api.federatedExecute(this.fedSources(), item.sql, item.maxRows);
+        const fr = await api.federatedExecute(item.fedSources, item.sql, item.maxRows);
         if (!this.alive) return;
         item.last = fr.result;
         item.grid.setResult(fr.result, null, "Cross-source results are read-only", item.maxRows);
@@ -1445,7 +1467,7 @@ export class ConsolePane implements TabPane {
 
   /** Qualified, dialect-quoted table of a simple single-table SELECT, else null. */
   private exportTable(sql: string): string | null {
-    const p = this.isLineBased || this.fedActive ? null : parseFilterable(sql, this.driver);
+    const p = this.isLineBased || this.routeOf(sql).kind !== "native" ? null : parseFilterable(sql, this.driver);
     return p ? qualifiedName(this.driver, p.schema, p.table) : null;
   }
 
@@ -1462,6 +1484,59 @@ export class ConsolePane implements TabPane {
       { alias: this.ownAlias, connectionId: this.connId, database: this.fedOwnDb ?? this.database },
       ...this.fed.map((f) => ({ alias: f.alias, connectionId: f.connId, database: f.database })),
     ];
+  }
+
+  /** Every SQL data source of the connection list (they all answer to their name in SQL). */
+  private catalog(): CatalogSource[] {
+    return store
+      .list()
+      .filter((e) => FED_DRIVERS.has(e.config.driver))
+      .map((e) => ({ connId: e.config.id, name: e.config.name, driver: e.config.driver }));
+  }
+
+  /** How this console writes a data source in SQL (`asia32`, or `"Odd name"`). */
+  private refOf(connId: string): string {
+    const all = this.catalog();
+    const src = all.find((c) => c.connId === connId);
+    return src ? sourceRef(src, all) : aliasSlug(store.conns.get(connId)?.config.name ?? "src");
+  }
+
+  /** Names native to this console's server (its databases, the current database's schemas), lower case. */
+  private nativeNames(): Set<string> {
+    const e = store.conns.get(this.connId);
+    const out = new Set<string>();
+    for (const d of e?.databases ?? []) out.add(d.name.toLowerCase());
+    for (const s of store.schemasFor(this.connId, this.database)) out.add(s.name.toLowerCase());
+    return out;
+  }
+
+  private routeCtx(): RouteContext {
+    return {
+      ownConnId: this.connId,
+      sources: this.catalog(),
+      attached: this.fed.map((f) => ({ alias: f.alias, connId: f.connId })),
+      ownAlias: this.fedShown || this.fed.length > 0 ? this.ownAlias : null,
+      nativeNames: this.nativeNames(),
+    };
+  }
+
+  /** How a statement runs here: on the session, or across sources (CONTRACT.md v0.13). */
+  private routeOf(sql: string): Route {
+    if (this.isLineBased || !FED_DRIVERS.has(this.driver)) return { kind: "native" };
+    return routeStatement(sql, this.routeCtx());
+  }
+
+  /** The sources a federated statement runs with: own (slug + strip alias), attached, and every referenced one. */
+  private fedSourcesFor(route: Route): FedSource[] {
+    const uses = route.kind === "federated" ? route.uses : [];
+    const name = store.conns.get(this.connId)?.config.name ?? "main";
+    return fedSourcesFor(
+      uses,
+      { connId: this.connId, name, database: this.fedOwnDb ?? this.database },
+      this.fedShown || this.fed.length > 0 ? this.ownAlias : null,
+      this.fed,
+      this.catalog(),
+    );
   }
 
   private onFedButton(): void {
@@ -1511,7 +1586,7 @@ export class ConsolePane implements TabPane {
     this.syncFedUi();
     // The tab badge counts the sources.
     this.host.onDatabase(this);
-    if (!quiet) toast(`Attached ${e.config.name} as ${a} — use ${a}.schema.table in SQL`, "info");
+    if (!quiet) toast(`Attached ${e.config.name} as ${a} — use ${a}.database.table in SQL`, "info");
     return a;
   }
 
@@ -1576,7 +1651,7 @@ export class ConsolePane implements TabPane {
     const e = store.conns.get(connId);
     const name = e?.config.name ?? "(removed data source)";
     const color = e ? connColor(e.config) : "var(--text-3)";
-    const input = h("input", { class: "fed-alias mono", type: "text", value: alias, spellcheck: false, autocomplete: "off", "aria-label": `Alias of ${name}`, title: "Alias used in SQL: alias.schema.table" });
+    const input = h("input", { class: "fed-alias mono", type: "text", value: alias, spellcheck: false, autocomplete: "off", "aria-label": `Alias of ${name}`, title: `Extra name for ${name} in SQL (alias.database.table); its own name ${this.refOf(connId)} works too` });
     input.size = Math.max(3, alias.length);
     input.addEventListener("input", () => (input.size = Math.max(3, input.value.length)));
     input.addEventListener("keydown", (ev) => {
@@ -1662,7 +1737,7 @@ export class ConsolePane implements TabPane {
         ),
       ),
       add,
-      h("span", { class: "fed-hint" }, this.fed.length ? "Query them as alias.schema.table · results are read-only" : "Attach another data source to join across sources"),
+      h("span", { class: "fed-hint" }, this.fed.length ? "Write source.database.table — any data source works by its name · results are read-only" : "Any data source works by name: source.database.table"),
       h("button", { class: "fed-how", type: "button", onclick: () => this.showGuide() }, "How does this work?"),
     );
     if (this.fed.length === 0) {
@@ -1703,7 +1778,11 @@ export class ConsolePane implements TabPane {
       this.syncFedUi();
     }
     this.hideGuide();
-    const aliases = [this.ownAlias, ...this.fed.map((f) => f.alias)];
+    const refs = [{ ref: this.refOf(this.connId), db: this.effectiveDatabase }, ...this.fed.map((f) => ({ ref: this.refOf(f.connId), db: f.database ?? store.conns.get(f.connId)?.defaultDb ?? null }))];
+    const ex =
+      refs.length >= 2
+        ? `${refs[0].ref}.${refPart(refs[0].db ?? "database")}.users JOIN ${refs[1].ref}.${refPart(refs[1].db ?? "database")}.users`
+        : "asia32.postgres.users JOIN stage_mysql.shop.users";
     const go = h("button", { class: "btn primary fed-guide-go", type: "button" }, "Insert an example query");
     go.addEventListener("click", () => void this.insertExample(go));
     const step = (n: string, title: string, sub: string): HTMLElement =>
@@ -1721,11 +1800,15 @@ export class ConsolePane implements TabPane {
       h(
         "div",
         { class: "fed-gsteps" },
-        step("1", "Attach sources", "Each one gets a short alias, shown above. Add more with + Attach source."),
-        step("2", "Write alias.schema.table", `e.g. ${aliases[0]}.schema.table JOIN ${aliases[1] ?? "other"}.schema.table`),
+        step("1", "Pick any data sources", "Every SQL data source in the explorer can be used by name — nothing to attach. Sources above are optional extra aliases."),
+        step(
+          "2",
+          "Write dataSource.database.table",
+          `e.g. ${ex} — the data source name is its name in the explorer, in lowercase with _ for spaces (or quote it)`,
+        ),
         step("3", run ? `Run (${run})` : "Run", "Filters run on each source; the join runs in DataTrip. Results are read-only."),
       ),
-      h("div", { class: "fed-guide-foot" }, go, h("span", null, "Uses real tables from your attached sources. Runs as SQLite SQL in DataTrip.")),
+      h("div", { class: "fed-guide-foot" }, go, h("span", null, "Uses real tables from the sources above. Runs as SQLite SQL in DataTrip.")),
     );
     this.editorWrap.appendChild(this.guideEl);
   }
@@ -1753,10 +1836,22 @@ export class ConsolePane implements TabPane {
     btn.disabled = true;
     btn.textContent = "Loading tables…";
     const ex: ExampleSource[] = [];
+    // One entry per data source (the own source and each attached one).
     for (const s of this.fedSources()) {
+      if (ex.some((x) => x.ref === this.refOf(s.connectionId))) continue;
       const ok = await this.loadSource(s.connectionId, s.database);
       if (!this.alive) return;
-      if (ok) ex.push({ alias: s.alias, schemas: store.schemasFor(s.connectionId, s.database), defaultSchema: store.defaultSchemaFor(s.connectionId, s.database) });
+      const e = store.conns.get(s.connectionId);
+      if (!ok || !e) continue;
+      const database = SERVER_DRIVERS.has(e.config.driver) ? s.database ?? e.defaultDb : null;
+      ex.push({
+        ref: this.refOf(s.connectionId),
+        name: e.config.name,
+        driver: e.config.driver,
+        database,
+        schemas: store.schemasFor(s.connectionId, s.database),
+        defaultSchema: store.defaultSchemaFor(s.connectionId, s.database),
+      });
     }
     btn.disabled = false;
     btn.textContent = "Insert an example query";
@@ -1779,127 +1874,156 @@ export class ConsolePane implements TabPane {
     };
   }
 
-  /** The source behind an alias of this console (own or attached), while the Sources strip is in use. */
-  private sourceByAlias(alias: string): { connId: string; database: string | null } | null {
-    if (!this.fedShown && this.fed.length === 0) return null;
-    const low = alias.toLowerCase();
-    if (low === this.ownAlias.toLowerCase()) return { connId: this.connId, database: this.fedOwnDb ?? this.database };
-    const f = this.fed.find((x) => x.alias.toLowerCase() === low);
-    return f ? { connId: f.connId, database: f.database } : null;
-  }
-
-  /** `alias.` → the source's schemas, `alias.schema.` → its tables (introspection loaded lazily). */
-  private fedComplete(path: string[]): FedCompletion[] | null | Promise<FedCompletion[] | null> {
-    if (this.isLineBased || !FED_DRIVERS.has(this.driver) || path.length < 1 || path.length > 2) return null;
-    const src = this.sourceByAlias(path[0]);
-    if (!src) return null;
-    const list = (): FedCompletion[] | null => {
-      const schemas = store.schemasFor(src.connId, src.database);
-      if (path.length === 1) {
-        const def = store.defaultSchemaFor(src.connId, src.database);
-        return schemas.map((s) => ({ label: s.name, apply: refPart(s.name), type: "namespace", detail: s.name === def ? "schema · default" : "schema", boost: s.name === def ? 2 : 0 }));
-      }
-      const s = schemas.find((x) => x.name.toLowerCase() === path[1].toLowerCase());
-      if (!s) return null;
-      return s.tables.map((t) => ({ label: t.name, apply: refPart(t.name), type: t.kind === "table" ? "type" : "class", detail: t.kind === "table" ? "table" : t.kind === "view" ? "view" : "materialized view" }));
+  /**
+   * Completion of `source.` → its databases (SQLite: also its tables; an attached alias: also the schemas of its
+   * database, the older form), `source.db.` → the tables of the default schema + the schemas (PG / SQL Server; a
+   * schema of the default database instead of a database → its tables), `source.db.schema.` → tables. The source
+   * is connected in the explorer and the database introspected lazily.
+   */
+  private fedComplete(path: { text: string; quoted: boolean }[]): FedCompletion[] | null | Promise<FedCompletion[] | null> {
+    if (this.isLineBased || !FED_DRIVERS.has(this.driver) || path.length < 1 || path.length > 3) return null;
+    const r = resolveSource(path[0], this.routeCtx());
+    if (!r || r.kind !== "source") return null;
+    const connId = r.connId;
+    const first = store.conns.get(connId);
+    if (!first || !FED_DRIVERS.has(first.config.driver)) return null;
+    const driver = first.config.driver;
+    // Database an alias of the Sources strip reads from (older `alias.schema.table` form).
+    const aliasDb =
+      r.via === "attached" ? (this.fed.find((f) => f.connId === connId && f.alias.toLowerCase() === path[0].text.toLowerCase())?.database ?? null) : r.via === "ownAlias" || connId === this.connId ? (this.fedOwnDb ?? this.database) : null;
+    const dbNamed = (x: string): string | null => store.conns.get(connId)?.databases.find((d) => d.name.toLowerCase() === x.toLowerCase())?.name ?? null;
+    /** The database whose introspection the completion needs (null = the connection's default). */
+    const needDb = (): string | null => {
+      if (driver === "sqlite") return null;
+      if (path.length === 1) return aliasDb;
+      return dbNamed(path[1].text) ?? aliasDb;
     };
-    const e = store.conns.get(src.connId);
-    const ready = e?.status === "connected" && (src.database === null || src.database === e.defaultDb || e.dbs.get(src.database)?.status === "ready");
-    if (ready) return list();
-    return this.loadSource(src.connId, src.database).then((ok) => (ok && this.alive ? list() : null));
+    const tableItems = (schemaName: string | null, db: string | null): FedCompletion[] => {
+      const schemas = store.schemasFor(connId, db);
+      const pick = schemaName === null ? schemas : schemas.filter((x) => x.name.toLowerCase() === schemaName.toLowerCase());
+      return pick.flatMap((sc) =>
+        sc.tables.map((t) => ({ label: t.name, apply: refPart(t.name), type: t.kind === "table" ? "type" : "class", detail: t.kind === "table" ? "table" : t.kind === "view" ? "view" : "materialized view" })),
+      );
+    };
+    const schemaItems = (db: string | null): FedCompletion[] => {
+      const def = store.defaultSchemaFor(connId, db);
+      return store.schemasFor(connId, db).map((x) => ({ label: x.name, apply: refPart(x.name), type: "namespace", detail: x.name === def ? "schema · default" : "schema", boost: x.name === def ? 1 : 0 }));
+    };
+    const build = (): FedCompletion[] | null => {
+      const e = store.conns.get(connId);
+      if (!e) return null;
+      const defSchema = defaultSchemaOf(driver);
+      if (path.length === 1) {
+        const dbs = [...e.databases].sort((a, b) => Number(a.isSystem) - Number(b.isSystem));
+        const out: FedCompletion[] = dbs.map((d) => ({
+          label: d.name,
+          apply: refPart(d.name),
+          type: "namespace",
+          detail: d.name === e.defaultDb ? "database · default" : d.isSystem ? "database · system" : "database",
+          boost: d.name === e.defaultDb ? 2 : d.isSystem ? -1 : 1,
+        }));
+        if (driver === "sqlite") out.push(...tableItems(null, null));
+        else if (r.via === "attached" || r.via === "ownAlias") out.push(...schemaItems(aliasDb));
+        return out;
+      }
+      if (driver === "sqlite") return path.length === 2 ? tableItems(null, null) : null;
+      const db = dbNamed(path[1].text);
+      if (path.length === 2) {
+        if (db === null) return tableItems(path[1].text, aliasDb); // source.schema. (older form)
+        if (driver === "mysql") return tableItems(null, db);
+        return [...tableItems(defSchema, db), ...schemaItems(db)];
+      }
+      return db === null || driver === "mysql" ? null : tableItems(path[2].text, db);
+    };
+    const ready = (): boolean => {
+      const e = store.conns.get(connId);
+      if (e?.status !== "connected") return false;
+      const db = needDb();
+      return db === null || db === e.defaultDb || e.dbs.get(db)?.status === "ready";
+    };
+    if (ready()) return build();
+    return (async (): Promise<FedCompletion[] | null> => {
+      if (!(await this.host.ensureConnected(connId).catch(() => false)) || !this.alive) return null;
+      const db = needDb();
+      if (db !== null && db !== store.conns.get(connId)?.defaultDb) await store.ensureDb(connId, db);
+      return this.alive ? build() : null;
+    })();
   }
 
   /**
-   * `foo.schema.table` where `foo` is the alias slug of a SQL data source that isn't attached (and not a database of
-   * this console's server, so real three-part names stay unmarked): underlined, with a one-click attach.
+   * Table references of 3+ parts whose first part is no data source (slug, quoted name, attached alias), no database
+   * and no schema of this console's server: underlined ("No data source named 'x'"). A slug two data sources share
+   * is underlined too. Only once the own server's databases are known (no false marks on db.schema.table).
    */
   private fedMarks(doc: string): FedMark[] {
     if (this.isLineBased || !FED_DRIVERS.has(this.driver)) return [];
-    const attached = new Set([this.connId, ...this.fed.map((f) => f.connId)]);
-    const bySlug = new Map<string, string>();
-    for (const e of store.list()) {
-      if (!FED_DRIVERS.has(e.config.driver) || attached.has(e.config.id)) continue;
-      const slug = aliasSlug(e.config.name);
-      if (!bySlug.has(slug)) bySlug.set(slug, e.config.id);
-    }
-    if (bySlug.size === 0) return [];
-    const aliases = new Set([this.ownAlias, ...this.fed.map((f) => f.alias)].map((a) => a.toLowerCase()));
-    const dbNames = new Set((store.conns.get(this.connId)?.databases ?? []).map((d) => d.name.toLowerCase()));
-    // Strings and comments blanked out, offsets kept.
-    const code = doc.replace(/'(?:[^']|'')*'?|--[^\n]*|\/\*[\s\S]*?(?:\*\/|$)/g, (m) => m.replace(/[^\n]/g, " "));
-    const re = /([A-Za-z_][A-Za-z0-9_]*)\.(?:[A-Za-z_][A-Za-z0-9_]*|"[^"\n]*")\.(?:[A-Za-z_][A-Za-z0-9_]*|"[^"\n]*")/g;
+    if (store.conns.get(this.connId)?.status !== "connected") return [];
+    const ctx = this.routeCtx();
     const out: FedMark[] = [];
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(code)) !== null && out.length < 200) {
-      const prev = m.index > 0 ? code[m.index - 1] : "";
-      if (prev && /[\w.$"`\]]/.test(prev)) continue;
-      const low = m[1].toLowerCase();
-      if (aliases.has(low) || dbNames.has(low) || !bySlug.has(low)) continue;
-      out.push({ from: m.index, to: m.index + m[1].length, key: m[1] });
+    for (const ref of findTableRefs(doc)) {
+      if (out.length >= 200) break;
+      if (ref.parts.length < 3) continue;
+      const first = ref.parts[0];
+      const r = resolveSource(first, ctx);
+      if (r?.kind === "ambiguous") out.push({ from: first.from, to: first.to, key: first.text, message: r.message });
+      else if (!r && !ctx.nativeNames.has(first.text.toLowerCase())) out.push({ from: first.from, to: first.to, key: first.text });
     }
     return out;
   }
 
   private fedTip(m: FedMark): HTMLElement {
-    const low = m.key.toLowerCase();
-    const attached = new Set([this.connId, ...this.fed.map((f) => f.connId)]);
-    const e = store.list().find((x) => FED_DRIVERS.has(x.config.driver) && !attached.has(x.config.id) && aliasSlug(x.config.name) === low);
-    const box = h("div", { class: "fed-tip" }, h("div", null, h("b", { class: "mono" }, m.key), " isn’t attached to this console."));
-    if (!e) return box;
-    const drv = DRIVER_LABELS[e.config.driver].split(" / ")[0];
-    const choose = h("button", { class: "fed-tip-alt", type: "button" }, "Choose source…");
-    choose.addEventListener("click", () => this.openAttachMenu(choose, m.key));
-    box.appendChild(
-      h(
-        "div",
-        { class: "fed-tip-actions" },
-        h("button", { class: "fed-tip-go", type: "button", onclick: () => void this.attachSource(e.config.id, m.key) }, `Attach ${e.config.name} (${drv}) as ${m.key}`),
-        choose,
-      ),
+    if (m.message) return h("div", { class: "fed-tip" }, h("div", null, m.message));
+    const box = h(
+      "div",
+      { class: "fed-tip" },
+      h("div", null, "No data source named ", h("b", { class: "mono" }, `'${m.key}'`), "."),
+      h("div", { class: "dim" }, "Write dataSource.database.table — the data source's name in the explorer, in lowercase with _ for spaces (or quote it)."),
     );
+    const choose = h("button", { class: "fed-tip-alt", type: "button" }, `Use a data source as ${m.key}…`);
+    choose.addEventListener("click", () => this.openAttachMenu(choose, m.key));
+    box.appendChild(h("div", { class: "fed-tip-actions" }, choose));
     return box;
   }
 
-  /** What dropping that table here does: insert `schema.table`, or attach its source and insert `alias.schema.table`. */
-  private dropPlan(d: TableDrag): { attach: boolean; alias: string | null; name: string; text: string } | null {
+  /**
+   * What dropping that table at `pos` inserts: `schema.table` for the console's own source (its
+   * `source.database.table` while the statement there runs across sources), `source.database.table` for another
+   * SQL source (nothing to attach: it resolves by name).
+   */
+  private dropPlan(d: TableDrag, pos: number): { name: string; text: string; other: boolean } | null {
     const e = store.conns.get(d.connId);
     if (!e || this.isLineBased) return null;
     if (d.connId === this.connId) {
-      const text = this.fedActive ? `${this.ownAlias}.${refPart(d.schema)}.${refPart(d.table)}` : qualifiedName(this.driver, d.schema, d.table);
-      return { attach: false, alias: null, name: e.config.name, text };
+      const stmt = statementAt(this.editor.getText(), pos)?.text ?? "";
+      const fedHere = this.fedActive || this.routeOf(stmt).kind === "federated";
+      const text = fedHere ? tableRef(this.refOf(this.connId), e.config.driver, d.database ?? this.effectiveDatabase, d.schema, d.table) : qualifiedName(this.driver, d.schema, d.table);
+      return { name: e.config.name, text, other: false };
     }
     if (!FED_DRIVERS.has(e.config.driver) || !FED_DRIVERS.has(this.driver)) return null;
-    const ex = this.fed.find((f) => f.connId === d.connId);
-    const alias = ex?.alias ?? uniqueAlias(aliasSlug(e.config.name), [this.ownAlias, ...this.fed.map((f) => f.alias)]);
-    return { attach: !ex, alias, name: e.config.name, text: `${alias}.${refPart(d.schema)}.${refPart(d.table)}` };
+    return { name: e.config.name, text: tableRef(this.refOf(d.connId), e.config.driver, d.database ?? e.defaultDb, d.schema, d.table), other: true };
   }
 
   private showDropHint(): void {
     const d = tableDrag();
-    const plan = d ? this.dropPlan(d) : null;
+    const plan = d ? this.dropPlan(d, this.editor.cursor) : null;
     clear(this.dropEl);
     if (!plan) {
       this.hideDropHint();
       return;
     }
     this.dropEl.append(
-      plan.attach
-        ? h(
-            "div",
-            { class: "fed-drop-card" },
-            "Drop to attach ",
-            h("b", null, plan.name),
-            " as ",
-            h("b", { class: "mono" }, plan.alias ?? ""),
-            h("br"),
-            h("span", { class: "dim" }, "and insert "),
-            h("span", { class: "mono hl" }, plan.text),
-          )
-        : h("div", { class: "fed-drop-card" }, h("span", { class: "dim" }, "Drop to insert "), h("span", { class: "mono hl" }, plan.text)),
+      h(
+        "div",
+        { class: "fed-drop-card" },
+        h("span", { class: "dim" }, "Drop to insert "),
+        h("span", { class: "mono hl" }, plan.text),
+        plan.other ? h("br") : null,
+        plan.other ? h("span", { class: "dim" }, `from ${plan.name} · runs across sources`) : null,
+      ),
     );
     this.dropEl.hidden = false;
     this.editorWrap.classList.add("drop-on");
-    this.editorWrap.classList.toggle("drop-attach", plan.attach);
+    this.editorWrap.classList.toggle("drop-attach", plan.other);
   }
 
   private hideDropHint(): void {
@@ -1941,19 +2065,10 @@ export class ConsolePane implements TabPane {
   }
 
   private dropTable(d: TableDrag, pos: number): void {
-    const plan = this.dropPlan(d);
+    const plan = this.dropPlan(d, pos);
     if (!plan) return;
-    let text = plan.text;
-    if (plan.attach) {
-      const e = store.conns.get(d.connId);
-      const db = e && d.database !== null && d.database !== e.defaultDb ? d.database : null;
-      const a = this.attachSource(d.connId, plan.alias ?? undefined, db, true);
-      if (!a) return;
-      text = `${a}.${refPart(d.schema)}.${refPart(d.table)}`;
-      toast(`Attached ${e?.config.name ?? "the data source"} as ${a}`, "info");
-    }
     this.hideGuide();
-    this.editor.insertAt(pos, text);
+    this.editor.insertAt(pos, plan.text);
   }
 
   // ---------------------------------------------------------------- layout

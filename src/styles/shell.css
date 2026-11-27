@@ -801,7 +801,7 @@ html.mac .shell.no-sidebar .sheet.tabs-left .tab-rail {
 }
 .fed-src {
   flex: none;
-  width: 110px;
+  width: 150px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -831,6 +831,9 @@ html.mac .shell.no-sidebar .sheet.tabs-left .tab-rail {
 }
 .fed-step.local .fed-src {
   color: var(--text-dim);
+}
+.fed-step-db {
+  color: var(--text-3);
 }
 
 /* ================================================================== Vault OIDC sign-in */

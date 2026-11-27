@@ -34,7 +34,7 @@ import { openVaultProfilesDialog } from "./vaultDialog";
 import { getSettings, onSettingsChange, updateSettings } from "./settings";
 import { openSettings } from "./settingsDialog";
 import { formatBinding, shortcutLabel } from "./keymap";
-import { FED_DRIVERS, TABLE_DRAG_MIME, setTableDrag } from "./federation";
+import { FED_DRIVERS, TABLE_DRAG_MIME, setTableDrag, sourceRef } from "./federation";
 import type { TableDrag } from "./federation";
 
 const OVERSCAN = 8;
@@ -412,6 +412,13 @@ export class Explorer {
     const connected = e.status === "connected";
     const badge = dataBadge(e.config, "conn-badge " + e.status, this.density === "compact" ? 11 : 14, `${DRIVER_LABELS[e.config.driver]} · ${STATUS_TEXT[e.status]}`);
     const custom = hasIcon(e.config.icon);
+    // How cross-source SQL names this data source (`asia32.postgres.users`).
+    const sqlName = FED_DRIVERS.has(e.config.driver)
+      ? sourceRef(
+          { connId: id, name: e.config.name, driver: e.config.driver },
+          store.list().filter((x) => FED_DRIVERS.has(x.config.driver)).map((x) => ({ connId: x.config.id, name: x.config.name, driver: x.config.driver })),
+        )
+      : null;
     const metaParts = [e.status === "connecting" ? "connecting…" : e.config.readOnly ? "read-only" : "", custom ? DRIVER_ABBR[e.config.driver] : ""].filter(Boolean);
     const actions: HTMLElement[] = [];
     if (connected) {
@@ -429,7 +436,10 @@ export class Explorer {
       // Every connection shows a disclosure triangle: on an idle one it connects first.
       expandable: e.status !== "error" || connected,
       cls: "conn " + e.status,
-      title: e.status === "error" && e.error ? e.error : `${e.config.name} — ${DRIVER_LABELS[e.config.driver]}${e.session ? " " + e.session.serverVersion : ""}${sentinelLabel(e.config) ? " · " + sentinelLabel(e.config) : ""}`,
+      title:
+        e.status === "error" && e.error
+          ? e.error
+          : `${e.config.name} — ${DRIVER_LABELS[e.config.driver]}${e.session ? " " + e.session.serverVersion : ""}${sentinelLabel(e.config) ? " · " + sentinelLabel(e.config) : ""}${sqlName ? `\nUse in SQL as ${sqlName}` : ""}`,
       actions,
       chip: connected && e.config.driver !== "sqlite" && e.config.driver !== "kafka" && scopeSummary(e).total > 0 ? this.chipEl(e) : undefined,
       dragConn: id,
