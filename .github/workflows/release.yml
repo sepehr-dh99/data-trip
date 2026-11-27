@@ -83,10 +83,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Two parallel macOS builds instead of one universal build (which compiles both
+          # architectures one after the other). The updater picks the matching one.
           - platform: macos-latest
-            args: --target universal-apple-darwin
-            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
-            artifact-name: macos-universal
+            args: --target aarch64-apple-darwin
+            rust-targets: aarch64-apple-darwin
+            artifact-name: macos-apple-silicon
+          - platform: macos-latest
+            args: --target x86_64-apple-darwin
+            rust-targets: x86_64-apple-darwin
+            artifact-name: macos-intel
           - platform: windows-latest
             args: ""
             rust-targets: ""

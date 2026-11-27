@@ -39,6 +39,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 [profile.release]
 opt-level = 3
-lto = true
-codegen-units = 1
+# Thin LTO with parallel codegen: most of full LTO's benefit at a fraction of the build time.
+lto = "thin"
+codegen-units = 16
 strip = true

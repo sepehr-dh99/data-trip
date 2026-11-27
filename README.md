@@ -8,9 +8,9 @@ Download the installer for your system from the [latest release](https://github.
 
 > The installers are not code-signed yet, so macOS and Windows show a warning the first time. The steps below get past it.
 
-### macOS (Apple Silicon and Intel)
+### macOS
 
-1. Open `DataTrip_<version>_universal.dmg` and drag **DataTrip** into **Applications**.
+1. Open `DataTrip_<version>_aarch64.dmg` on Apple Silicon Macs (M1 and later) or `DataTrip_<version>_x64.dmg` on Intel Macs, and drag **DataTrip** into **Applications**. ( › About This Mac shows which one you have.)
 2. Remove the download quarantine flag, which macOS uses to block unsigned apps:
    ```bash
    xattr -dr com.apple.quarantine /Applications/DataTrip.app
@@ -109,7 +109,7 @@ npm run tauri build  # build installers for the current platform
 
 Releases are built by GitHub Actions (`.github/workflows/release.yml`):
 
-- Pushing a tag such as `vX.Y.Z` builds the app for macOS (universal `.dmg`), Windows (`.msi` and `.exe`) and Linux (`.AppImage` and `.deb`) and attaches them to a **draft** GitHub release.
+- Pushing a tag such as `vX.Y.Z` builds the app for macOS (Apple Silicon and Intel `.dmg`), Windows (`.msi` and `.exe`) and Linux (`.AppImage` and `.deb`) and attaches them to a **draft** GitHub release.
 - Every push to `main` (and every pull request) builds the same installers and uploads them as workflow artifacts, without creating a release.
 
 ## Project layout
