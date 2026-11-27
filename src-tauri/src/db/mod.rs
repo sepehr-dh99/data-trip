@@ -219,7 +219,11 @@ impl DbConn {
                 rows: Vec::new(),
                 truncated: false,
             };
-            let end = self.stream(sql, &mut collector).await?;
+            // MySQL reports "near '…' at line N": turn it into a character position of this statement.
+            let end = self
+                .stream(sql, &mut collector)
+                .await
+                .map_err(|e| e.locate_in(sql))?;
             let rows_affected = if collector.columns.is_empty() {
                 end.rows_affected
             } else {

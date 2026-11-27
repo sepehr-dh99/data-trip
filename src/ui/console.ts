@@ -32,6 +32,8 @@ import type { TabPane } from "./tabs";
 import { sentinelLabel } from "./redis";
 import { AiAssist } from "./aiPanel";
 import { docWithoutPending } from "./aiEditor";
+import { FileBinding } from "./sqlFiles";
+import { errorHelpButton } from "./help";
 
 const DEFAULT_MAX_ROWS = 500;
 const MOD = /Mac/.test(navigator.userAgent) ? "⌘" : "Ctrl+";
@@ -160,6 +162,66 @@ function rawMsg(e: unknown): string {
 
 let counter = 0;
 
+// ---------------------------------------------------------------- v0.15 safeguards (module-wide)
+
+/** Only this many most recently used consoles keep a live CodeMirror view; the others hibernate theirs. */
+const LIVE_EDITORS = 10;
+/** Consoles, most recently used first. */
+const consoleOrder: ConsolePane[] = [];
+let idleTimer: number | undefined;
+
+/** Marks a console as just used: it keeps (or gets back) its editor view; the least recently used beyond 10 hibernate. */
+function touchConsole(c: ConsolePane): void {
+  const i = consoleOrder.indexOf(c);
+  if (i >= 0) consoleOrder.splice(i, 1);
+  consoleOrder.unshift(c);
+  for (const old of consoleOrder.slice(LIVE_EDITORS)) old.hibernateEditor();
+  if (idleTimer === undefined) idleTimer = window.setInterval(idleSweep, 30_000);
+}
+
+/** Closes the database session of consoles idle for `data.idleDisconnectMinutes` (0 = never). */
+function idleSweep(): void {
+  const min = getSettings().data.idleDisconnectMinutes;
+  if (!(min > 0)) return;
+  for (const c of [...consoleOrder]) c.idleCheck(min * 60_000);
+}
+
+/** Code-point offset → UTF-16 index (PostgreSQL error positions count characters). */
+function cpIndex(s: string, cp: number): number {
+  let i = 0;
+  for (let n = 0; n < cp && i < s.length; n++) i += (s.codePointAt(i) ?? 0) > 0xffff ? 2 : 1;
+  return i;
+}
+
+/** The token at `pos` (word, quoted name / literal, else one character); at the end, the last token before it. */
+function tokenRange(doc: string, pos: number, limit: number): { from: number; to: number } {
+  let p = Math.max(0, Math.min(pos, doc.length));
+  if (p >= limit || p >= doc.length || /\s/.test(doc[p])) {
+    // "at end of input" / a position on whitespace: the token before it
+    let q = Math.min(p, doc.length) - 1;
+    while (q > 0 && /\s/.test(doc[q])) q--;
+    if (q < 0) return { from: 0, to: Math.min(1, doc.length) };
+    let a = q;
+    while (a > 0 && /[\w$#@]/.test(doc[a - 1]) && /[\w$#@]/.test(doc[q])) a--;
+    return { from: a, to: q + 1 };
+  }
+  const c = doc[p];
+  if (c === "'" || c === '"' || c === "`" || c === "[") {
+    const close = c === "[" ? "]" : c;
+    const e = doc.indexOf(close, p + 1);
+    if (e > p && e - p < 200) return { from: p, to: e + 1 };
+  }
+  if (/[\w$#@]/.test(c)) {
+    while (p > 0 && /[\w$#@]/.test(doc[p - 1])) p--;
+    let e = p;
+    while (e < doc.length && /[\w$#@]/.test(doc[e])) e++;
+    return { from: p, to: e };
+  }
+  return { from: p, to: p + 1 };
+}
+
+const IDLE_HINT = (min: number): string => `Disconnected after ${min} min idle — reconnects on next run`;
+
 export class ConsolePane implements TabPane {
   readonly kind = "console" as const;
   readonly el: HTMLElement;
@@ -210,8 +272,27 @@ export class ConsolePane implements TabPane {
   private crossSource = false;
   /** Cross-source guide card (3 steps + "Insert an example query") over the editor; hides once the user types. */
   private guideEl: HTMLElement | null = null;
+  /** v0.15: last run / typing / focus in this console (idle disconnect). */
+  private lastUse = Date.now();
+  /** v0.15: the session was closed because the console sat idle (tooltip hint until the next run). */
+  private idleClosedMin = 0;
+  /** v0.15: a typed BEGIN / START TRANSACTION (Redis MULTI) without its COMMIT / ROLLBACK yet: never idle-close. */
+  private typedTx = false;
   /** "Drop to attach …" hint while a table is dragged over the editor. */
   private dropEl: HTMLElement = h("div", { class: "fed-drop", hidden: true, "aria-hidden": "true" });
+  /** SQL files (v0.15): the .sql file this console is bound to, File ▾, changed-on-disk banner. */
+  readonly file: FileBinding = new FileBinding({
+    view: () => this.editor.cmView,
+    renamed: (name) => {
+      this.title = name;
+      this.host.onDatabase(this);
+    },
+    dirtyChanged: () => this.host.onStatus(this),
+    connId: () => this.connId,
+    database: () => this.database,
+    title: () => this.title,
+    pane: () => this,
+  });
 
   constructor(
     public connId: string,
@@ -249,7 +330,7 @@ export class ConsolePane implements TabPane {
       "Ask AI",
       h("span", { class: "ai-kbd" }, shortcutLabel("askAi")),
     );
-    this.controls = h("div", { class: "cap-controls" }, this.btnAi, this.btnRun, this.btnStop, this.btnRunAll, this.btnFed, this.btnTx);
+    this.controls = h("div", { class: "cap-controls" }, this.file.button, this.btnAi, this.btnRun, this.btnStop, this.btnRunAll, this.btnFed, this.btnTx);
     this.btnTx.hidden = driver === "redis" || driver === "kafka";
     this.syncTxLabel();
     this.waitText = h("span", null, "Running…");
@@ -262,7 +343,11 @@ export class ConsolePane implements TabPane {
       kafkaNames: () => kafkaNames(this.connId),
       onRun: () => void this.runCurrent(),
       onRunAll: () => void this.runAll(),
-      onCursor: () => this.host.onWorkspace(),
+      onCursor: () => {
+        this.lastUse = Date.now();
+        this.host.onWorkspace();
+      },
+      onChange: () => this.file.onEdit(),
       onAskAi: () => this.askAi(),
     });
     this.ai = new AiAssist({
@@ -286,6 +371,11 @@ export class ConsolePane implements TabPane {
       statements: () => this.editor.getAllStatements(),
       focus: () => this.editor.focus(),
       isActive: () => this.alive && this.el.isConnected && this.controls.isConnected && !this.el.classList.contains("hidden"),
+      // v0.15: cross-source requests (aiCross.ts)
+      catalog: () => this.catalog(),
+      routeCtx: () => this.routeCtx(),
+      sourceDatabase: (id: string) => this.fed.find((f) => f.connId === id)?.database ?? null,
+      loadSource: (id: string, db: string | null) => this.loadSource(id, db),
     });
     // Gutter ▶: run just that statement (Alt/Option-click: keep the current results, add a result tab).
     this.editor.onRunStatement((r, o) => {
@@ -299,7 +389,7 @@ export class ConsolePane implements TabPane {
     this.bar = new FilterBar(driver, { onApply: (where, order) => this.applyBar(where, order) });
     const results = h("div", { class: "c-results" }, this.tabsEl, this.bar.el, this.bodyEl);
     this.fedEl = h("div", { class: "fed-strip", role: "group", "aria-label": "Sources", hidden: true });
-    this.el = h("div", { class: "console" }, this.fedEl, this.editorWrap, splitter, results);
+    this.el = h("div", { class: "console" }, this.fedEl, this.file.banner, this.editorWrap, splitter, results);
     this.editorWrap.appendChild(this.dropEl);
     // The guide card goes away as soon as the user types (or pastes / deletes) in the editor.
     this.editorWrap.addEventListener("beforeinput", () => this.hideGuide());
@@ -311,11 +401,114 @@ export class ConsolePane implements TabPane {
     this.updateSchema();
     this.loadSchema();
     if (driver === "kafka") void loadOverview(connId);
+    this.editorWrap.addEventListener("focusin", () => (this.lastUse = Date.now()));
+    touchConsole(this);
   }
 
-  // ---------------------------------------------------------------- public
+  // ---------------------------------------------------------------- v0.15 safeguards
+
+  /** Destroys the editor view of a hidden, least recently used console (its text, undo history and results stay). */
+  hibernateEditor(): void {
+    if (!this.alive || this.editor.hibernated || this.ai.busy) return;
+    if (this.el.isConnected && !this.el.classList.contains("hidden")) return;
+    this.ai.close();
+    this.editor.hibernate();
+  }
+
+  /**
+   * Closes the console's database session after `ms` without a run, typing or focus — never while a statement
+   * runs, in a manual transaction (or a typed BEGIN), with the editor focused, or for Kafka. The next run
+   * reopens it silently (ensureSession).
+   */
+  idleCheck(ms: number): void {
+    const s = this.session;
+    if (!this.alive || !s || this.running || !this.autoCommit || this.typedTx || this.isKafka || this.ai.busy) return;
+    if (Date.now() - this.lastUse < ms) return;
+    if (document.hasFocus() && this.editorWrap.contains(document.activeElement)) return;
+    this.session = null;
+    this.sessionPromise = null;
+    void api.closeSession(s.sessionId).catch(() => undefined);
+    this.idleClosedMin = Math.round(ms / 60_000);
+    this.status.text = IDLE_HINT(this.idleClosedMin);
+    this.host.onStatus(this);
+    // re-renders the tabs, so the tooltip carries the hint
+    this.host.onDatabase(this);
+  }
+
+  /** "Disconnected after 15 min idle — reconnects on next run" (tab tooltip), or null. */
+  get statusHint(): string | null {
+    return this.idleClosedMin > 0 && !this.session ? IDLE_HINT(this.idleClosedMin) : null;
+  }
+
+  /** Statements typed to open / end a transaction (only blocks the idle disconnect). */
+  private trackTx(sql: string): void {
+    const t = headOf(sql).toLowerCase();
+    if (this.isRedis) {
+      if (/^multi\b/.test(t)) this.typedTx = true;
+      else if (/^(?:exec|discard)\b/.test(t)) this.typedTx = false;
+      return;
+    }
+    if (/^(?:begin|start\s+transaction|savepoint|set\s+transaction)\b/.test(t)) this.typedTx = true;
+    else if (/^(?:commit|end)\b/.test(t) || (/^rollback\b/.test(t) && !/^rollback\s+(?:work\s+)?to\b/.test(t))) this.typedTx = false;
+  }
+
+  /** Doc offset where `sql` (a statement that ran) sits in the editor: the copy at / nearest the caret; -1 = gone. */
+  private locateStatement(doc: string, sql: string): number {
+    if (!sql) return -1;
+    const head = this.editor.cursor;
+    let best = -1;
+    let dist = Infinity;
+    for (let i = doc.indexOf(sql), k = 0; i >= 0 && k < 200; i = doc.indexOf(sql, i + 1), k++) {
+      const d = head < i ? i - head : head > i + sql.length ? head - i - sql.length : 0;
+      if (d < dist) {
+        best = i;
+        dist = d;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * The editor range where a failed statement went wrong (v0.15): the error's `position` (1-based character of the
+   * executed SQL) or `line`, mapped from what ran (the pager wraps a single SELECT) to the statement in the editor.
+   */
+  private errorSpot(e: unknown, sql: string, executed: string): { from: number; to: number; where: string } | null {
+    const pe = e as { position?: unknown; line?: unknown };
+    const pos = typeof pe.position === "number" && pe.position >= 1 ? pe.position : null;
+    const line = typeof pe.line === "number" && pe.line >= 1 ? pe.line : null;
+    if (pos === null && line === null) return null;
+    const doc = this.editor.getText();
+    const start = this.locateStatement(doc, sql);
+    if (start < 0) return null;
+    const trimmed = sql.trimStart();
+    const lead = sql.length - trimmed.length;
+    const k = executed === sql ? lead : executed.indexOf(trimmed.slice(0, Math.min(trimmed.length, 80)));
+    if (k < 0) return null;
+    const base = k - lead; // index in `executed` of sql[0]
+    const lineCol = (idx: number): string => {
+      const before = sql.slice(0, idx);
+      const l = doc.slice(0, start).split("\n").length + before.split("\n").length - 1;
+      return `line ${l}, column ${idx - before.lastIndexOf("\n")}`;
+    };
+    if (pos !== null) {
+      const idx = cpIndex(executed, pos - 1) - base;
+      if (idx < 0 || idx > sql.length) return null;
+      const r = tokenRange(doc, start + idx, start + sql.length);
+      return { ...r, where: lineCol(Math.min(idx, sql.length)) };
+    }
+    const n = (line as number) - 1 - (base > 0 ? executed.slice(0, base).split("\n").length - 1 : 0);
+    const lines = sql.split("\n");
+    if (n < 0 || n >= lines.length) return null;
+    const ls = lines.slice(0, n).reduce((a, x) => a + x.length + 1, 0);
+    const text = lines[n];
+    const a = text.length - text.trimStart().length;
+    const b = text.trimEnd().length;
+    if (b <= a) return null;
+    return { from: start + ls + a, to: start + ls + b, where: `line ${doc.slice(0, start + ls).split("\n").length}` };
+  }
 
   focus(): void {
+    touchConsole(this);
     this.editor.focus();
   }
 
@@ -346,7 +539,12 @@ export class ConsolePane implements TabPane {
 
   /** Pending grid edits or an open manual transaction. */
   get dirty(): boolean {
-    return (!this.autoCommit && this.session !== null) || this.items.some((i) => i.grid?.hasPending() === true);
+    return this.file.dirty || (!this.autoCommit && this.session !== null) || this.items.some((i) => i.grid?.hasPending() === true);
+  }
+
+  /** The .sql file this console is bound to (tab name = its file name), null for a plain console. */
+  get filePath(): string | null {
+    return this.file.path;
   }
 
   /** The editor's whole text (reopen closed tab). */
@@ -359,7 +557,7 @@ export class ConsolePane implements TabPane {
   /** What restore on launch saves for this console. */
   snapshot(): WsConsole {
     return {
-      sql: docWithoutPending(this.editor.cmView.state),
+      sql: docWithoutPending(this.editor.state),
       cursor: this.editor.cursor,
       database: this.database,
       dbHint: this.effectiveDatabase,
@@ -371,6 +569,7 @@ export class ConsolePane implements TabPane {
       sources: this.fed.map((f) => ({ alias: f.alias, connId: f.connId, database: f.database })),
       fedShown: this.fedShown,
       crossSource: this.crossSource,
+      file: this.file.snapshot(),
     };
   }
 
@@ -382,6 +581,7 @@ export class ConsolePane implements TabPane {
   restoreState(ws: WsConsole): void {
     this.needsConnect = store.conns.get(this.connId)?.status !== "connected";
     this.dbHint = ws.dbHint;
+    if (ws.file) this.file.restore(ws.file);
     this.schemaExplicit = ws.schemaExplicit && this.schema !== null;
     this.editor.setCursor(Math.min(ws.cursor, ws.sql.length));
     if (!this.isLineBased && FED_DRIVERS.has(this.driver)) {
@@ -411,6 +611,7 @@ export class ConsolePane implements TabPane {
    * the usual recovery for expired Vault tokens / unknown SSH hosts), then loads completion. True when connected.
    */
   wake(): Promise<boolean> {
+    touchConsole(this);
     if (!this.needsConnect) return Promise.resolve(true);
     if (this.waking) return this.waking;
     const connId = this.connId;
@@ -629,11 +830,14 @@ export class ConsolePane implements TabPane {
     this.session = null;
     this.sessionPromise = null;
     this.autoCommit = true;
+    this.typedTx = false;
     this.syncTxUi();
   }
 
   async dispose(): Promise<void> {
     this.alive = false;
+    const at = consoleOrder.indexOf(this);
+    if (at >= 0) consoleOrder.splice(at, 1);
     this.bar.destroy();
     const s = this.session;
     this.session = null;
@@ -658,6 +862,8 @@ export class ConsolePane implements TabPane {
             throw new Error("Console was closed");
           }
           this.session = s;
+          this.typedTx = false;
+          this.idleClosedMin = 0;
           this.status.serverVersion = s.serverVersion;
           await this.applySearchPath(s);
           if (!this.autoCommit) await api.setAutoCommit(s.sessionId, false);
@@ -770,6 +976,7 @@ export class ConsolePane implements TabPane {
 
   private setRunning(on: boolean, text: string): void {
     this.running = on;
+    this.lastUse = Date.now();
     this.status.running = on;
     this.status.text = text;
     this.btnRun.disabled = this.btnRunAll.disabled = on;
@@ -804,6 +1011,9 @@ export class ConsolePane implements TabPane {
     if (this.running || stmts.length === 0) return;
     if (!(await this.confirmRisky(stmts))) return;
     if (this.running) return;
+    // v0.15: the error underline of the previous run goes away
+    this.editor.clearErrorMark();
+    this.idleClosedMin = 0;
     const routes = stmts.map((sql) => this.routeOf(sql));
     const allFed = routes.every((r) => r.kind !== "native");
     const base = opts.append ? this.items.length : 0;
@@ -881,11 +1091,15 @@ export class ConsolePane implements TabPane {
             counted = await runOne();
           }
           if (counted) autoCount = counted;
+          this.trackTx(sql);
           if (!this.isLineBased && /^\s*(create|alter|drop|rename)\b/i.test(sql)) schemaTouched = true;
           if (this.isKafka && /^\s*(create|delete)\s+topic\b/i.test(sql)) void loadOverview(this.connId, true);
         } catch (e) {
           if (!this.alive) return;
-          this.addError(sql, errMsg(e), base + i + 1, total, isConnectionLost(rawMsg(e)));
+          // v0.15: underline where the statement failed (when the driver reported a position / line)
+          const ran = (e as { executed?: unknown }).executed;
+          const spot = this.isLineBased ? null : this.errorSpot(e, sql, typeof ran === "string" ? ran : sql);
+          this.addError(sql, errMsg(e), base + i + 1, total, isConnectionLost(rawMsg(e)), false, spot);
           toast(errMsg(e), "error");
           break;
         }
@@ -931,7 +1145,14 @@ export class ConsolePane implements TabPane {
   private async fetchPage(sessionId: string, sql: string, offset: number, size: number): Promise<{ res: QueryResult; hasMore: boolean }> {
     const wrapped = pagedSql(this.driver, sql, size, offset);
     if (!wrapped) throw new Error("This statement can't be paged");
-    const res = await api.execute(sessionId, wrapped, size + 1);
+    let res: QueryResult;
+    try {
+      res = await api.execute(sessionId, wrapped, size + 1);
+    } catch (e) {
+      // error positions refer to the wrapped statement (v0.15 error underline)
+      if (e && typeof e === "object") (e as { executed?: string }).executed = wrapped;
+      throw e;
+    }
     const hasMore = res.rows.length > size || res.truncated;
     if (res.rows.length > size) res.rows = res.rows.slice(0, size);
     res.truncated = false;
@@ -1234,7 +1455,7 @@ export class ConsolePane implements TabPane {
   }
 
   /** `reconnect`: the connection was lost — offer a Reconnect button. */
-  private addError(sql: string, msg: string, n: number, total: number, reconnect = false, fed = false): void {
+  private addError(sql: string, msg: string, n: number, total: number, reconnect = false, fed = false, spot: { from: number; to: number; where: string } | null = null): void {
     this.status.text = "Error";
     this.status.rows = null;
     this.status.affected = null;
@@ -1257,9 +1478,28 @@ export class ConsolePane implements TabPane {
       h("div", { class: "r-error-text" }, msg),
       sql ? h("pre", { class: "r-sql" }, sql) : null,
       btn,
+      spot ? this.goToErrorButton(spot, msg) : null,
       reconnect || fed ? null : this.ai.fixActions(sql, msg),
+      errorHelpButton(msg, { vault: store.conns.get(this.connId)?.config.authMethod === "vault" }),
     );
     this.addItem(total > 1 ? `Error · ${n}` : "Error", sql, view, "err");
+  }
+
+  /** v0.15: underlines the failing token in the editor and offers "Go to error" (caret there). */
+  private goToErrorButton(spot: { from: number; to: number; where: string }, msg: string): HTMLElement {
+    this.editor.setErrorMark(spot.from, spot.to, msg);
+    const b = h("button", { class: "btn sm r-goto-err", type: "button", title: "Put the caret where the statement failed" }, icon("search", 13), `Go to error · ${spot.where}`);
+    b.addEventListener("click", () => {
+      const m = this.editor.errorMark;
+      // the underline is gone after an edit: the old position may no longer fit
+      if (!m) {
+        toast("The statement was edited since — run it again to locate the error", "info");
+        return;
+      }
+      this.editor.setErrorMark(m.from, m.to, m.message, true);
+      this.editor.focus();
+    });
+    return b;
   }
 
   // ---------------------------------------------------------------- filter bar
@@ -1406,10 +1646,12 @@ export class ConsolePane implements TabPane {
       await this.loadPage(item, item.paging.offset, item.paging.pageSize, true);
       return;
     }
-    if (!this.session || this.running) return;
+    if (this.running) return;
     this.setRunning(true, "Reloading…");
     try {
-      const res = await api.execute(this.session.sessionId, item.sql, item.maxRows);
+      // the session may have been closed after sitting idle (v0.15): reopen it
+      const sess = await this.ensureSession();
+      const res = await api.execute(sess.sessionId, item.sql, item.maxRows);
       item.last = res;
       if (item.grid) this.applyGrid(item.grid, res, item.maxRows);
       const label = item.tab.querySelector(".r-label");

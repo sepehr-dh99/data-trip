@@ -90,6 +90,10 @@ export interface ExplorerHost {
   openPalette(): void;
   /** Multi-selection → "New cross-source console (N sources)": SQL data sources, in selection order. */
   newCrossSource(connIds: string[]): void;
+  /** Data source menu › Run SQL file… (v0.15). */
+  runSqlFile(connId: string): void;
+  /** Sidebar toolbar: ? (help center). */
+  openHelp(): void;
 }
 
 /** Per (connection, database) Redis scan state behind the namespace tree. */
@@ -1511,6 +1515,7 @@ export class Explorer {
     const bHistory = btn("clock", "Query history", () => this.host.toggleHistory());
     const bImport = btn("download", "Import from DataGrip", () => this.host.importDataGrip());
     const pill = h("button", { class: "side-k", type: "button", "aria-label": "Command palette", onclick: () => this.host.openPalette() });
+    const bHelp = h("button", { class: "side-tool side-help", type: "button", "aria-label": "Help", onclick: () => this.host.openHelp() }, "?");
     const label = (name: string, key: string): string => (key ? `${name} (${key})` : name);
     const sync = (): void => {
       bSettings.title = label("Settings", shortcutLabel("settings"));
@@ -1518,13 +1523,14 @@ export class Explorer {
       bSsh.title = "SSH configurations — jump hosts and keys";
       bHistory.title = label("Query history", formatBinding("Mod-Shift-H"));
       bImport.title = "Import data sources from DataGrip";
+      bHelp.title = label("Help", shortcutLabel("help"));
       const k = shortcutLabel("commandPalette");
       pill.textContent = k || "⌘K";
       pill.title = label("Command palette — every action, data source, table and tab", k);
     };
     sync();
     onSettingsChange(sync);
-    return h("div", { class: "side-tools", role: "toolbar", "aria-label": "Tools" }, bSettings, bVault, bSsh, bHistory, bImport, h("span", { class: "spacer" }), pill);
+    return h("div", { class: "side-tools", role: "toolbar", "aria-label": "Tools" }, bSettings, bVault, bSsh, bHistory, bImport, bHelp, h("span", { class: "spacer" }), pill);
   }
 
   /** ⌘/Ctrl-click on a data source: adds it to (or removes it from) the multi-selection. */
@@ -1589,6 +1595,7 @@ export class Explorer {
         : { label: "Connect", icon: "plug", onClick: () => void this.connect(id) },
       { label: "Reconnect", icon: "refresh", hint: shortcutLabel("reconnect"), onClick: () => void this.reconnect(id) },
       { label: "New console", icon: "terminal", disabled: !connected, onClick: () => this.host.openConsole(id) },
+      { label: "Run SQL file…", icon: "playAll", disabled: !FED_DRIVERS.has(e.config.driver), onClick: () => this.host.runSqlFile(id) },
       { label: "Refresh", icon: "refresh", disabled: !connected, onClick: () => void this.refresh(id) },
       { sep: true },
       { label: "Edit…", icon: "pencil", onClick: () => this.host.editConnection(id) },

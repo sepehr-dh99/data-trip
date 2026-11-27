@@ -36,6 +36,8 @@ export interface WsConsole {
   fedShown: boolean;
   /** Opened as a cross-source console (tab badge "N sources"); absent in older workspaces. */
   crossSource?: boolean;
+  /** v0.15: the .sql file the console is bound to (absent / null = a plain console). */
+  file?: { path: string; mtimeMs: number | null; dirty: boolean } | null;
 }
 
 export interface WsTab {
@@ -93,7 +95,15 @@ function parseConsole(v: unknown): WsConsole {
     sources: Array.isArray(c.sources) ? c.sources.map(parseSource).filter((s): s is WsSource => s !== null) : [],
     fedShown: c.fedShown === true,
     crossSource: c.crossSource === true,
+    file: parseFile(c.file),
   };
+}
+
+function parseFile(v: unknown): WsConsole["file"] {
+  if (!isObj(v)) return null;
+  const path = str(v.path);
+  if (!path) return null;
+  return { path, mtimeMs: typeof v.mtimeMs === "number" && isFinite(v.mtimeMs) ? v.mtimeMs : null, dirty: v.dirty === true };
 }
 
 export function parseWorkspace(raw: unknown): Workspace {

@@ -17,8 +17,12 @@ export interface TabPane {
   readonly dirty?: boolean;
   /** Cross-source consoles: badge text ("3 sources") shown instead of the data source's name. */
   readonly sourceBadge?: string | null;
+  /** Consoles bound to a .sql file: its path (the tab is named after the file). */
+  readonly filePath?: string | null;
   /** Kafka topic / group tabs: what the capsule's second breadcrumb segment shows. */
   readonly objectLabel?: { glyph: "topic" | "group"; name: string };
+  /** v0.15: extra tooltip line, e.g. "Disconnected after 15 min idle — reconnects on next run". */
+  readonly statusHint?: string | null;
   focus(): void;
   dispose(): Promise<void>;
   dropSession(): void;

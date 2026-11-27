@@ -31,10 +31,16 @@ import type {
   FedSource,
   FedResult,
   AiProviderStatus,
+  AiProviderId,
+  AiModels,
   AiRequest,
   AiResult,
   UpdateStatus,
   UpdateInfo,
+  TextFile,
+  FileStat,
+  SqlRunOptions,
+  SqlRunProgress,
 } from "./types";
 
 /** Normalizes any thrown value from invoke() into an Error with a readable message. */
@@ -43,7 +49,12 @@ async function call<T>(cmd: string, args?: Record<string, unknown>): Promise<T> 
     return await invoke<T>(cmd, args);
   } catch (e: unknown) {
     if (e && typeof e === "object" && "message" in e) {
-      throw new Error(String((e as { message: unknown }).message));
+      const o = e as { message: unknown; position?: unknown; line?: unknown };
+      const err: Error & { position?: number; line?: number } = new Error(String(o.message));
+      // v0.15: where a statement failed (1-based character offset / line of the executed SQL).
+      if (typeof o.position === "number") err.position = o.position;
+      if (typeof o.line === "number") err.line = o.line;
+      throw err;
     }
     throw new Error(typeof e === "string" ? e : JSON.stringify(e));
   }
@@ -190,10 +201,24 @@ export const api = {
   aiCancel: () => call<null>("ai_cancel"),
   /** Stores (or with null clears) the OpenAI-compatible API key in the keychain; it is never read back. */
   aiSetApiKey: (key: string | null) => call<null>("ai_set_api_key", { key }),
+  /** v0.15: the provider's model catalog (cached 10 min by the backend; refresh = reload). Never rejects for provider problems (see `error`). */
+  aiModels: (provider: AiProviderId, baseUrl: string | null = null, refresh = false) => call<AiModels>("ai_models", { provider, baseUrl, refresh }),
   // ── v0.14: in-app updates ──
   updateStatus: () => call<UpdateStatus>("update_status"),
   updateCheck: (includePre: boolean) => call<UpdateInfo | null>("update_check", { includePre }),
   updateDownload: () => call<null>("update_download"),
   updateInstall: (restart: boolean) => call<null>("update_install", { restart }),
   updateOpenPage: (url: string) => call<null>("update_open_page", { url }),
+  // ── v0.15: SQL files ──
+  /** Reads a text file for a console (max 8 MiB; larger → error "FILE_TOO_LARGE: …"). */
+  sqlFileRead: (path: string) => call<TextFile>("sql_file_read", { path }),
+  /** Atomic write; with expectedMtimeMs a file changed on disk meanwhile → error "FILE_CHANGED: …". */
+  sqlFileWrite: (path: string, text: string, expectedMtimeMs: number | null, bom = false) =>
+    call<{ mtimeMs: number }>("sql_file_write", { path, text, expectedMtimeMs, bom }),
+  /** Modification time and size; null when the file doesn't exist. */
+  fileMtime: (path: string) => call<FileStat | null>("file_mtime", { path }),
+  /** Runs a script file statement by statement (events "sqlfile-progress"); resolves with the final progress. */
+  runSqlFile: (sessionId: string, path: string, options: SqlRunOptions, runId: string) =>
+    call<SqlRunProgress>("run_sql_file", { sessionId, path, options, runId }),
+  runSqlFileCancel: (runId: string) => call<null>("run_sql_file_cancel", { runId }),
 };

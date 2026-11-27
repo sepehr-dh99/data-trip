@@ -110,6 +110,8 @@ export function autoName(t: TabPane): string {
   // Cross-source consoles read several databases: no single database in the name.
   const db = t.sourceBadge ? "" : dbText(t);
   if (t.kind !== "console") return naming === "source" && conn ? `${conn} / ${t.title}` : t.title;
+  // Consoles bound to a .sql file are named after the file.
+  if (t.filePath) return naming === "source" && conn ? `${conn} / ${t.title}` : t.title;
   if (naming === "classic") return t.title;
   if (naming === "source") return `${conn || t.title}${db ? " / " + db : ""}${t.table ? " · " + t.table : ""}`;
   const base = t.table ?? t.title;
@@ -122,6 +124,7 @@ export function fullPath(t: TabPane): string {
   const conn = cfg ? cfg.name : "";
   const db = dbText(t);
   let path: string;
+  if (t.kind === "console" && t.filePath) return conn ? `${t.filePath} — ${conn}` : t.filePath;
   if (t.kind === "console" && t.table) {
     const parts: string[] = [];
     if (t.effectiveDatabase) parts.push(t.effectiveDatabase);
@@ -530,7 +533,7 @@ export class TabStrip {
     const cfg = connOf(t);
     const server = cfg ? DRIVER_LABELS[cfg.driver].split(" / ")[0] + (store.conns.get(t.connId)?.session?.serverVersion ? " " + store.conns.get(t.connId)?.session?.serverVersion : "") : "";
     const tip = getSettings().tabs.sort === "manual" ? "Double-click to rename · drag to reorder" : "Double-click to rename";
-    return `${fullPath(t)}${server ? " (" + server + ")" : ""}\n${tip}`;
+    return `${fullPath(t)}${server ? " (" + server + ")" : ""}${t.statusHint ? "\n" + t.statusHint : ""}\n${tip}`;
   }
 
   private renderTop(): void {

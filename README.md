@@ -64,8 +64,13 @@ Passwords are stored in the system keychain (macOS Keychain, Windows Credential 
 - **Command palette** (Cmd+K / Ctrl+K): every action with its shortcut, plus your data sources, the tables the explorer has loaded and the open tabs; fuzzy filter, arrow keys, Enter to run.
 - **App menu**: a native menu bar on macOS (DataTrip, File, Edit, View, Console, Window, Help; Settings… sits under DataTrip); on Windows and Linux the same menus open from the ☰ button at the left of the tab bar. A toolbar at the bottom of the sidebar opens Settings, Vault profiles, SSH configurations, Query history and Import from DataGrip.
 - **Cross-source queries** in any SQL console: refer to a table of any data source in your list as `dataSource.database.table` and DataTrip joins them for you, e.g. `select * from asia32.postgres.users a join stage_mysql.shop.users b on b.email = a.email`. The data source name is its name in the explorer in lowercase with `_` for spaces and other characters ("Stage MySQL" → `stage_mysql`; the explorer tooltip shows it), or the exact name quoted (`"Stage MySQL".shop.users`). PostgreSQL and SQL Server take an optional schema (`asia32.postgres.sales.orders`; default `public` / `dbo`); SQLite also accepts `source.table`. Filters on one table run at the source, the join runs in memory, and a "How it ran" panel shows each pull. Nothing needs to be attached; the older `alias.schema.table` form with attached aliases keeps working. Cmd-click (Ctrl-click) two or more data sources → **New cross-source console** opens a console with a short guide and an example query built from real tables; `source.`, `source.database.` and `source.database.schema.` autocomplete databases, schemas and tables; dragging a table from another data source inserts `source.database.table`.
-- **AI assistant in consoles** (Cmd+I / Ctrl+I or **✦ Ask AI**): describe a query in words and the **Codex CLI** you are already signed in to with ChatGPT writes it — no API key. Claude Code, **OpenCode** (any provider you signed in to with `opencode auth login`; model as `provider/model`), an OpenAI-compatible API key (kept in the keychain) or a local Ollama model work too (Settings › AI assistant). Only the schema of the tables your question is about is sent (names and types, never rows unless you turn on sample rows); the SQL appears as a highlighted insertion you **Accept** (Tab), **Reject** (Esc), **Refine…** or **Explain** — nothing runs until you run it. A failed statement gets **✦ Fix with AI**, shown as a diff; with text selected, **Explain selection**. Production data sources (read-only, or "prod" in the name or folder) are blocked by default. Install Codex with `npm i -g @openai/codex`, then run `codex login` once.
+- **AI assistant in consoles** (Cmd+I / Ctrl+I or **✦ Ask AI**): describe a query in words and the **Codex CLI** you are already signed in to with ChatGPT writes it — no API key. Claude Code, **OpenCode** (any provider you signed in to with `opencode auth login`; model as `provider/model`), an OpenAI-compatible API key (kept in the keychain) or a local Ollama model work too (Settings › AI assistant). Only the schema of the tables your question is about is sent (names and types, never rows unless you turn on sample rows); the SQL appears as a highlighted insertion you **Accept** (Tab), **Reject** (Esc), **Refine…** or **Explain** — nothing runs until you run it. A failed statement gets **✦ Fix with AI**, shown as a diff; with text selected, **Explain selection**. Production data sources (read-only, or "prod" in the name or folder) are blocked by default. The assistant knows all your data sources by their SQL names: ask for something that needs another data source (name it, or a table only it has, or say "across sources") and it writes a cross-source query (`source.database.table`, SQLite outer query) with the schemas of each source, checked locally before you see it. Settings › AI assistant › Model lists each provider's models (`opencode models`, `codex debug models`, Claude Code aliases, the API's `/models`, Ollama) — or type any model id. Install Codex with `npm i -g @openai/codex`, then run `codex login` once.
+- **Safeguards**: a console left idle closes its database session after 15 minutes (Settings › Data & history; never during a transaction or a running query) and reconnects silently on the next run; only the 10 most recently used consoles keep a live editor, the others keep their text, undo history and results.
+- **Error positions**: when PostgreSQL, MySQL or SQL Server report where a statement failed, the token is underlined in the editor (hover for the message) and the error view offers **Go to error**.
 - **Redis Sentinel**: list the sentinels and the master name; DataTrip asks the sentinels where the master (or a healthy replica) is, connects to it with TLS / ACL user / DB index like a standalone server, and follows a failover on reconnect. Sentinels may have their own password (kept in the keychain), SSH tunnels cover the sentinels and the nodes they report, and Test connection shows which sentinel answered, the master, its replicas and the PING time.
+- **SQL files**: save a console as a `.sql` file (Cmd+S / Ctrl+S; Save as… Shift+Cmd+S), open one (Cmd+O / Ctrl+O) against a data source and database remembered per file, export the selection as `.sql`, recent files in File ▾ and the command palette, or drag a `.sql` file onto the window to open a copy. A console bound to a file is named after it, shows ● for unsaved changes and offers Reload / Keep mine / Compare when the file changes on disk.
+- **Run SQL file** on a data source (right-click it, or File ▾): runs a script of any size statement by statement straight from disk, with progress, failures with line numbers, Stop, and options — stop on the first error, one transaction per N statements, or one transaction for everything. MySQL `DELIMITER` and SQL Server `GO` work.
+- **Help center** (F1, the ? in the sidebar, Help menu, Cmd+K): searchable, offline articles for every feature with examples you can try or copy; a four-step welcome tour on first launch (Help › Welcome tour); "What does this mean?" on errors DataTrip knows (Kafka host names, expired Vault tokens, SSH host keys…) and small ? hints next to tricky connection-dialog fields.
 
 ## Keyboard shortcuts
 
@@ -76,12 +81,15 @@ Passwords are stored in the system keychain (macOS Keychain, Windows Credential 
 | New console | Cmd+N | Ctrl+N |
 | Close tab | Cmd+W | Ctrl+W |
 | Format SQL | Cmd+Option+L | Ctrl+Alt+L |
-| Submit grid edits | Cmd+S | Ctrl+S |
+| Submit grid edits (result grid focused) | Cmd+S | Ctrl+S |
 | Open history | Cmd+Shift+H | Ctrl+Shift+H |
 | Command palette | Cmd+K | Ctrl+K |
 | Ask AI (in a SQL console) | Cmd+I | Ctrl+I |
 | Accept / reject an AI suggestion | Tab / Esc | Tab / Esc |
 | Settings | Cmd+, | Ctrl+, |
+| Save SQL file / Save as… | Cmd+S / Shift+Cmd+S | Ctrl+S / Ctrl+Shift+S |
+| Open SQL file | Cmd+O | Ctrl+O |
+| Help | F1 | F1 |
 
 ## Development
 
@@ -134,8 +142,9 @@ src-tauri/
     commands.rs          Tauri commands
     model.rs, error.rs   IPC types and error type
     store.rs             connection configs, keychain passwords, history
-    ai.rs                AI assistant: provider detection (Codex / Claude Code / OpenCode CLI, API key, Ollama) and generation
+    ai.rs                AI assistant: provider detection (Codex / Claude Code / OpenCode CLI, API key, Ollama), model catalogs and generation
     session.rs           open sessions, cancel, transaction mode
+    sqlfile.rs           SQL files: read / write with change detection, Run SQL file (streaming splitter + runner)
     export.rs            CSV and JSON export
     db/                  drivers: postgres, mysql, sqlite, mssql
 scripts/make_icons.py    regenerates the application icons with Pillow

@@ -655,3 +655,191 @@ commands; `federated_execute` keeps its signature (v0.10) with new naming rules,
   (merging `src-tauri/tauri.updater.conf.json` → `bundle.createUpdaterArtifacts`).
 - Settings `updates { auto, background, prerelease, skipped }`; the frontend (src/ui/updates.ts) checks 6 s
   after launch and hourly when the last check is older than a day; "Later" skips that version until a newer one.
+
+## v0.15 — SQL files & help
+
+Approved designs: `/home/claude/canvas/project/SqlFiles.dc.html` (R), `HelpCenter.dc.html` (S).
+Backend `src-tauri/src/sqlfile.rs` (commands registered as `sqlfile::…`, state `sqlfile::SqlFileRuns`); frontend
+`src/ui/sqlFiles.ts`, `src/ui/help.ts`, `src/ui/tour.ts`, content `src/help/articles.ts`, styles
+`src/styles/files.css`, `src/styles/help.css`.
+
+| command | args | returns |
+|---|---|---|
+| sql_file_read | path | TextFile `{text, mtimeMs, size, bom}` (max 8 MiB, else error `FILE_TOO_LARGE: …`; UTF-8 only; BOM removed) |
+| sql_file_write | path, text, expectedMtimeMs: number\|null, bom: bool\|null | `{mtimeMs}` |
+| file_mtime | path | FileStat `{mtimeMs, size}` \| null (missing) |
+| run_sql_file | sessionId, path, options: SqlRunOptions, runId | SqlRunProgress (final) |
+| run_sql_file_cancel | runId | null |
+
+- The existing `read_text_file` / `write_text_file` (importers / export, v0.2 / v0.9) are unchanged; the file
+  commands above are new names so their callers keep working.
+- **sql_file_write**: atomic (temp file + rename, `export::write_text_atomic`), through a symlink to its target,
+  the old file's permissions kept, BOM re-added when `bom`. With `expectedMtimeMs` and an existing file whose mtime
+  differs (≥ 1 ms) → error `FILE_CHANGED: <name> was changed on disk …` (nothing written). mtimes are ms since the
+  epoch.
+- **run_sql_file**: SQL drivers only. A blocking thread reads the file line by line (never whole), splits it
+  (`sqlfile::Splitter`: '…' / "…" / `…` / [..] quotes, -- and nested /* */ comments, PostgreSQL `$tag$` bodies and
+  E'…', MySQL backslash escapes, `#` comments, `/*! … */` kept as content, client `DELIMITER x`; SQL Server lines
+  `GO` / `GO n` end a batch, and a file containing GO is split on GO only), counts the statements in a first pass,
+  then streams them through a channel. Each statement runs with `Session::execute(sql, 1)` (no history). Options
+  `SqlRunOptions { stopOnError, batchTx: number|null (statements per transaction; null/0 = auto-commit), singleTx }`:
+  DataTrip sends `begin_sql` / `commit_sql` around batches (or the whole file); a failure inside a transaction rolls
+  it back (`rolledBack` += the statements that had succeeded in it; the failure message says so) and singleTx stops.
+  If the file contains its own BEGIN / COMMIT (`db::tx_control`), DataTrip commits what it opened and stops wrapping
+  (note). MySQL DDL (implicit commit) ends DataTrip's transaction (note in singleTx). `stopOnError` → stops at the
+  first failure. Events **`sqlfile-progress`** = `SqlRunProgress { runId, done, total|null, ok, failed, rolledBack,
+  bytesDone, bytesTotal, elapsedMs, lastError: {line (1-based, where the statement starts), statement (first 200
+  chars, whitespace collapsed), message}|null, finished, cancelled, stopped: string|null (why it ended early),
+  note: string|null }`: at most every 120 ms, plus one event per failure (with `lastError`) and a final one
+  (`finished`). Cancel: sets the flag and `Session::cancel` (the running statement), an open transaction is rolled
+  back, `cancelled: true`.
+- **Frontend runs on a dedicated session** (`open_session(connId, database)`, closed afterwards), so the console's
+  transaction mode / running statements are not involved.
+
+### SQL files (board R)
+- Keymap actions `saveFile` (Mod-S), `saveFileAs` (Mod-Shift-S), `openFile` (Mod-O), `help` (F1) in all presets.
+  Menu command ids: `saveFile`, `saveFileAs`, `exportSelection`, `openFile`, `runSqlFile`, `help`, `welcomeTour`
+  (macOS menu: File › Open SQL file… / Save / Save as… / Export selection as .sql… / Run SQL file on a data source…,
+  Help › DataTrip help / Welcome tour). Mod-S with the result grid focused still submits grid edits (the grid
+  handles it first).
+- **File ▾** (first button of a console's capsule controls): Save, Save as…, Export selection as .sql… ("Export
+  console…" without a selection), Open SQL file…, Run SQL file on a data source… (this console's data source /
+  database), Recent files (settings `files.recent`, max 10; also a "Recent files" group in ⌘K).
+- **Binding** (`ConsolePane.file: FileBinding`): `bind(path, text, mtimeMs, bom)` sets the tab title to the file
+  name (`TabPane.filePath`; `autoName` = the file name, tooltip `<path> — <data source>`), the saved baseline and
+  the line-ending style (CRLF kept on save). ● (`dirty`) = editor text ≠ last saved / loaded text (debounced
+  120 ms). ⌘S writes back with `expectedMtimeMs`; `FILE_CHANGED` → confirm Overwrite (writes without the check) or
+  Cancel (shows the banner). Save as (native save dialog) writes without the check and rebinds. Saving remembers
+  the file's target (`files.targets[path] = {connId, database}`, max 200) and adds it to recents. Closing a dirty
+  file console asks first.
+- **Changed on disk**: on window focus / visibility and tab activation, `file_mtime`; a different mtime → read the
+  file; same text → silently adopt; else banner "<name> changed on disk since you opened it." **Reload from
+  disk** (one undoable change), **Keep mine** (adopts the disk mtime: the next save overwrites), **Compare** (new
+  console "<name> (on disk)", editor read-only via `EditorState.readOnly`, info banner; Save as makes it a normal
+  file console). Missing file → banner "was moved or deleted" with Save it again / Save as… / Dismiss.
+- **Open** (⌘O, File ▾, menu, palette): native open dialog (filters .sql/.txt, all files) → an open console of that
+  path is activated instead → `sql_file_read` (`FILE_TOO_LARGE` → offer Run SQL file) → "Open <name>" picker
+  (path · size · statement count; "Run it against": the remembered target, the current console's, the explorer
+  selection, then every SQL data source, connected first; a Database select for connected servers with several
+  databases; "Remember for this file") → `openConsole(connId, {sql, database, title: name})` + `bind`. A recent file
+  with a remembered target opens directly.
+- **Drop**: window capture-phase `dragenter/over/leave/drop` for `Files` (the window keeps `dragDropEnabled:false`;
+  in-page table drags are untouched): overlay "Drop to open as a new console"; .sql/.txt files ≤ 8 MiB are read
+  with `File.text()` and opened (picker without "Remember") as **unbound** consoles named after the file; toast
+  "Opened a copy — use Save as to choose where it's saved".
+- **Workspace**: `WsConsole.file?: {path, mtimeMs, dirty} | null`. On restore the file is read again: same mtime →
+  that text is the baseline; changed → banner (baseline = disk text when the console had unsaved changes).
+- **Run SQL file** (explorer data source menu "Run SQL file…", File ▾, File menu, palette): open dialog → data source
+  (the console's / the explorer's; from the menu or palette with a console: that console; else the picker) → the
+  panel at the bottom of a console of that data source and database (the active one if it matches, else a new
+  console "run <name>"): options (Stop on first error; One transaction per [500] statements — default on; Run in a
+  single transaction), production / read-only warning, **Run** → progress bar, done / total, ✓ ok, ✕ failed,
+  ↺ rolled back, elapsed and time left, failures "✕ line N <statement> — <message>" (max 1000 listed), notes;
+  **Stop** → `run_sql_file_cancel`; finished → Run again / Close (+ toast when the console isn't active).
+
+### Help (board S)
+- **Help center** (`openHelp(id?)`; F1, the "?" in the sidebar toolbar, Help › DataTrip help, ⌘K "Help"): dialog
+  with search (all words must match title / lead / body / keywords; title hits first), the topic list of the
+  board (Getting started, Connect to a database, Consoles & running SQL, Results, editing & export, SQL files,
+  Cross-source queries, AI assistant, Vault, SSH & OIDC, Kafka & Redis, Keyboard shortcuts, Troubleshooting; a
+  topic with several articles lists them under it), and the article view (crumb, title, lead, body, **Try it**
+  button — a command id or "open a new console with this SQL" —, **Copy example** for the first code block,
+  Related links). Esc closes (first clears the search), F1 toggles, ⌘F focuses search. "Keyboard shortcuts" is
+  generated from `ACTIONS` with the current bindings.
+- **Content** (`src/help/articles.ts`): Markdown subset rendered to DOM nodes only (no innerHTML): `##`/`###`,
+  paragraphs, `- ` lists, `1. ` numbered steps, `> ` tips, ```sql blocks (small highlighter using the
+  `--syn-*` colors), `` `code` ``, `**bold**`, `[text](#article-id)`, `{key:actionId}` (current shortcut),
+  `{bind:Mod-S}`, `{modkey}`.
+- **Help from errors**: `ERROR_HELP` (regex → article id, some only for Vault data sources) + `errorHelpButton(msg,
+  {vault})` → "? What does this mean?" opening a compact popover (crumb, title, lead, body, "Open the full
+  article ↗", related). Used in the console error view, the connection dialog's Test / Save errors and the Kafka
+  topic error view.
+- **? hints** (`helpHint(articleId, tip)`): native tooltip with one line; click → the popover with the tip on top.
+  Connection dialog: Security protocol, Bootstrap servers (Kafka), SSH tunnel, Vault profile, Sentinel nodes,
+  Master name; Vault profiles: OIDC Mount path and Role.
+- **Welcome tour** (`src/ui/tour.ts`): 4 steps anchored to the explorer tree, the visible console's gutter (else
+  Run / New console), the ⌘K pill and the ? button; spotlight ring + card (Step n of 4, Next / Done, Skip tour; Esc
+  skips, ←/→). Shown ~0.9 s after the first launch while `settings.help.tourDone` is false and no dialog is open;
+  finishing or skipping sets it. Help › Welcome tour (and the help center's footer link) restarts it.
+- Settings additions: `files { recent: string[], targets: Record<path, {connId, database}> }`, `help { tourDone }`.
+
+## v0.15 — AI, safeguards, error positions
+
+| command | args | returns |
+|---|---|---|
+| ai_models | provider, baseUrl: string\|null, refresh: bool\|null | AiModels `{ models: {id, label?, note?}[], source: string, error?: string }` |
+
+**Cross-source AI requests** (frontend `src/ui/aiCross.ts`, pure; node tests `node scripts/test-ai-context.mjs`;
+the single-source helpers moved from `ai.ts` to the pure `src/ui/aiContext.ts`, re-exported by `ai.ts`).
+- Every request's `schemaContext` starts with "Data sources you can use …": one line per SQL data source — its SQL
+  name (`sourceRef`: slug, or quoted name), driver, and for the console's own source "this console · current
+  database X". Names only, no schema. Sources AI is blocked for (production, `blockProd`) are left out.
+- `detectCrossSource(text, sources, sqlUses)` over cached explorer metadata only: another source's slug (≥ 3 chars,
+  not generic) or quoted exact name in the request; a table (≥ 4 chars) named in the request that only another source
+  has (only once the own schema is loaded; tables compared without a plural "s"); a non-system database (≥ 3 chars)
+  only another server has; the sources the SQL being refined / fixed already reads from (`routeStatement`). Words
+  like "across / between … sources|databases|servers", "cross-source", "federated" make it explicit (then a table
+  named in the request picks a source even when the own source has one of that name).
+- Cross mode (`AiRequest.crossSource: true`): the involved sources are connected and introspected lazily (explorer
+  connect + `ensureDb`, attached database or the default); `buildCrossContext` sends the cross-source rules
+  (`source.database.table` / `source.database.schema.table`, slug or quoted exact name, SQLite outer query —
+  strftime, `||`, no ILIKE, LIMIT —, alias every table, filters on one table get pushed down, one read-only SELECT)
+  with a short example over the involved sources, then each source's tables as `CREATE TABLE
+  source.database[.schema].table (…)` (columns quoted the SQLite way). The 25-table budget is split: each source
+  gets an equal share of what it wants (v0.12 picking rules per source), leftovers go to sources wanting more; the
+  rest of each source is a names-only line. Samples (when allowed) only from the own source. The backend prompt then
+  says: write ONE cross-source SELECT following the rules if the request needs other sources, else a normal
+  `<dialect>` query.
+- Prod sources: a blocked source the request names (or its SQL uses) → the request is refused in the prompt box
+  ("“X” is a production data source and “Block AI for production data sources” is on …"); a blocked source matched
+  only by a table / database → excluded, with a warn chip "X: AI blocked".
+- Chips: "Across: a · b" (tooltip: why each source was picked), "Tables: src.table, …(from each source)".
+- Check before showing (`checkCrossSql`, with the console's RouteContext): ambiguous / unknown data source names,
+  `source.table` without the database (non-SQLite), tables without a data source in a cross-source query (CTE names
+  excepted), non-SQLite syntax in the outer query (ILIKE, `::`, NOW(), DATE_TRUNC, EXTRACT, INTERVAL, GETDATE,
+  DATEADD…, TOP, ISNULL, TO_CHAR / DATE_FORMAT, FETCH FIRST), writes, blocked sources, and a query that doesn't read
+  from a source the request named. Problems → ONE automatic `refine` request "DataTrip checked this cross-source query
+  … found: …. Fix exactly these problems …"; what is still wrong afterwards → info toast after insertion.
+
+**Model catalogs** (`ai_models`, cached 10 min per provider + base URL; `refresh` reloads; failures with no models
+aren't cached). Never rejects for provider problems: `error` says what went wrong.
+- opencode: `opencode models` (run like the generation CLIs: no shell, AppImage env cleaned, PATH search, empty temp
+  dir, 15 s) — every output line that is a single `provider/model` token; banners / warnings skipped.
+- codex: `codex debug models` (experimental) — JSON → every object's `slug` / `id` / `model` string (label from
+  `display_name`; `visibility: "hide"` skipped), else lines that look like model ids. Not available / empty → the
+  top-level `model` of `$CODEX_HOME/config.toml` (default `~/.codex`; note "from config.toml") + suggested models
+  (note "suggested"): gpt-6.2-sol, gpt-6.2-astra, gpt-6.1-sol, gpt-6-luna (Codex docs, Nov 2026).
+- claude: the aliases sonnet, opus, haiku, opusplan (note "alias") + claude-opus-5-5, claude-haiku-5-5 ("pinned").
+- openai: GET `{baseUrl or https://api.openai.com/v1}/models` with the stored key → `data[].id`, sorted.
+- ollama: `/api/tags`.
+- Settings › AI assistant › Model is a searchable picker: "Default" (= "", provider default), the catalog (OpenCode
+  grouped by the provider prefix), a typed value kept as a custom model ("Use “x”"), ↻ reloads, the line under it
+  shows "N models · from `opencode models`" or the error. The prompt box's provider chip shows the chosen model
+  ("Codex · gpt-6.2-sol", "OpenCode · default model").
+
+**Connection safeguards** (frontend, `console.ts`).
+- Settings `data.idleDisconnectMinutes`: 5 | 15 | 30 | 60 | 120 | 0 (never), default 15; Settings › Data & history
+  "Disconnect idle consoles after" (select). Every 30 s, a SQL / Redis console (not Kafka) whose session is open,
+  with no run / typing / focus-in for that long, not running, auto-commit, no typed BEGIN / START TRANSACTION /
+  SAVEPOINT (Redis MULTI) without COMMIT / ROLLBACK (/ EXEC, DISCARD) since, no AI request running and its editor not
+  focused in a focused window → `close_session`. The next run (or paging, Load more, edits, count) reopens it via
+  `ensureSession` (search_path re-applied). Status text and tab tooltip: "Disconnected after 15 min idle — reconnects
+  on next run" (`TabPane.statusHint`).
+- Editor hibernation: consoles in most-recently-used order (activation / focus / wake); only the 10 most recent keep
+  a CodeMirror `EditorView`. `SqlEditor.hibernate()` keeps the `EditorState` (text, undo history, selection, pending
+  AI text, error mark) and a scroll snapshot and destroys the view; `state`, `getText()`, statements, cursor, edits
+  (`dispatch` applies to the saved state), undo / redo keep working; anything needing the view (`focus`, `cmView`,
+  coordinates) recreates it first (`wake()`, inserted as the container's first child, scroll restored). Not while
+  the console is visible or its AI request runs; the AI prompt box is closed first. Result grids are kept as they are.
+
+**Error positions**.
+- `AppError` serializes `{ message, position?, line? }` (fields only when known; messages unchanged): PostgreSQL —
+  `PgDatabaseError::position()` `Original(n)` → `position` (1-based character of the executed SQL); MySQL — "… near
+  '<rest>' at line N" → `line`, and `DbConn::execute` locates `<rest>` from that line on → `position`
+  (`near ''` → the statement's end); SQL Server — tiberius `TokenError::line()` → `line`. The frontend `api` keeps
+  them on the thrown `Error` (`err.position`, `err.line`).
+- Console: a failed statement run from the editor is found in the document (the copy at / nearest the caret); the
+  position (code points → UTF-16; the pager's wrapper offset removed) or line maps to the document; the token there
+  (word, quoted name / literal, else one character; at the end: the last token) gets a red wavy underline with the
+  message on hover (`SqlEditor.setErrorMark`), and the error view gets **Go to error · line L, column C** (caret
+  there). Cleared by any edit and on the next run. Cross-source and Redis / Kafka errors get none.

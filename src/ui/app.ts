@@ -39,6 +39,9 @@ import { VAULT_TOKEN_RE, vaults } from "./vault";
 import { showTokenPastePrompt } from "./vaultChips";
 import { getSettings, onSettingsChange, updateSettings } from "./settings";
 import { RestoredPane, WorkspaceSaver, loadWorkspace } from "./workspace";
+import { initSqlFiles, openSqlFile, runSqlFileFlow } from "./sqlFiles";
+import { initHelp, isHelpOpen, openHelp } from "./help";
+import { maybeStartTour, startTour } from "./tour";
 import { checkForUpdates, initUpdates, setBeforeRestart } from "./updates";
 import type { Workspace, WsTab } from "./workspace";
 
@@ -126,6 +129,8 @@ export class App {
       toggleHistory: () => this.toggleHistory(),
       openPalette: () => this.openCommandPalette(),
       newCrossSource: (ids) => void this.newCrossSource(ids),
+      runSqlFile: (id) => void runSqlFileFlow({ connId: id }),
+      openHelp: () => openHelp(),
     });
     this.navigator = new Navigator({
       sheet: () => this.shell.querySelector<HTMLElement>(".sheet") ?? this.root,
@@ -184,6 +189,28 @@ export class App {
     window.addEventListener("keydown", (e) => this.onKeyCapture(e), true);
     // macOS: the native menu bar (lib.rs) sends the clicked item's id.
     listenNativeMenu((id) => this.runCommand(id));
+    // SQL files (v0.15): open / save / run .sql files, dropped files, changed-on-disk checks.
+    initSqlFiles({
+      openConsole: (connId, o) => this.openConsole(connId, { sql: o.sql, database: o.database ?? null, title: o.title }),
+      consoles: () => this.tabs.filter((t): t is ConsolePane => t instanceof ConsolePane),
+      activeConsole: () => this.activeConsole(),
+      activate: (c) => this.activate(c),
+      currentConn: () => this.active?.connId ?? this.selectedConn,
+      ensureConnected: (id) => this.ensureConn(id),
+    });
+    // Help (v0.15): "Try it" buttons of the help center.
+    initHelp({
+      runCommand: (id) => this.runCommand(id),
+      newConsoleWith: (sql) => {
+        const id = this.active?.connId ?? this.selectedConn ?? store.list().find((e) => e.status === "connected")?.config.id ?? store.list()[0]?.config.id;
+        if (!id) {
+          toast("Add a connection first", "info");
+          this.addConnection();
+          return;
+        }
+        void this.openConsole(id, { sql });
+      },
+    });
     window.addEventListener("paste", (e) => this.onPaste(e));
     // In-app updates: the open tabs are saved right before an update restarts the app.
     setBeforeRestart(() => this.saver.flush());
@@ -241,6 +268,8 @@ export class App {
     // and don't save either, so the saved workspace survives for the next start).
     if (loaded && getSettings().data.restoreConsoles) await this.restoreWorkspace();
     this.wsReady = loaded;
+    // First launch: the welcome tour (once; Help › Welcome tour restarts it).
+    maybeStartTour();
     this.pruneHistory();
     let prev = getSettings().data;
     onSettingsChange((st) => {
@@ -675,7 +704,10 @@ export class App {
     this.syncHistoryConn();
     // Restored on launch: connect / open on first activation.
     if (pane instanceof RestoredPane) void this.materialize(pane);
-    else if (pane instanceof ConsolePane) void pane.wake();
+    else if (pane instanceof ConsolePane) {
+      void pane.wake();
+      void pane.file.checkDisk();
+    }
     this.saveWorkspaceSoon();
   }
 
@@ -696,6 +728,11 @@ export class App {
   }
 
   private async closeTab(t: TabPane): Promise<void> {
+    // A console bound to a .sql file with unsaved changes: ask first.
+    if (t instanceof ConsolePane && t.file.dirty) {
+      const ok = await confirmDialog("Close without saving?", `${t.title} has unsaved changes. Close it anyway? (Cancel, then ${shortcutLabel("saveFile") || "Save"} to keep them.)`, "Close without saving", true);
+      if (!ok) return;
+    }
     const i = this.tabs.indexOf(t);
     if (i < 0) return;
     this.rememberClosed(t);
@@ -928,6 +965,28 @@ export class App {
       case "helpPalette":
         this.openCommandPalette();
         return;
+      case "saveFile":
+        if (needConsole()) void c?.file.save();
+        return;
+      case "saveFileAs":
+        if (needConsole()) void c?.file.saveAs();
+        return;
+      case "exportSelection":
+        if (needConsole()) void c?.file.exportSelection();
+        return;
+      case "openFile":
+        void openSqlFile();
+        return;
+      case "runSqlFile":
+        if (c && !c.isLineBased) void runSqlFileFlow({ console: c });
+        else void runSqlFileFlow({});
+        return;
+      case "help":
+        openHelp();
+        return;
+      case "welcomeTour":
+        startTour();
+        return;
       case "checkUpdates":
         void checkForUpdates(true);
         return;
@@ -1092,6 +1151,17 @@ export class App {
     if (place !== "left") act("tabsLeft", "Tabs on the left", "sidebar", "", "placement rail");
     if (place !== "right") act("tabsRight", "Tabs on the right", "sidebar", "", "placement rail");
     act("keyboardShortcuts", "Keyboard shortcuts…", "sliders", "", "keymap bindings");
+    act("saveFile", "Save SQL file", "download", k("saveFile"), "write disk", !c);
+    act("saveFileAs", "Save SQL file as…", "download", k("saveFileAs"), "write disk rename", !c);
+    act("exportSelection", "Export selection as .sql…", "download", "", "save file", !c);
+    act("openFile", "Open SQL file…", "folder", k("openFile"), "load script disk");
+    act("runSqlFile", "Run SQL file on a data source…", "playAll", "", "execute script seed dump import batch");
+    act("help", "Help", "search", k("help"), "documentation docs guide manual how troubleshooting");
+    act("welcomeTour", "Welcome tour", "sparkle", "", "intro help onboarding");
+    for (const p of getSettings().files.recent) {
+      const name = p.slice(Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")) + 1);
+      out.push({ group: "Recent files", label: name, icon: "folder", detail: p, keywords: "recent sql file", run: () => void openSqlFile(p) });
+    }
     for (const e of store.list()) {
       const id = e.config.id;
       out.push({
@@ -1157,6 +1227,12 @@ export class App {
           { id: "newConsole", label: "New console", hint: k("newConsole") },
           { id: "newCrossSource", label: "New cross-source console" },
           sep,
+          { id: "openFile", label: "Open SQL file…", hint: k("openFile") },
+          { id: "saveFile", label: "Save", hint: k("saveFile"), disabled: !c },
+          { id: "saveFileAs", label: "Save as…", hint: k("saveFileAs"), disabled: !c },
+          { id: "exportSelection", label: "Export selection as .sql…", disabled: !c },
+          { id: "runSqlFile", label: "Run SQL file on a data source…" },
+          sep,
           { id: "importDataGrip", label: "Import from DataGrip…" },
           { id: "vaultProfiles", label: "Vault profiles…" },
           { id: "sshProfiles", label: "SSH configurations…" },
@@ -1217,6 +1293,9 @@ export class App {
       {
         label: "Help",
         items: [
+          { id: "help", label: "DataTrip help", hint: k("help") },
+          { id: "welcomeTour", label: "Welcome tour" },
+          sep,
           { id: "keyboardShortcuts", label: "Keyboard shortcuts…" },
           { id: "crossSourceGuide", label: "Cross-source queries guide" },
           { id: "commandPalette", label: "Command palette…", hint: k("commandPalette") },
@@ -1317,6 +1396,23 @@ export class App {
       case "toggleSidebar":
         e.preventDefault();
         this.toggleSidebar();
+        return;
+      case "saveFile":
+      case "saveFileAs": {
+        // The result grid handles ⌘S itself (submit edits) and prevents the default first.
+        e.preventDefault();
+        if (!c) return;
+        if (a === "saveFile") void c.file.save();
+        else void c.file.saveAs();
+        return;
+      }
+      case "openFile":
+        e.preventDefault();
+        void openSqlFile();
+        return;
+      case "help":
+        e.preventDefault();
+        if (!isHelpOpen()) openHelp();
         return;
     }
   }

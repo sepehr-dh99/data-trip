@@ -7,8 +7,8 @@ import { HISTORY_CHANGED } from "./history";
 import { toast } from "./toast";
 import { ACTIONS, PRESETS, PRESET_LABELS, bindingOf, conflictFor, eventToBinding, formatBinding, setBinding } from "./keymap";
 import type { ActionId } from "./keymap";
-import { FONT_LABELS, FONT_STACKS, defaultSettings, effectiveTokenColors, getSettings, lineHeightPx, onSettingsChange, updateSettings } from "./settings";
-import type { AppSettings, EditorFont, KeymapPreset, LineHeight, PageSize } from "./settings";
+import { FONT_LABELS, FONT_STACKS, IDLE_MINUTES, defaultSettings, effectiveTokenColors, getSettings, lineHeightPx, onSettingsChange, updateSettings } from "./settings";
+import type { AppSettings, EditorFont, IdleMinutes, KeymapPreset, LineHeight, PageSize } from "./settings";
 import { THEMES, TOKEN_KEYS, TOKEN_PALETTE } from "./themes";
 import type { TokenKey } from "./themes";
 import { buildAiSettings } from "./aiSettings";
@@ -574,9 +574,15 @@ class SettingsWindow {
     const restore = this.row("Restore consoles on launch", "Reopen tabs in their order with their text and cursor; data sources connect when a tab is used", this.toggle("Restore consoles", () => S().data.restoreConsoles, (v) => updateSettings((s) => (s.data.restoreConsoles = v))));
     const confirm = this.row("Confirm risky statements", "Ask before UPDATE or DELETE without WHERE, DROP, TRUNCATE", this.toggle("Confirm risky statements", () => S().data.confirmRisky, (v) => updateSettings((s) => (s.data.confirmRisky = v))));
     const auto = this.row("Auto-reconnect", "Reconnect silently when a connection drops or Vault credentials expire", this.toggle("Auto-reconnect", () => S().data.autoReconnect, (v) => updateSettings((s) => (s.data.autoReconnect = v))));
+    // v0.15: idle disconnect (a small select)
+    const idleSel = h("select", { class: "st-input st-select", "aria-label": "Disconnect idle consoles after" });
+    for (const m of IDLE_MINUTES) idleSel.appendChild(h("option", { value: String(m) }, m === 0 ? "Never" : m >= 60 ? `${m / 60} hour${m === 60 ? "" : "s"}` : `${m} minutes`));
+    idleSel.addEventListener("change", () => updateSettings((s) => (s.data.idleDisconnectMinutes = Number(idleSel.value) as IdleMinutes)));
+    this.syncs.push(() => (idleSel.value = String(S().data.idleDisconnectMinutes)));
+    const idle = this.row("Disconnect idle consoles after", "Closes a console’s database session when it sat unused (never during a transaction or a running query); the next run reconnects silently", idleSel, "idle timeout session close disconnect");
     const clearBtn = h("button", { class: "st-pill", type: "button", onclick: () => void this.clearHistory(clearBtn) }, "Clear history…");
     const wipe = this.row("Clear query history", "Delete every entry of every data source from the History panel", clearBtn, "delete remove history");
-    this.section("data", [keep, restore, confirm, auto, wipe]);
+    this.section("data", [keep, restore, confirm, auto, idle, wipe]);
   }
 
   // ------------------------------------------------------------------ Updates

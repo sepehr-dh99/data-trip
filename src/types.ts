@@ -269,6 +269,10 @@ export type ExportFormat = "csv" | "json";
 
 export interface AppError {
   message: string;
+  /** v0.15: 1-based character offset into the executed statement where it failed (when the driver knows). */
+  position?: number;
+  /** v0.15: 1-based line of the executed statement where it failed. */
+  line?: number;
 }
 
 export const DEFAULT_PORTS: Record<Driver, number | null> = {
@@ -455,6 +459,23 @@ export interface AiRequest {
   schemaContext: string;
   currentSql?: string | null;
   error?: string | null;
+  /** v0.15: the request may need other data sources (schemaContext holds the cross-source rules + schemas). */
+  crossSource?: boolean;
+}
+
+/** v0.15: one entry of a provider's model catalog (`ai_models`). */
+export interface AiModel {
+  id: string;
+  label?: string;
+  /** e.g. "suggested", "from config.toml", "alias". */
+  note?: string;
+}
+
+export interface AiModels {
+  models: AiModel[];
+  /** Where the list came from, e.g. "`opencode models`". */
+  source: string;
+  error?: string;
 }
 
 export interface AiResult {
@@ -477,4 +498,49 @@ export interface UpdateInfo {
   notes: string | null;
   date: string | null;
   url: string;
+}
+
+// ── v0.15: SQL files ──
+export interface TextFile {
+  text: string;
+  mtimeMs: number;
+  size: number;
+  /** The file started with a UTF-8 BOM (removed from `text`; pass it back when saving). */
+  bom: boolean;
+}
+
+export interface FileStat {
+  mtimeMs: number;
+  size: number;
+}
+
+export interface SqlRunOptions {
+  stopOnError: boolean;
+  /** Statements per transaction; null = auto-commit every statement. */
+  batchTx: number | null;
+  singleTx: boolean;
+}
+
+export interface SqlRunFailure {
+  line: number;
+  statement: string;
+  message: string;
+}
+
+/** `sqlfile-progress` event payload (and the final result of run_sql_file). */
+export interface SqlRunProgress {
+  runId: string;
+  done: number;
+  total: number | null;
+  ok: number;
+  failed: number;
+  rolledBack: number;
+  bytesDone: number;
+  bytesTotal: number;
+  elapsedMs: number;
+  lastError: SqlRunFailure | null;
+  finished: boolean;
+  cancelled: boolean;
+  stopped: string | null;
+  note: string | null;
 }

@@ -13,6 +13,7 @@ pub mod fedsql;
 pub mod model;
 pub mod profiles;
 pub mod session;
+pub mod sqlfile;
 pub mod ssh;
 pub mod store;
 pub mod updater;
@@ -56,6 +57,7 @@ pub fn run() {
             );
             app.manage(ai::AiState::default());
             app.manage(updater::UpdaterState::default());
+            app.manage(sqlfile::SqlFileRuns::default());
             app.manage(AppState {
                 store,
                 vault_cache,
@@ -129,11 +131,17 @@ pub fn run() {
             ai::ai_generate,
             ai::ai_cancel,
             ai::ai_set_api_key,
+            ai::ai_models,
             updater::update_status,
             updater::update_check,
             updater::update_download,
             updater::update_install,
             updater::update_open_page,
+            sqlfile::sql_file_read,
+            sqlfile::sql_file_write,
+            sqlfile::file_mtime,
+            sqlfile::run_sql_file,
+            sqlfile::run_sql_file_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DataTrip");

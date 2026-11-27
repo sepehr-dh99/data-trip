@@ -47,7 +47,14 @@ export type MenuCommand =
   | "crossSourceGuide"
   | "helpShortcuts"
   | "helpPalette"
-  | "checkUpdates";
+  | "checkUpdates"
+  | "saveFile"
+  | "saveFileAs"
+  | "exportSelection"
+  | "openFile"
+  | "runSqlFile"
+  | "help"
+  | "welcomeTour";
 
 export interface AppMenuEntry {
   id?: MenuCommand;

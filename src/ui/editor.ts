@@ -504,8 +504,71 @@ function fedExtensions(holder: FedHolder): Extension {
   return [plugin, tip, EditorState.languageData.of(() => [{ autocomplete: source }])];
 }
 
+// ---- v0.15: where a statement failed (error position from the driver), underlined with the message on hover.
+
+interface ErrorMark {
+  from: number;
+  to: number;
+  message: string;
+}
+
+const setErrorMarkEffect = StateEffect.define<ErrorMark | null>();
+const ERROR_MARK = Decoration.mark({ class: "cm-sql-error" });
+
+const errorMarkField = StateField.define<ErrorMark | null>({
+  create: (): ErrorMark | null => null,
+  update(v: ErrorMark | null, tr: Transaction): ErrorMark | null {
+    for (const e of tr.effects) if (e.is(setErrorMarkEffect)) return e.value;
+    // any edit clears it (the position no longer matches what ran)
+    return v && tr.docChanged ? null : v;
+  },
+  provide: (f: StateField<ErrorMark | null>) =>
+    EditorView.decorations.from(f, (v: ErrorMark | null) => (v ? Decoration.set([ERROR_MARK.range(v.from, v.to)]) : Decoration.none)),
+});
+
+function errorMarkExtension(): Extension {
+  const tip = hoverTooltip((view: EditorView, pos: number) => {
+    const m = view.state.field(errorMarkField, false);
+    if (!m || pos < m.from || pos > m.to) return null;
+    return {
+      pos: m.from,
+      end: m.to,
+      above: true,
+      create: () => {
+        const dom = document.createElement("div");
+        dom.className = "cm-sql-error-tip";
+        dom.textContent = m.message;
+        return { dom };
+      },
+    };
+  });
+  const look = EditorView.baseTheme({
+    ".cm-sql-error": {
+      textDecoration: "underline wavy #ff453a",
+      textDecorationSkipInk: "none",
+      textUnderlineOffset: "3px",
+      backgroundColor: "rgba(255, 69, 58, 0.12)",
+    },
+    ".cm-sql-error-tip": {
+      maxWidth: "520px",
+      padding: "6px 9px",
+      fontSize: "12px",
+      lineHeight: "1.45",
+      whiteSpace: "pre-wrap",
+      color: "#ffb4ae",
+    },
+  });
+  return [errorMarkField, tip, look];
+}
+
 export class SqlEditor {
-  private view: EditorView;
+  /** The live view; null while hibernated (v0.15: only the most recently used consoles keep one). */
+  private live: EditorView | null;
+  /** The editor state (text, undo history, selection, AI / error marks) while hibernated. */
+  private saved: EditorState | null = null;
+  private savedScroll: { effect: unknown; top: number; left: number } | null = null;
+  private parent: HTMLElement;
+  private onCursorCb: (() => void) | undefined;
   private lang = new Compartment();
   private driver: Driver;
   private schema: Record<string, string[]> = {};
@@ -517,6 +580,8 @@ export class SqlEditor {
 
   constructor(parent: HTMLElement, opts: EditorOptions) {
     this.driver = opts.driver;
+    this.parent = parent;
+    this.onCursorCb = opts.onCursor;
     this.kafkaNames = opts.kafkaNames ?? (() => ({ topics: [], groups: [] }));
     const onChange = opts.onChange;
     const onCursor = opts.onCursor;
@@ -525,6 +590,7 @@ export class SqlEditor {
       runGutterExtensions(opts.driver, this.runHolder),
       aiEditorExtension(),
       fedExtensions(this.fedHolder),
+      errorMarkExtension(),
       highlightActiveLineGutter(),
       highlightActiveLine(),
       history(),
@@ -542,18 +608,18 @@ export class SqlEditor {
         if ((u.selectionSet || u.docChanged) && onCursor) onCursor();
       }),
     ];
-    this.view = new EditorView({
+    this.live = new EditorView({
       state: EditorState.create({ doc: opts.doc ?? "", extensions }),
       parent,
     });
     // Shortcuts follow the keymap settings (preset + overrides).
-    this.offSettings = onSettingsChange(() => this.view.dispatch({ effects: this.keys.reconfigure(this.keymapExtension()) }));
+    this.offSettings = onSettingsChange(() => this.dispatch({ effects: this.keys.reconfigure(this.keymapExtension()) }));
     // Capture on the container so the run shortcuts win over CodeMirror's own bindings.
     parent.addEventListener(
       "keydown",
       (e: KeyboardEvent) => {
         // Only keys typed in the editor itself (not in the AI prompt box floating over it).
-        if (e.target instanceof Node && !this.view.dom.contains(e.target)) return;
+        if (!this.live || (e.target instanceof Node && !this.live.dom.contains(e.target))) return;
         const a = matchAction(e);
         if (a === "runStatement" || a === "runAll") {
           e.preventDefault();
@@ -629,17 +695,17 @@ export class SqlEditor {
   }
 
   getText(): string {
-    return this.view.state.doc.toString();
+    return this.state.doc.toString();
   }
 
   setText(text: string): void {
-    this.view.dispatch({ changes: { from: 0, to: this.view.state.doc.length, insert: text } });
+    this.dispatch({ changes: { from: 0, to: this.state.doc.length, insert: text } });
   }
 
   /** Replace the selection (or insert at the cursor) with `text`. */
   insertText(text: string): void {
-    const sel = this.view.state.selection.main;
-    this.view.dispatch({
+    const sel = this.state.selection.main;
+    this.dispatch({
       changes: { from: sel.from, to: sel.to, insert: text },
       selection: { anchor: sel.from + text.length },
     });
@@ -651,7 +717,7 @@ export class SqlEditor {
    * with `;` in SQL consoles so the two never run together. The caret ends inside the new statement.
    */
   insertStatement(text: string, atEnd = false): void {
-    const st = this.view.state;
+    const st = this.state;
     const sel = st.selection.main;
     const doc = st.doc.toString();
     const lineBased = this.lineBased();
@@ -660,7 +726,7 @@ export class SqlEditor {
     if (!lineBased && !body.endsWith(";")) body += ";";
     const back = lineBased ? 0 : 1; // caret lands before the trailing ";"
     if (!atEnd && !sel.empty) {
-      this.view.dispatch({
+      this.dispatch({
         changes: { from: sel.from, to: sel.to, insert: body },
         selection: { anchor: sel.from + body.length - back },
         scrollIntoView: true,
@@ -697,7 +763,7 @@ export class SqlEditor {
     const rest = doc.slice(pos);
     const suffix = rest.length > 0 && !/^[ \t]*(\n|$)/.test(rest) ? "\n" : "";
     changes.push({ from: pos, to: pos, insert: prefix + body + suffix });
-    this.view.dispatch({
+    this.dispatch({
       changes,
       selection: { anchor: pos + shift + prefix.length + body.length - back },
       scrollIntoView: true,
@@ -706,22 +772,22 @@ export class SqlEditor {
   }
 
   undo(): boolean {
-    return undo(this.view);
+    return this.live ? undo(this.live) : undo(this.target());
   }
 
   redo(): boolean {
-    return redo(this.view);
+    return this.live ? redo(this.live) : redo(this.target());
   }
 
   /** Caret offset (head of the main selection). */
   get cursor(): number {
-    return this.view.state.selection.main.head;
+    return this.state.selection.main.head;
   }
 
   /** Puts the caret at `pos` (clamped to the document) and scrolls it into view. */
   setCursor(pos: number): void {
-    const p = Math.max(0, Math.min(this.view.state.doc.length, Math.floor(pos) || 0));
-    this.view.dispatch({ selection: { anchor: p }, scrollIntoView: true });
+    const p = Math.max(0, Math.min(this.state.doc.length, Math.floor(pos) || 0));
+    this.dispatch({ selection: { anchor: p }, scrollIntoView: true });
   }
 
   /**
@@ -730,7 +796,7 @@ export class SqlEditor {
    */
   formatTarget(): { from: number; to: number; text: string } | null {
     if (this.lineBased()) return null;
-    const st = this.view.state;
+    const st = this.state;
     const sel = st.selection.main;
     if (!sel.empty) {
       const raw = st.sliceDoc(sel.from, sel.to);
@@ -745,7 +811,7 @@ export class SqlEditor {
 
   /** Replaces [from, to) with `text` as one undoable step and selects the replacement's end. */
   replaceRange(from: number, to: number, text: string): void {
-    this.view.dispatch({
+    this.dispatch({
       changes: { from, to, insert: text },
       selection: { anchor: from + text.length },
       scrollIntoView: true,
@@ -755,7 +821,7 @@ export class SqlEditor {
   }
 
   getSelectionOrStatementAtCursor(): Runnable | null {
-    const st = this.view.state;
+    const st = this.state;
     const sel = st.selection.main;
     if (!sel.empty) {
       const raw = st.sliceDoc(sel.from, sel.to);
@@ -783,9 +849,9 @@ export class SqlEditor {
     const want = norm(oldText);
     const all = this.getAllStatements().filter((s) => norm(s.text) === want);
     if (all.length === 0) return false;
-    const head = this.view.state.selection.main.head;
+    const head = this.state.selection.main.head;
     const hit = all.find((s) => head >= s.from && head <= s.to) ?? all[0];
-    this.view.dispatch({ changes: { from: hit.from, to: hit.to, insert: newText } });
+    this.dispatch({ changes: { from: hit.from, to: hit.to, insert: newText } });
     return true;
   }
 
@@ -809,10 +875,107 @@ export class SqlEditor {
     return this.view;
   }
 
+  /** The current editor state — also while hibernated (text, selection, undo history, pending AI text). */
+  get state(): EditorState {
+    return this.live ? this.live.state : (this.saved as EditorState);
+  }
+
+  /** The live view, recreated first when hibernated. */
+  private get view(): EditorView {
+    this.wake();
+    return this.live as EditorView;
+  }
+
+  /** Applies a transaction to the live view, or to the saved state while hibernated. */
+  private dispatch(spec: TransactionSpec): void {
+    if (this.live) {
+      this.live.dispatch(spec);
+      return;
+    }
+    if (!this.saved) return;
+    const tr = this.saved.update(spec);
+    this.saved = tr.state;
+    if ((tr.docChanged || tr.selection) && this.onCursorCb) this.onCursorCb();
+  }
+
+  /** `{state, dispatch}` for state commands (undo / redo) while hibernated. */
+  private target(): { state: EditorState; dispatch: (tr: Transaction) => void } {
+    return {
+      state: this.state,
+      dispatch: (tr: Transaction) => {
+        this.saved = tr.state;
+        if (this.onCursorCb) this.onCursorCb();
+      },
+    };
+  }
+
+  get hibernated(): boolean {
+    return this.live === null;
+  }
+
+  /**
+   * Destroys the CodeMirror view and keeps its state (text, undo history, selection, marks) and scroll position;
+   * every method keeps working on the state, and anything that needs the view (focus, coordinates, the AI box)
+   * recreates it.
+   */
+  hibernate(): void {
+    const v = this.live;
+    if (!v || this.saved) return;
+    const snap = (v as unknown as { scrollSnapshot?: () => unknown }).scrollSnapshot;
+    this.savedScroll = { effect: typeof snap === "function" ? snap.call(v) : null, top: v.scrollDOM.scrollTop, left: v.scrollDOM.scrollLeft };
+    this.saved = v.state;
+    this.live = null;
+    v.destroy();
+  }
+
+  /** Recreates the view of a hibernated editor at its old place and scroll position. */
+  wake(): void {
+    if (this.live || !this.saved) return;
+    const scroll = this.savedScroll;
+    const cfg: { state: EditorState; scrollTo?: unknown } = { state: this.saved };
+    if (scroll?.effect) cfg.scrollTo = scroll.effect;
+    const v = new EditorView(cfg as { state: EditorState });
+    // First child again: overlays (AI box, drop hint, guide card) stay above the editor.
+    this.parent.insertBefore(v.dom, this.parent.firstChild);
+    this.live = v;
+    this.saved = null;
+    this.savedScroll = null;
+    if (scroll && !scroll.effect) {
+      requestAnimationFrame(() => {
+        if (this.live !== v) return;
+        v.scrollDOM.scrollTop = scroll.top;
+        v.scrollDOM.scrollLeft = scroll.left;
+      });
+    }
+  }
+
+  /**
+   * Underlines [from, to) as the place a statement failed (v0.15); hovering shows `message`. Cleared by the next
+   * edit or `clearErrorMark`. `caret`: also put the caret there and scroll to it.
+   */
+  setErrorMark(from: number, to: number, message: string, caret = false): void {
+    const len = this.state.doc.length;
+    const f = Math.max(0, Math.min(len, from));
+    const t = Math.max(f, Math.min(len, to));
+    this.dispatch({
+      effects: setErrorMarkEffect.of(t > f ? { from: f, to: t, message } : null),
+      ...(caret ? { selection: { anchor: f }, scrollIntoView: true } : {}),
+    });
+  }
+
+  clearErrorMark(): void {
+    if (this.state.field(errorMarkField, false)) this.dispatch({ effects: setErrorMarkEffect.of(null) });
+  }
+
+  /** The current error mark (null = none). */
+  get errorMark(): { from: number; to: number; message: string } | null {
+    return this.state.field(errorMarkField, false) ?? null;
+  }
+
   setSchema(schema: Record<string, string[]>, driver: Driver): void {
     this.schema = schema;
     this.driver = driver;
-    this.view.dispatch({ effects: [this.lang.reconfigure(this.langExtension()), setRunDriver.of(driver)] });
+    this.dispatch({ effects: [this.lang.reconfigure(this.langExtension()), setRunDriver.of(driver)] });
   }
 
   focus(): void {
@@ -827,7 +990,7 @@ export class SqlEditor {
 
   /** Recomputes the cross-source marks (attached sources changed). */
   refreshFedMarks(): void {
-    this.view.dispatch({ effects: refreshFed.of(null) });
+    this.dispatch({ effects: refreshFed.of(null) });
   }
 
   /** Document offset under a viewport point (drops), or null outside the text. */
@@ -837,8 +1000,8 @@ export class SqlEditor {
 
   /** Inserts `text` at `pos` (a drop) as its own undo step, caret after it. */
   insertAt(pos: number, text: string): void {
-    const p = Math.max(0, Math.min(this.view.state.doc.length, pos));
-    this.view.dispatch({
+    const p = Math.max(0, Math.min(this.state.doc.length, pos));
+    this.dispatch({
       changes: { from: p, to: p, insert: text },
       selection: { anchor: p + text.length },
       scrollIntoView: true,
@@ -851,7 +1014,8 @@ export class SqlEditor {
   destroy(): void {
     this.offSettings?.();
     this.offSettings = null;
-    this.view.destroy();
+    this.live?.destroy();
+    this.live = null;
   }
 }
 

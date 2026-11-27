@@ -6,6 +6,7 @@
 
 use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,12 +27,19 @@ const DEFAULT_OPENAI_MODEL: &str = "gpt-4o-mini";
 /// Prefix of the error a cancelled request fails with (the UI drops it silently).
 pub const CANCELLED: &str = "AI_CANCELLED";
 
-/// Running request (id + cancel sender) and an in-memory fallback for the API key when no keychain exists.
+/// Model catalogs are cached this long (per provider + base URL).
+const MODELS_TTL: Duration = Duration::from_secs(600);
+/// A model-listing CLI (`opencode models`, `codex debug models`) gets this long.
+const MODELS_CLI_SECS: u64 = 15;
+
+/// Running request (id + cancel sender), an in-memory fallback for the API key when no keychain exists and the
+/// model catalog cache.
 #[derive(Default)]
 pub struct AiState {
     running: Mutex<Option<(u64, oneshot::Sender<()>)>>,
     next_id: AtomicU64,
     mem_key: Mutex<Option<String>>,
+    models: Mutex<HashMap<String, (Instant, AiModels)>>,
 }
 
 impl AiState {
@@ -94,6 +102,10 @@ pub struct AiRequest {
     pub current_sql: Option<String>,
     #[serde(default)]
     pub error: Option<String>,
+    /// The request may need tables of other data sources: the schema context then holds the cross-source
+    /// rules (`source.database.table`, SQLite outer query) and the involved sources' schemas.
+    #[serde(default)]
+    pub cross_source: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,6 +115,29 @@ pub struct AiResult {
     pub explanation: Option<String>,
     pub elapsed_ms: u64,
     pub provider: String,
+}
+
+/// One entry of a provider's model catalog.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiModel {
+    /// What goes to `--model` / the API.
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// e.g. "suggested", "from config.toml".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiModels {
+    pub models: Vec<AiModel>,
+    /// Where the list came from, e.g. "`opencode models`".
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 // ------------------------------------------------------------------ commands
@@ -259,6 +294,68 @@ pub async fn ai_generate(state: State<'_, AiState>, request: AiRequest) -> AppRe
     })
 }
 
+/// The model catalog of a provider (cached 10 min; `refresh` reloads). Never fails: problems go to `error`
+/// with whatever could still be listed (Codex: config + suggested models).
+#[tauri::command]
+pub async fn ai_models(
+    state: State<'_, AiState>,
+    provider: String,
+    base_url: Option<String>,
+    refresh: Option<bool>,
+) -> AppResult<AiModels> {
+    let base = base_url
+        .map(|b| b.trim().trim_end_matches('/').to_string())
+        .filter(|b| !b.is_empty());
+    let key = format!("{}|{}", provider, base.as_deref().unwrap_or(""));
+    if refresh != Some(true) {
+        let cache = state.models.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, m)) = cache.get(&key) {
+            if at.elapsed() < MODELS_TTL {
+                return Ok(m.clone());
+            }
+        }
+    }
+    let out = match provider.as_str() {
+        "opencode" => opencode_models().await,
+        "codex" => codex_models().await,
+        "claude" => claude_models(),
+        "openai" => openai_models(base.as_deref(), state.api_key()).await,
+        "ollama" => match ollama_models().await {
+            Some(list) => AiModels {
+                models: list
+                    .into_iter()
+                    .map(|id| AiModel {
+                        id,
+                        label: None,
+                        note: None,
+                    })
+                    .collect(),
+                source: "Ollama /api/tags".into(),
+                error: None,
+            },
+            None => AiModels {
+                models: Vec::new(),
+                source: "Ollama /api/tags".into(),
+                error: Some("Ollama is not running on 127.0.0.1:11434".into()),
+            },
+        },
+        other => AiModels {
+            models: Vec::new(),
+            source: String::new(),
+            error: Some(format!("Unknown AI provider \"{}\"", other)),
+        },
+    };
+    // Failures are not cached for long: a refresh after fixing the setup should work at once.
+    if out.error.is_none() || !out.models.is_empty() {
+        state
+            .models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (Instant::now(), out.clone()));
+    }
+    Ok(out)
+}
+
 /// Cancels the running request (the CLI process is killed, the HTTP request dropped).
 #[tauri::command]
 pub async fn ai_cancel(state: State<'_, AiState>) -> AppResult<()> {
@@ -334,7 +431,15 @@ fn build_prompt(r: &AiRequest) -> String {
         .map(str::to_string)
         .unwrap_or_else(|| dialect_name(&r.driver).to_string());
     let mut p = String::new();
-    if r.mode == "explain" {
+    if r.cross_source && r.mode != "explain" {
+        p.push_str(&format!(
+            "You write SQL for DataTrip, a database IDE. This console is on {}.\n\
+             The request may need tables of other data sources. If it does, write ONE cross-source SELECT that \
+             follows the cross-source rules below (its outer query runs in SQLite). If it only needs this \
+             console's data source, write a normal {} query instead.\n{}\n",
+            dialect, dialect, SYSTEM_RULES
+        ));
+    } else if r.mode == "explain" {
         p.push_str(&format!(
             "You explain {} SQL for DataTrip, a database IDE.\n\
              Explain in plain language, in at most three short sentences and without code blocks, what the SQL \
@@ -980,8 +1085,359 @@ mod tests {
     }
 
     #[test]
+    fn parses_opencode_models() {
+        let m = parse_opencode_models(
+            "Loading…\nanthropic/claude-sonnet-4-5\nopenai/gpt-5.1\n\nWARN something odd\nopencode/big-pickle\n",
+        );
+        let ids: Vec<&str> = m.iter().map(|x| x.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "anthropic/claude-sonnet-4-5",
+                "openai/gpt-5.1",
+                "opencode/big-pickle"
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_codex_models() {
+        let json = r#"{"models":[{"slug":"gpt-6.2-sol","display_name":"GPT-6.2 Sol"},{"slug":"x-1","visibility":"hide"},{"id":"gpt-6-luna"}]}"#;
+        let ids: Vec<String> = parse_codex_models(json).into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, ["gpt-6.2-sol", "gpt-6-luna"]);
+        let ids: Vec<String> =
+            parse_codex_models("Models:\n- gpt-6.2-sol (default)\n- gpt-6-luna\n")
+                .into_iter()
+                .map(|m| m.id)
+                .collect();
+        assert_eq!(ids, ["gpt-6.2-sol", "gpt-6-luna"]);
+    }
+
+    #[test]
+    fn parses_toml_model() {
+        assert_eq!(
+            parse_toml_model("# c\nmodel = \"gpt-6.2-sol\"\n[profiles.x]\nmodel = \"y\"\n"),
+            Some("gpt-6.2-sol".into())
+        );
+        assert_eq!(parse_toml_model("[a]\nmodel = \"y\""), None);
+        assert_eq!(parse_toml_model("model_reasoning_effort = \"high\""), None);
+    }
+
+    #[test]
     fn unterminated_fence() {
         let (sql, _) = extract_sql("```postgresql\nSELECT 3;");
         assert_eq!(sql, "SELECT 3;");
     }
+}
+
+// ------------------------------------------------------------------ model catalogs
+
+/// Codex models offered when the CLI can't list its catalog (ChatGPT sign-in names, Nov 2026).
+const CODEX_SUGGESTED: &[(&str, &str)] = &[
+    ("gpt-6.2-sol", "GPT-6.2 Sol"),
+    ("gpt-6.2-astra", "GPT-6.2 Astra"),
+    ("gpt-6.1-sol", "GPT-6.1 Sol"),
+    ("gpt-6-luna", "GPT-6 Luna"),
+];
+
+/// Claude Code `--model` aliases, then pinned model ids.
+const CLAUDE_MODELS: &[(&str, &str, &str)] = &[
+    ("sonnet", "Sonnet (latest)", "alias"),
+    ("opus", "Opus (latest)", "alias"),
+    ("haiku", "Haiku (latest)", "alias"),
+    ("opusplan", "Opus to plan, Sonnet to write", "alias"),
+    ("claude-opus-5-5", "Claude Opus 5.5", "pinned"),
+    ("claude-haiku-5-5", "Claude Haiku 5.5", "pinned"),
+];
+
+fn model_entry(id: &str, label: Option<&str>, note: Option<&str>) -> AiModel {
+    AiModel {
+        id: id.to_string(),
+        label: label.map(str::to_string),
+        note: note.map(str::to_string),
+    }
+}
+
+fn claude_models() -> AiModels {
+    AiModels {
+        models: CLAUDE_MODELS
+            .iter()
+            .map(|&(id, label, note)| model_entry(id, Some(label), Some(note)))
+            .collect(),
+        source: "Claude Code model aliases".into(),
+        error: None,
+    }
+}
+
+/// Runs a model-listing CLI with no stdin, in a temp dir, capped at 15 s.
+async fn list_cli(bin: &Path, args: &[String]) -> Result<CliOutput, String> {
+    let dir = TempDir::new().map_err(|e| e.message)?;
+    match tokio::time::timeout(
+        Duration::from_secs(MODELS_CLI_SECS),
+        run_cli(bin, args, &dir.0, ""),
+    )
+    .await
+    {
+        Ok(Ok(out)) => Ok(out),
+        Ok(Err(e)) => Err(e.message),
+        Err(_) => Err(format!("timed out after {} s", MODELS_CLI_SECS)),
+    }
+}
+
+/// `provider/model` lines of `opencode models` (other output — banners, warnings — is skipped).
+pub fn parse_opencode_models(stdout: &str) -> Vec<AiModel> {
+    let mut out: Vec<AiModel> = Vec::new();
+    for line in stdout.lines() {
+        let t = line.trim();
+        let ok = !t.is_empty()
+            && !t.contains(char::is_whitespace)
+            && t.contains('/')
+            && !t.starts_with('/')
+            && !t.ends_with('/')
+            && !t.contains("://")
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "/._-:@+[]".contains(c));
+        if ok && !out.iter().any(|m| m.id == t) {
+            out.push(model_entry(t, None, None));
+        }
+    }
+    out
+}
+
+async fn opencode_models() -> AiModels {
+    let source = "`opencode models`".to_string();
+    let bin = match find_binary("opencode") {
+        Some(b) => b,
+        None => {
+            return AiModels {
+                models: Vec::new(),
+                source,
+                error: Some("OpenCode CLI not found".into()),
+            }
+        }
+    };
+    match list_cli(&bin, &["models".to_string()]).await {
+        Ok(out) => {
+            let models = parse_opencode_models(&out.stdout);
+            let error = if models.is_empty() {
+                Some(if out.ok {
+                    "`opencode models` listed no models — run `opencode auth login`".to_string()
+                } else {
+                    format!("`opencode models` failed: {}", tail(&out.stderr, 300))
+                })
+            } else {
+                None
+            };
+            AiModels {
+                models,
+                source,
+                error,
+            }
+        }
+        Err(e) => AiModels {
+            models: Vec::new(),
+            source,
+            error: Some(format!("`opencode models` failed: {}", e)),
+        },
+    }
+}
+
+fn looks_like_model_id(t: &str) -> bool {
+    (3..=80).contains(&t.len())
+        && t.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && t.chars().any(|c| c.is_ascii_digit() || c == '-')
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-:/".contains(c))
+}
+
+/// Model ids of `codex debug models`: JSON (objects with `slug` / `id` / `model`, label from `display_name`;
+/// entries with `visibility: "hide"` skipped), else lines that look like model ids.
+pub fn parse_codex_models(stdout: &str) -> Vec<AiModel> {
+    fn walk(v: &serde_json::Value, out: &mut Vec<AiModel>) {
+        match v {
+            serde_json::Value::Array(a) => {
+                for x in a {
+                    walk(x, out);
+                }
+            }
+            serde_json::Value::Object(o) => {
+                let id = ["slug", "id", "model"]
+                    .iter()
+                    .find_map(|k| o.get(*k).and_then(|x| x.as_str()));
+                if let Some(id) = id.map(str::trim).filter(|s| looks_like_model_id(s)) {
+                    let hidden = o.get("visibility").and_then(|x| x.as_str()) == Some("hide");
+                    if !hidden && !out.iter().any(|m| m.id == id) {
+                        let label = o
+                            .get("display_name")
+                            .or_else(|| o.get("displayName"))
+                            .and_then(|x| x.as_str())
+                            .filter(|l| !l.trim().is_empty() && *l != id);
+                        out.push(model_entry(id, label, None));
+                    }
+                    return;
+                }
+                for x in o.values() {
+                    walk(x, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out: Vec<AiModel> = Vec::new();
+    let t = stdout.trim();
+    let json_start = t.find(['{', '[']);
+    if let Some(i) = json_start {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&t[i..]) {
+            walk(&v, &mut out);
+            return out;
+        }
+    }
+    for line in t.lines() {
+        let w = line.trim().trim_start_matches(['-', '*', ' ']).trim();
+        let w = w.split_whitespace().next().unwrap_or("");
+        if looks_like_model_id(w) && !out.iter().any(|m| m.id == w) {
+            out.push(model_entry(w, None, None));
+        }
+    }
+    out
+}
+
+/// `model = "…"` of `$CODEX_HOME/config.toml` (default `~/.codex`), top level only.
+fn codex_config_model() -> Option<String> {
+    let dir = std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join(".codex")))?;
+    let text = std::fs::read_to_string(dir.join("config.toml")).ok()?;
+    parse_toml_model(&text)
+}
+
+pub fn parse_toml_model(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            break;
+        }
+        let rest = match t.strip_prefix("model") {
+            Some(r) => r.trim_start(),
+            None => continue,
+        };
+        let rest = match rest.strip_prefix('=') {
+            Some(r) => r.trim(),
+            None => continue,
+        };
+        let q = rest.chars().next()?;
+        if q != '"' && q != '\'' {
+            continue;
+        }
+        let body = &rest[1..];
+        if let Some(end) = body.find(q) {
+            let m = body[..end].trim();
+            if !m.is_empty() {
+                return Some(m.to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn codex_models() -> AiModels {
+    let error: Option<String> = match find_binary("codex") {
+        None => Some("Codex CLI not found".into()),
+        Some(bin) => {
+            let args = vec!["debug".to_string(), "models".to_string()];
+            match list_cli(&bin, &args).await {
+                Ok(out) if out.ok => {
+                    let models = parse_codex_models(&out.stdout);
+                    if !models.is_empty() {
+                        return AiModels {
+                            models,
+                            source: "`codex debug models`".into(),
+                            error: None,
+                        };
+                    }
+                    Some("`codex debug models` listed no models".into())
+                }
+                Ok(out) => Some(format!(
+                    "`codex debug models` isn't available in this Codex version ({})",
+                    tail(&out.stderr, 200)
+                )),
+                Err(e) => Some(format!("`codex debug models` failed: {}", e)),
+            }
+        }
+    };
+    let mut models: Vec<AiModel> = Vec::new();
+    if let Some(m) = codex_config_model() {
+        models.push(model_entry(&m, None, Some("from config.toml")));
+    }
+    for &(id, label) in CODEX_SUGGESTED {
+        if !models.iter().any(|m| m.id == id) {
+            models.push(model_entry(id, Some(label), Some("suggested")));
+        }
+    }
+    AiModels {
+        models,
+        source: "Codex config + suggested models".into(),
+        error,
+    }
+}
+
+async fn openai_models(base_url: Option<&str>, api_key: Option<String>) -> AiModels {
+    let base = base_url.unwrap_or(OPENAI_URL).to_string();
+    let source = format!("{}/models", base);
+    let key = match api_key {
+        Some(k) => k,
+        None => {
+            return AiModels {
+                models: Vec::new(),
+                source,
+                error: Some("No API key set".into()),
+            }
+        }
+    };
+    let result = fetch_openai_models(&source, &base, key).await;
+    match result {
+        Ok(models) => AiModels {
+            models,
+            source,
+            error: None,
+        },
+        Err(e) => AiModels {
+            models: Vec::new(),
+            source,
+            error: Some(e),
+        },
+    }
+}
+
+async fn fetch_openai_models(url: &str, base: &str, key: String) -> Result<Vec<AiModel>, String> {
+    let client = http_client(Duration::from_secs(MODELS_CLI_SECS)).map_err(|e| e.message)?;
+    let resp = client
+        .get(url)
+        .bearer_auth(key)
+        .send()
+        .await
+        .map_err(|e| format!("Could not reach {}: {}", base, e))?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "The API answered {}: {}",
+            status.as_u16(),
+            http_error_text(&text)
+        ));
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let mut out: Vec<AiModel> = Vec::new();
+    if let Some(list) = v.get("data").and_then(|d| d.as_array()) {
+        for m in list {
+            if let Some(id) = m.get("id").and_then(|x| x.as_str()) {
+                if !out.iter().any(|x| x.id == id) {
+                    out.push(model_entry(id, None, None));
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(out)
 }

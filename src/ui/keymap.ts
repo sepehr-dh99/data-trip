@@ -25,7 +25,11 @@ export type ActionId =
   | "jumpToTab"
   | "toggleSidebar"
   | "commandPalette"
-  | "askAi";
+  | "askAi"
+  | "saveFile"
+  | "saveFileAs"
+  | "openFile"
+  | "help";
 
 export interface ActionInfo {
   id: ActionId;
@@ -54,6 +58,10 @@ export const ACTIONS: ActionInfo[] = [
   { id: "toggleSidebar", name: "Toggle sidebar" },
   { id: "commandPalette", name: "Command palette" },
   { id: "askAi", name: "Ask AI" },
+  { id: "saveFile", name: "Save SQL file" },
+  { id: "saveFileAs", name: "Save SQL file as…" },
+  { id: "openFile", name: "Open SQL file…" },
+  { id: "help", name: "Help" },
 ];
 
 type Table = Record<ActionId, string>;
@@ -78,6 +86,10 @@ const DATATRIP: Table = {
   toggleSidebar: "Mod-B",
   commandPalette: "Mod-K",
   askAi: "Mod-I",
+  saveFile: "Mod-S",
+  saveFileAs: "Mod-Shift-S",
+  openFile: "Mod-O",
+  help: "F1",
 };
 
 export const PRESETS: Record<KeymapPreset, Table> = {

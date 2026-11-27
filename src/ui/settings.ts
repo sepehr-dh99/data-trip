@@ -19,12 +19,21 @@ export type KeymapPreset = "datatrip" | "datagrip" | "vscode";
 export type HistoryDays = 30 | 90 | 365 | 0;
 export type AiProvider = "codex" | "claude" | "opencode" | "openai" | "ollama";
 
+export interface FileTarget {
+  connId: string;
+  database: string | null;
+}
+
 export interface CustomTabGroup {
   id: string;
   name: string;
   color: string;
   members: string[];
 }
+
+/** v0.15: idle-disconnect choices (Settings › Data & history); 0 = never. */
+export type IdleMinutes = 0 | 5 | 15 | 30 | 60 | 120;
+export const IDLE_MINUTES: IdleMinutes[] = [5, 15, 30, 60, 120, 0];
 
 export interface AppSettings {
   editor: {
@@ -67,6 +76,8 @@ export interface AppSettings {
     restoreConsoles: boolean;
     confirmRisky: boolean;
     autoReconnect: boolean;
+    /** v0.15: close a console's database session after this many idle minutes (0 = never). */
+    idleDisconnectMinutes: IdleMinutes;
   };
   /** In-app updates (v0.14). */
   updates: {
@@ -78,6 +89,18 @@ export interface AppSettings {
     prerelease: boolean;
     /** Version the user dismissed with "Later" (not offered again until a newer one). */
     skipped: string;
+  };
+  /** SQL files (v0.15): recently opened / saved files and the data source each was last used with. */
+  files: {
+    /** Most recent first, max 10. */
+    recent: string[];
+    /** File path → data source + database to run it against (max 200). */
+    targets: Record<string, FileTarget>;
+  };
+  /** Help (v0.15). */
+  help: {
+    /** The welcome tour was finished or skipped. */
+    tourDone: boolean;
   };
   /** AI assistant in SQL consoles (v0.12). */
   ai: {
@@ -121,8 +144,10 @@ export function defaultSettings(): AppSettings {
     results: { pageSize: 500, borders: true, typeColors: true, countRows: false, nullText: "NULL", maxColWidth: 320 },
     tabs: { placement: "top", sort: "manual", group: "source", naming: "table", customGroups: [], pinned: [] },
     keymap: { preset: "datatrip", overrides: {} },
-    data: { historyDays: 90, restoreConsoles: true, confirmRisky: true, autoReconnect: true },
+    data: { historyDays: 90, restoreConsoles: true, confirmRisky: true, autoReconnect: true, idleDisconnectMinutes: 15 },
     updates: { auto: true, background: false, prerelease: false, skipped: "" },
+    files: { recent: [], targets: {} },
+    help: { tourDone: false },
     ai: { provider: "codex", model: "", baseUrl: "", ollamaModel: "", autoTables: true, samples: false, blockProd: true },
   };
 }
@@ -150,6 +175,15 @@ export function mergeSettings(raw: unknown): AppSettings {
   const x = isObj(raw.data) ? raw.data : {};
   const ai = isObj(raw.ai) ? raw.ai : {};
   const up = isObj(raw.updates) ? raw.updates : {};
+  const fl = isObj(raw.files) ? raw.files : {};
+  const hp = isObj(raw.help) ? raw.help : {};
+  const targets: Record<string, FileTarget> = {};
+  if (isObj(fl.targets)) {
+    for (const path of Object.keys(fl.targets).slice(-200)) {
+      const t = fl.targets[path];
+      if (isObj(t) && typeof t.connId === "string") targets[path] = { connId: t.connId, database: typeof t.database === "string" ? t.database : null };
+    }
+  }
 
   const tokenColors: Partial<Record<TokenKey, string>> = {};
   if (isObj(e.tokenColors)) {
@@ -213,6 +247,7 @@ export function mergeSettings(raw: unknown): AppSettings {
       restoreConsoles: bool(x.restoreConsoles, d.data.restoreConsoles),
       confirmRisky: bool(x.confirmRisky, d.data.confirmRisky),
       autoReconnect: bool(x.autoReconnect, d.data.autoReconnect),
+      idleDisconnectMinutes: oneOf<IdleMinutes>(x.idleDisconnectMinutes, IDLE_MINUTES, d.data.idleDisconnectMinutes),
     },
     updates: {
       auto: bool(up.auto, d.updates.auto),
@@ -220,6 +255,11 @@ export function mergeSettings(raw: unknown): AppSettings {
       prerelease: bool(up.prerelease, d.updates.prerelease),
       skipped: str(up.skipped, d.updates.skipped),
     },
+    files: {
+      recent: Array.isArray(fl.recent) ? fl.recent.filter((p): p is string => typeof p === "string" && p !== "").slice(0, 10) : [],
+      targets,
+    },
+    help: { tourDone: bool(hp.tourDone, d.help.tourDone) },
     ai: {
       provider: oneOf<AiProvider>(ai.provider, ["codex", "claude", "opencode", "openai", "ollama"], d.ai.provider),
       model: str(ai.model, d.ai.model).trim(),

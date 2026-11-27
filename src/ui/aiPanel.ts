@@ -27,6 +27,10 @@ import {
   samplesAllowed,
 } from "./ai";
 import type { SchemaContext } from "./ai";
+import { buildCrossContext, checkCrossSql, detectCrossSource, refinePrompt, sourcesSection } from "./aiCross";
+import type { AiSourceInfo, CrossDetect } from "./aiCross";
+import { routeStatement, sourceRef } from "./federation";
+import type { CatalogSource, RouteContext } from "./federation";
 import { acceptPending, pendingOf, pendingText, rejectKeepTarget, rejectPending, showDiff, showInsertion } from "./aiEditor";
 import type { AiBarModel } from "./aiEditor";
 
@@ -51,6 +55,22 @@ export interface AiConsoleHost {
   focus(): void;
   /** This console is the visible tab (the app's Ask AI command / menu item goes to it). */
   isActive(): boolean;
+  /** v0.15 cross-source: every SQL data source of the connection list. */
+  catalog(): CatalogSource[];
+  /** How the console routes a statement (CONTRACT v0.13). */
+  routeCtx(): RouteContext;
+  /** Database an attached source reads from (null = its default / not attached). */
+  sourceDatabase(connId: string): string | null;
+  /** Connects a source in the explorer and loads that database's introspection; true when ready. */
+  loadSource(connId: string, database: string | null): Promise<boolean>;
+}
+
+/** The cross-source side of one request: what was detected and the sources' info after loading. */
+interface CrossPlan {
+  det: CrossDetect;
+  /** Own source first, then the involved ones. */
+  involved: AiSourceInfo[];
+  all: AiSourceInfo[];
 }
 
 // The app dispatches `dt-action` { id: "askAi" } on window for ⌘I, the command palette and the menu; the
@@ -300,6 +320,29 @@ export class AiAssist {
       const shown = names.slice(0, 4).join(", ") + (names.length > 4 ? ` +${names.length - 4}` : "");
       tables = h("span", { class: "ai-chip", title: names.join(", ") }, `Tables: ${shown}`, ctx.picked ? h("span", { class: "ai-dim" }, " (picked from your question)") : h("span", { class: "ai-dim" }, " (whole schema)"));
     }
+    // v0.15: other data sources the request involves (cached metadata only; loaded when the request is sent)
+    const crossChips: HTMLElement[] = [];
+    const plan = this.crossPlan(this.contextText(), this.currentSqlForContext());
+    if (plan.det.cross) {
+      const others = plan.involved.filter((x) => !x.own);
+      const why = others.map((x) => `${x.name} (${x.ref}) — ${plan.det.reasons[x.connId] ?? "named"}`).join("\n");
+      crossChips.push(
+        h(
+          "span",
+          { class: "ai-chip ai-cross", title: (why ? why + "\n" : "") + "Writes a cross-source query (source.database.table, runs in SQLite) when the request needs it" },
+          others.length ? `Across: ${others.map((x) => x.ref).slice(0, 3).join(" · ")}${others.length > 3 ? ` +${others.length - 3}` : ""}` : "Across data sources",
+        ),
+      );
+      const ct = buildCrossContext(plan.involved, this.contextText(), s.ai.autoTables);
+      if (ct.tables.length) {
+        const names = ct.tables.map((t) => `${t.ref}.${t.table.name}`);
+        tables = h("span", { class: "ai-chip", title: names.join(", ") }, `Tables: ${names.slice(0, 3).join(", ")}${names.length > 3 ? ` +${names.length - 3}` : ""}`, h("span", { class: "ai-dim" }, " (from each source)"));
+      }
+    }
+    for (const b of plan.det.blocked) {
+      const e = store.conns.get(b.connId);
+      crossChips.push(chip(`${e?.config.name ?? "Source"}: AI blocked`, "warn", b.essential ? "Production data source with “Block AI for production data sources” on — the request can't be sent while it names this source" : "Production data source with “Block AI for production data sources” on — its schema isn't sent"));
+    }
     const samples = samplesAllowed(conn, s);
     const data = samples ? chip("Schema + 20 sample rows", "amber", "Sample rows of up to 3 tables are sent (Settings › AI assistant)") : chip("Schema only · no row data", "ok", "Only table and column names and types are sent");
     const status = this.providers.find((p) => p.id === s.ai.provider);
@@ -308,7 +351,7 @@ export class AiAssist {
       { class: "ai-chip ai-prov" + (status && !status.available ? " warn" : ""), type: "button", title: status ? status.detail : "Settings › AI assistant", onclick: () => openSettings("ai") },
       status && !status.available ? `${providerShort(s.ai.provider)} · not set up` : providerChip(s, status),
     );
-    el.replaceChildren(src, tables, data, h("span", { class: "spacer" }), prov);
+    el.replaceChildren(src, ...crossChips, tables, data, h("span", { class: "spacer" }), prov);
   }
 
   private setRunningUi(on: boolean, text = ""): void {
@@ -362,21 +405,107 @@ export class AiAssist {
 
   // ---------------------------------------------------------------- generation
 
-  private async request(mode: AiMode, prompt: string, currentSql: string | null, error: string | null, ctxText: string): Promise<{ result: AiResult; tables: number }> {
+  // ---------------------------------------------------------------- cross-source context (v0.15)
+
+  /** Every SQL data source as the assistant sees it (explorer cache; nothing is loaded). */
+  private sourceInfos(): AiSourceInfo[] {
+    const cat = this.host.catalog();
+    const ownId = this.host.connId();
+    return cat.map((c) => {
+      const e = store.conns.get(c.connId);
+      const own = c.connId === ownId;
+      const att = own ? null : this.host.sourceDatabase(c.connId);
+      return {
+        connId: c.connId,
+        name: c.name,
+        driver: c.driver,
+        ref: sourceRef(c, cat),
+        database: own ? this.host.database() : c.driver === "sqlite" ? null : (att ?? e?.defaultDb ?? null),
+        databases: (e?.databases ?? []).map((d) => ({ name: d.name, isSystem: d.isSystem })),
+        schemas: own ? this.host.schemas() : store.schemasFor(c.connId, att),
+        defaultSchema: own ? this.host.defaultSchema() : store.defaultSchemaFor(c.connId, att),
+        own,
+        blocked: !own && aiBlockedReason(e?.config) !== null,
+      };
+    });
+  }
+
+  /** The SQL a refine / fix / explain is about (its sources count as involved). */
+  private currentSqlForContext(): string | null {
+    if (this.boxKind === "refine") return pendingText(this.host.view().state);
+    if (this.fixContext) return this.fixContext.sql;
+    return null;
+  }
+
+  /** Detection over cached metadata: which other sources the request (and its SQL) involve. */
+  private crossPlan(text: string, sql: string | null): CrossPlan {
+    const all = this.sourceInfos();
+    let uses: string[] = [];
+    if (sql) {
+      const r = routeStatement(sql, this.host.routeCtx());
+      if (r.kind === "federated") uses = [...new Set(r.uses.map((u) => u.connId))];
+    }
+    const det = detectCrossSource(text, all, uses);
+    const own = all.find((x) => x.own);
+    const involved = [...(own ? [own] : []), ...all.filter((x) => det.involved.includes(x.connId))];
+    return { det, involved, all };
+  }
+
+  /** Refuses a request that names a blocked (production) source; null when it may go. */
+  private blockedMessage(det: CrossDetect): string | null {
+    const b = det.blocked.find((x) => x.essential);
+    if (!b) return null;
+    const name = store.conns.get(b.connId)?.config.name ?? "That data source";
+    return `“${name}” is a production data source and “Block AI for production data sources” is on, so the assistant can't use it. Leave it out of the request, or change the setting in Settings › AI assistant.`;
+  }
+
+  private async request(
+    mode: AiMode,
+    prompt: string,
+    currentSql: string | null,
+    error: string | null,
+    ctxText: string,
+  ): Promise<{ result: AiResult; tables: number; cross: CrossPlan | null }> {
     const s = getSettings();
     await this.host.ensureSchemas();
-    const ctx = this.schemaContext(ctxText);
-    let schemaText = ctx.text;
+    // v0.15: the request may need other data sources — load their schemas lazily (explorer connect + introspect).
+    let plan: CrossPlan | null = this.crossPlan(ctxText, currentSql);
+    const refusal = this.blockedMessage(plan.det);
+    if (refusal) throw new Error(refusal);
+    if (!plan.det.cross) plan = null;
+    else {
+      const others = plan.involved.filter((x) => !x.own);
+      await Promise.all(others.map((x) => this.host.loadSource(x.connId, this.host.sourceDatabase(x.connId)).catch(() => false)));
+      const all = this.sourceInfos();
+      plan = { det: plan.det, all, involved: plan.involved.map((x) => all.find((y) => y.connId === x.connId) ?? x) };
+    }
+    const list = sourcesSection(plan ? plan.all : this.sourceInfos());
+    let schemaText: string;
+    let count: number;
+    let sampleTables: { schema: string; name: string }[];
+    if (plan) {
+      const ct = buildCrossContext(plan.involved, ctxText, s.ai.autoTables);
+      schemaText = ct.text;
+      count = ct.tables.length;
+      // Samples only from the console's own source (on its session), never from the others.
+      sampleTables = ct.tables.filter((t) => t.connId === this.host.connId()).map((t) => ({ schema: t.schema, name: t.table.name }));
+    } else {
+      const ctx = this.schemaContext(ctxText);
+      schemaText = ctx.text;
+      count = ctx.tables.length;
+      sampleTables = ctx.tables.map((t) => ({ schema: t.schema, name: t.table.name }));
+    }
     if (samplesAllowed(this.conn(), s) && mode !== "explain") {
-      for (const t of ctx.tables.slice(0, SAMPLE_TABLES)) {
+      for (const t of sampleTables.slice(0, SAMPLE_TABLES)) {
         try {
-          const res = await this.host.sample(sampleSql(this.host.driver(), t.schema, t.table.name));
-          schemaText += "\n\n" + renderSamples(this.host.driver(), t.schema, t.table.name, res);
+          const res = await this.host.sample(sampleSql(this.host.driver(), t.schema, t.name));
+          schemaText += "\n\n" + renderSamples(this.host.driver(), t.schema, t.name, res);
         } catch {
           /* a table we can't read just goes without samples */
         }
       }
     }
+    if (list) schemaText = list + "\n\n" + schemaText;
     const version = this.host.serverVersion();
     const dialect = DIALECT_NAMES[this.host.driver()] ?? "SQL";
     const req: AiRequest = {
@@ -390,9 +519,31 @@ export class AiAssist {
       schemaContext: schemaText,
       currentSql,
       error,
+      crossSource: plan !== null,
     };
     const result = await api.aiGenerate(req);
-    return { result, tables: ctx.tables.length };
+    return { result, tables: count, cross: plan };
+  }
+
+  /**
+   * Generated SQL that runs (or tries to run) across sources is checked locally first; problems get ONE automatic
+   * refine round naming them. Returns the (possibly refined) result and what is still wrong.
+   */
+  private async checkCross(out: { result: AiResult; tables: number; cross: CrossPlan | null }, ctxText: string): Promise<{ out: { result: AiResult; tables: number; cross: CrossPlan | null }; left: string[] }> {
+    const plan = out.cross;
+    const sql = (out.result.sql ?? "").trim();
+    if (!plan || !sql) return { out, left: [] };
+    const named = Object.keys(plan.det.reasons).filter((id) => plan.det.reasons[id] === "named");
+    const first = checkCrossSql(sql, this.host.routeCtx(), plan.all, named);
+    if (first.problems.length === 0) return { out, left: [] };
+    const who = providerShort(getSettings().ai.provider);
+    this.setRunningUi(true, `${who} is fixing the cross-source query (${first.problems[0].split(" — ")[0]})…`);
+    const again = await this.request("refine", refinePrompt(first.problems), sql, null, ctxText + "\n" + sql);
+    const sql2 = (again.result.sql ?? "").trim();
+    if (!sql2) return { out, left: first.problems };
+    again.result.elapsedMs += out.result.elapsedMs;
+    const second = checkCrossSql(sql2, this.host.routeCtx(), (again.cross ?? plan).all, named);
+    return { out: { ...again, cross: again.cross ?? plan }, left: second.problems };
   }
 
   private async run(mode: AiMode, prompt: string): Promise<void> {
@@ -413,9 +564,12 @@ export class AiAssist {
     if (mode === "refine" && !currentSql) mode = "write";
     this.lastPrompt = mode === "fix" ? this.lastPrompt : prompt;
     this.setRunningUi(true, mode === "fix" ? `${who} is fixing the statement…` : mode === "refine" ? `${who} is refining…` : `${who} is writing SQL…`);
-    let out: { result: AiResult; tables: number };
+    let out: { result: AiResult; tables: number; cross: CrossPlan | null };
+    let left: string[] = [];
     try {
-      out = await this.request(mode, prompt, currentSql, error, this.contextText());
+      const ctxText = this.contextText();
+      out = await this.request(mode, prompt, currentSql, error, ctxText);
+      ({ out, left } = await this.checkCross(out, ctxText));
     } catch (e) {
       const msg = errMsg(e);
       this.setRunningUi(false);
@@ -459,6 +613,7 @@ export class AiAssist {
     }
     this.model = model;
     this.host.focus();
+    if (left.length) toast(`Check the cross-source query before running it: ${left[0]}`, "info", 8000);
   }
 
   // ---------------------------------------------------------------- action bar

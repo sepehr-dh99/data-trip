@@ -12,6 +12,7 @@ import { OIDC_REDIRECT_URI, fmtRemaining, isOidcCancel, statusText, statusTone, 
 import { openAssignDialog, usersOf } from "./vaultAssign";
 import { tokenInput } from "./vaultChips";
 import type { TokenInput } from "./vaultChips";
+import { helpHint } from "./help";
 
 export interface VaultDialogOpts {
   /** Profile to select (otherwise the first). */
@@ -71,6 +72,11 @@ export function openVaultProfilesDialog(opts: VaultDialogOpts = {}): void {
   shell.onNew = () => select("");
 
   const field = (label: string, input: HTMLElement): HTMLElement => h("label", { class: "field" }, h("span", { class: "field-label" }, label), input);
+  /** v0.15: ? hint after a field label (opens the Vault OIDC help article). */
+  const hinted = (f: HTMLElement, tip: string): HTMLElement => {
+    f.querySelector(".field-label")?.append(helpHint("vault-oidc", tip));
+    return f;
+  };
 
   function renderEditor(): void {
     const ed = shell.editor;
@@ -198,7 +204,12 @@ export function openVaultProfilesDialog(opts: VaultDialogOpts = {}): void {
     const oidcPane = h(
       "div",
       { class: "vault-stack" },
-      h("div", { class: "row2" }, field("Mount path", inMount), field("Role (optional)", inRole)),
+      h(
+        "div",
+        { class: "row2" },
+        hinted(field("Mount path", inMount), "Where the OIDC auth method is enabled in Vault (vault login -method=oidc -path=…); usually oidc."),
+        hinted(field("Role (optional)", inRole), "The Vault role to sign in with; empty uses the mount's default role."),
+      ),
       h("span", { class: "vault-hint" }, "Redirect URI ", h("span", { class: "mono oidc-uri" }, OIDC_REDIRECT_URI), " must be in the role’s allowed_redirect_uris (same as the vault CLI)."),
       oidcBox,
     );

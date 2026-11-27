@@ -24,6 +24,7 @@ import { showMenu } from "./menu";
 import { store } from "./state";
 import type { TabPane } from "./tabs";
 import { toast } from "./toast";
+import { errorHelpButton } from "./help";
 
 type FromMode = "latest" | "earliest" | "timestamp" | "offset";
 
@@ -597,7 +598,7 @@ export class TopicPane implements TabPane {
     clear(this.innerEl);
     if (this.error && n === 0) {
       this.bodyMsg.className = "kf-bodymsg show";
-      this.bodyMsg.append(h("div", { class: "r-message err", role: "alert" }, icon("alert", 20), h("div", { class: "r-message-title" }, "Could not read messages"), h("div", { class: "r-error-text" }, this.error)));
+      this.bodyMsg.append(h("div", { class: "r-message err", role: "alert" }, icon("alert", 20), h("div", { class: "r-message-title" }, "Could not read messages"), h("div", { class: "r-error-text" }, this.error), errorHelpButton(this.error)));
     } else if (this.loading && n === 0) {
       this.bodyMsg.className = "kf-bodymsg show";
       this.bodyMsg.append(h("div", { class: "r-wait", role: "status" }, h("span", { class: "spinner", "aria-hidden": "true" }), h("span", null, "Reading messages…")));

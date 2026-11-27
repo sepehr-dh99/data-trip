@@ -2,7 +2,7 @@
 // already-loaded metadata) and open tabs. Fuzzy filter, ↑↓ to move, ↵ to run, Esc to close.
 import { clear, h, icon } from "./dom";
 
-export type PaletteGroup = "Actions" | "Data sources" | "Tables" | "Open tabs";
+export type PaletteGroup = "Actions" | "Data sources" | "Tables" | "Open tabs" | "Recent files";
 
 export interface PaletteItem {
   group: PaletteGroup;
@@ -19,10 +19,10 @@ export interface PaletteItem {
   run: () => void;
 }
 
-const GROUP_ORDER: PaletteGroup[] = ["Actions", "Data sources", "Open tabs", "Tables"];
+const GROUP_ORDER: PaletteGroup[] = ["Actions", "Data sources", "Open tabs", "Recent files", "Tables"];
 /** Rows per group: without a query tables stay short; with one, enough to scroll. */
-const LIMIT_EMPTY: Record<PaletteGroup, number> = { Actions: 60, "Data sources": 12, "Open tabs": 12, Tables: 8 };
-const LIMIT_QUERY: Record<PaletteGroup, number> = { Actions: 30, "Data sources": 20, "Open tabs": 20, Tables: 60 };
+const LIMIT_EMPTY: Record<PaletteGroup, number> = { Actions: 60, "Data sources": 12, "Open tabs": 12, "Recent files": 5, Tables: 8 };
+const LIMIT_QUERY: Record<PaletteGroup, number> = { Actions: 30, "Data sources": 20, "Open tabs": 20, "Recent files": 10, Tables: 60 };
 
 /**
  * Fuzzy score of `text` for query `q` (both lower case): every query character must appear in order. Higher is

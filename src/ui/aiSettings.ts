@@ -1,7 +1,7 @@
 // Settings › AI assistant (board N, "AI settings" scene): provider cards with live status, model / key / endpoint
 // fields and the three privacy toggles. Built with the settings window's own row / toggle helpers.
 import { api } from "../api";
-import type { AiProviderId, AiProviderStatus } from "../types";
+import type { AiModel, AiModels, AiProviderId, AiProviderStatus } from "../types";
 import { errMsg, h } from "./dom";
 import { toast } from "./toast";
 import { getSettings, updateSettings } from "./settings";
@@ -88,13 +88,24 @@ export function buildAiSettings(kit: SettingsKit): SettingsItem[] {
     text: "ai assistant provider codex chatgpt claude code opencode openai api key ollama local model",
   };
 
-  // model (Codex / Claude Code / API)
-  const model = kit.textField("Model", () => S().ai.model, (v) => updateSettings((s) => (s.ai.model = v)), true, 220);
+  // model (Codex / Claude Code / OpenCode / API): a searchable picker over the provider's catalog
+  // (`ai_models`, v0.15) with "Default" and any typed custom value.
+  const model = kit.textField("Model", () => S().ai.model, (v) => updateSettings((s) => (s.ai.model = v)), true, 240);
+  const picker = modelPicker(model, () => {
+    const p = S().ai.provider;
+    return { provider: p, baseUrl: p === "openai" && S().ai.baseUrl ? S().ai.baseUrl : null };
+  });
   kit.onSync(() => {
     const p = S().ai.provider;
-    model.placeholder = p === "codex" ? "default (Codex config)" : p === "claude" ? "default" : "gpt-4o-mini";
+    model.placeholder = p === "openai" ? "gpt-4o-mini" : "Default";
+    picker.sync();
   });
-  const modelRow = kit.row("Model", "Leave empty for the provider’s default · OpenCode: provider/model, e.g. anthropic/claude-sonnet-4-5", model, "model gpt");
+  const modelRow = kit.row(
+    "Model",
+    "Pick from the provider’s models or type any id · empty = the provider’s default · OpenCode: provider/model",
+    picker.el,
+    "model gpt codex claude opencode sonnet opus haiku",
+  );
 
   // API key (write-only)
   const keyInput = h("input", { class: "st-input mono", type: "password", spellcheck: false, autocomplete: "off", "aria-label": "API key", placeholder: "sk-…", style: "width:220px" });
@@ -176,4 +187,184 @@ export function buildAiSettings(kit: SettingsKit): SettingsItem[] {
     "privacy production prod safety",
   );
   return [providers, modelRow, keyRow, baseRow, omRow, auto, samples, block];
+}
+
+// ---------------------------------------------------------------- model picker (v0.15)
+
+interface ModelPicker {
+  el: HTMLElement;
+  /** Settings changed (provider / base URL): reload the catalog when it is another one. */
+  sync(): void;
+}
+
+/** "anthropic/claude-sonnet-4-5" → "anthropic" (OpenCode groups); "" without a provider prefix. */
+function groupOf(id: string): string {
+  const i = id.indexOf("/");
+  return i > 0 ? id.slice(0, i) : "";
+}
+
+/**
+ * Searchable model picker around the settings text field: typing filters the list (and any typed value is kept
+ * as a custom model), "Default" clears it, ↻ reloads the catalog, the line below says where the list came from.
+ */
+function modelPicker(input: HTMLInputElement, target: () => { provider: AiProviderId; baseUrl: string | null }): ModelPicker {
+  let key = "";
+  let data: AiModels | null = null;
+  let loading = false;
+  let open = false;
+  let filterText = "";
+  let sel = -1;
+  let items: { id: string; el: HTMLElement }[] = [];
+  const list = h("div", { class: "ai-mp-list", role: "listbox", "aria-label": "Models", hidden: true });
+  const caret = h("button", { class: "ai-mp-caret", type: "button", tabindex: "-1", "aria-label": "Show models", title: "Show models" }, "▾");
+  const refreshBtn = h("button", { class: "st-pill ai-mp-refresh", type: "button", title: "Reload the model list" }, "↻");
+  const srcLine = h("div", { class: "ai-mp-src" });
+  input.setAttribute("role", "combobox");
+  input.setAttribute("aria-autocomplete", "list");
+  input.setAttribute("aria-expanded", "false");
+  const box = h("div", { class: "ai-mp-box" }, input, caret, list);
+  const el = h("div", { class: "ai-mp" }, h("div", { class: "st-ctl" }, box, refreshBtn), srcLine);
+
+  const paintSource = (): void => {
+    if (loading) {
+      srcLine.textContent = "Loading models…";
+      srcLine.className = "ai-mp-src";
+      return;
+    }
+    if (!data) {
+      srcLine.textContent = "";
+      return;
+    }
+    const n = data.models.length;
+    const from = data.source ? `from ${data.source}` : "";
+    srcLine.className = "ai-mp-src" + (data.error ? " warn" : "");
+    srcLine.textContent = [n ? `${n} model${n === 1 ? "" : "s"}` : "", from, data.error ?? ""].filter(Boolean).join(" · ");
+  };
+
+  const load = async (force: boolean): Promise<void> => {
+    const t = target();
+    const k = `${t.provider}|${t.baseUrl ?? ""}`;
+    if (!force && k === key && (data || loading)) return;
+    key = k;
+    loading = true;
+    paintSource();
+    let res: AiModels;
+    try {
+      res = await api.aiModels(t.provider, t.baseUrl, force);
+    } catch (e) {
+      res = { models: [], source: "", error: errMsg(e) };
+    }
+    if (key !== k) return; // the provider changed meanwhile
+    data = res;
+    loading = false;
+    paintSource();
+    if (open) render();
+  };
+
+  const choose = (id: string): void => {
+    input.value = id;
+    updateSettings((s) => (s.ai.model = id));
+    close();
+    input.focus();
+  };
+
+  const render = (): void => {
+    const q = filterText.trim().toLowerCase();
+    const models: AiModel[] = (data?.models ?? []).filter((m) => !q || m.id.toLowerCase().includes(q) || (m.label ?? "").toLowerCase().includes(q));
+    const cur = getSettings().ai.model;
+    const rows: HTMLElement[] = [];
+    items = [];
+    const item = (id: string, main: string, note: string | null): void => {
+      const row = h(
+        "div",
+        { class: "ai-mp-item" + (id === cur ? " on" : ""), role: "option", "aria-selected": String(id === cur) },
+        h("span", { class: "ai-mp-id" + (id ? " mono" : "") }, main),
+        note ? h("span", { class: "ai-mp-note" }, note) : null,
+      );
+      // mousedown: keep the input's focus
+      row.addEventListener("mousedown", (e: MouseEvent) => e.preventDefault());
+      row.addEventListener("click", () => choose(id));
+      items.push({ id, el: row });
+      rows.push(row);
+    };
+    if (!q) item("", "Default", "the provider’s own choice");
+    let group: string | null = null;
+    for (const m of models.slice(0, 400)) {
+      const g = groupOf(m.id);
+      if (g !== group) {
+        group = g;
+        if (g) rows.push(h("div", { class: "ai-mp-group" }, g));
+      }
+      const label = m.label && m.label !== m.id ? `${m.id}  ·  ${m.label}` : m.id;
+      item(m.id, label, m.note ?? null);
+    }
+    if (models.length > 400) rows.push(h("div", { class: "ai-mp-more" }, `… ${models.length - 400} more — type to filter`));
+    if (q && !models.some((m) => m.id === filterText.trim())) {
+      item(filterText.trim(), `Use “${filterText.trim()}”`, "custom");
+    }
+    if (loading && !data) rows.push(h("div", { class: "ai-mp-more" }, "Loading models…"));
+    else if (!models.length && data?.error) rows.push(h("div", { class: "ai-mp-more" }, data.error));
+    list.replaceChildren(...rows);
+    sel = Math.min(sel, items.length - 1);
+    paintSel();
+  };
+
+  const paintSel = (): void => {
+    items.forEach((it, i) => it.el.classList.toggle("sel", i === sel));
+    items[sel]?.el.scrollIntoView({ block: "nearest" });
+  };
+
+  const show = (filter: string): void => {
+    filterText = filter;
+    open = true;
+    sel = -1;
+    list.hidden = false;
+    input.setAttribute("aria-expanded", "true");
+    void load(false);
+    render();
+  };
+
+  function close(): void {
+    open = false;
+    list.hidden = true;
+    input.setAttribute("aria-expanded", "false");
+  }
+
+  input.addEventListener("focus", () => show(""));
+  input.addEventListener("input", () => show(input.value));
+  input.addEventListener("blur", () => window.setTimeout(close, 120));
+  input.addEventListener("keydown", (e: KeyboardEvent) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      if (!open) show("");
+      if (!items.length) return;
+      sel = e.key === "ArrowDown" ? (sel + 1) % items.length : (sel - 1 + items.length) % items.length;
+      paintSel();
+    } else if (e.key === "Enter" && open) {
+      e.preventDefault();
+      if (sel >= 0 && items[sel]) choose(items[sel].id);
+      else close();
+    } else if (e.key === "Escape" && open) {
+      e.preventDefault();
+      e.stopPropagation();
+      close();
+    }
+  });
+  caret.addEventListener("mousedown", (e: MouseEvent) => e.preventDefault());
+  caret.addEventListener("click", () => {
+    if (open) close();
+    else {
+      input.focus();
+      show("");
+    }
+  });
+  refreshBtn.addEventListener("click", () => void load(true));
+
+  return {
+    el,
+    sync: () => {
+      const t = target();
+      if (`${t.provider}|${t.baseUrl ?? ""}` !== key && t.provider !== "ollama") void load(false);
+    },
+  };
 }

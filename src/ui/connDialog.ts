@@ -8,6 +8,7 @@ import { openSshProfilesDialog, sshLabel, sshStore } from "./sshDialog";
 import { statusText, statusTone, vaults } from "./vault";
 import { openTokenPopover, startOidcSignIn } from "./vaultChips";
 import { openVaultProfilesDialog } from "./vaultDialog";
+import { errorHelpButton, helpHint } from "./help";
 import { clear, errMsg, h, icon } from "./dom";
 import { CONN_COLORS, DRIVER_COLORS } from "./sqlutil";
 import { DRIVER_ABBR, fillBadge, hasIcon } from "./icons";
@@ -65,6 +66,11 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
 
   const field = (label: string, input: HTMLElement, cls = ""): HTMLElement =>
     h("label", { class: "field " + cls }, h("span", { class: "field-label" }, label), input);
+  /** v0.15: a small ? after a field's label (one-line tooltip, click for the help article). */
+  const withHint = (f: HTMLElement, article: string, tip: string): HTMLElement => {
+    f.querySelector(".field-label")?.append(helpHint(article, tip));
+    return f;
+  };
 
   const inName = h("input", { class: "input", type: "text", placeholder: "My database", value: cfg.name, oninput: () => (nameTouched = true) });
   const folderList = h("datalist", { id: "dt-folder-options" }, folderNames().map((f) => h("option", { value: f })));
@@ -185,7 +191,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   const vaultFields = h(
     "div",
     { class: "vault-fields" },
-    field("Vault profile", h("div", { class: "vault-stack" }, selVProfile, vSummary)),
+    withHint(field("Vault profile", h("div", { class: "vault-stack" }, selVProfile, vSummary)), "vault", "Where the token for Vault comes from; one profile can serve many data sources."),
     vAddrField,
     field(
       "Secret path",
@@ -223,7 +229,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   const sshSec = h(
     "details",
     { class: "vault-adv ssh-sec", open: !!cfg.sshProfileId },
-    h("summary", null, icon("chevron", 12), "SSH tunnel", sshSentNote, sshState),
+    h("summary", null, icon("chevron", 12), "SSH tunnel", helpHint("ssh", "Reach a database only a bastion (jump host) can see. Enter the host as the bastion sees it."), sshSentNote, sshState),
     h("div", { class: "vault-adv-body" }, sshFields, sshKafkaNote),
   );
   let sshId: string | null = cfg.sshProfileId ?? null;
@@ -482,11 +488,11 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     h(
       "div",
       { class: "field" },
-      h("span", { class: "field-label" }, "Sentinel nodes ", h("span", { class: "sent-sub" }, "· host:port, default port 26379 · paste a comma-separated list")),
+      h("span", { class: "field-label" }, "Sentinel nodes ", h("span", { class: "sent-sub" }, "· host:port, default port 26379 · paste a comma-separated list"), helpHint("redis-sentinel", "The Sentinel processes (not the Redis nodes): DataTrip asks them where the master is.")),
       chipBox,
       sentErr,
     ),
-    h("div", { class: "row2" }, field("Master name", inMaster), field("Read from", h("div", { class: "seg", role: "radiogroup", "aria-label": "Read from" }, readBtns))),
+    h("div", { class: "row2" }, withHint(field("Master name", inMaster), "redis-sentinel", "The name the sentinels monitor (sentinel monitor <name> … in sentinel.conf); empty = mymaster."), field("Read from", h("div", { class: "seg", role: "radiogroup", "aria-label": "Read from" }, readBtns))),
     h("div", { class: "sent-auth" }, swSentAuth, h("span", null, "Sentinels need their own password ", h("span", { class: "sent-sub" }, "(sentinel requirepass)"))),
     sentCredRow,
   );
@@ -574,7 +580,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   const hostLabel = h("span", { class: "field-label" }, "Host");
   const hostField = h("label", { class: "field grow" }, hostLabel, inHost);
   const portField = field("Port", inPort, "port");
-  const protoField = field("Security protocol", protoSeg);
+  const protoField = withHint(field("Security protocol", protoSeg), "kafka-connect", "How clients talk to the brokers: SSL / SASL_SSL use TLS, SASL_* need a user and password. Must match the listener.");
   const credRow = h("div", { class: "row2" }, userField, passField);
   const hostRow = h("div", { class: "row2" }, hostField, portField);
   const netFields = h(
@@ -672,6 +678,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
     dbIdxField.style.display = redis ? "" : "none";
     portField.style.display = kafka ? "none" : "";
     hostLabel.textContent = kafka ? "Bootstrap servers" : "Host";
+    if (kafka) hostLabel.append(helpHint("kafka-connect", "Brokers to start from, host:port, comma-separated — they must be reachable from this computer (VPN addresses, not cluster-internal names)."));
     inHost.placeholder = kafka ? "broker1:9092,broker2:9092" : "localhost";
     userLabel.textContent = redis ? "ACL user" : "User";
     inUser.placeholder = redis ? "default (optional)" : "";
@@ -929,6 +936,8 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       result.className = "test-result err";
       clear(result);
       result.append(icon("alert", 15), h("span", null, errMsg(e)));
+      const helpBtn = errorHelpButton(errMsg(e), { vault: authMethod === "vault" });
+      if (helpBtn) result.append(helpBtn);
       // Expired Vault token / unknown SSH host: fix inline and run the test again.
       handleActionError(e, runTest);
     } finally {
@@ -975,6 +984,8 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       result.className = "test-result err";
       clear(result);
       result.append(icon("alert", 15), h("span", null, errMsg(e)));
+      const helpBtn = errorHelpButton(errMsg(e), { vault: authMethod === "vault" });
+      if (helpBtn) result.append(helpBtn);
       btnSave.disabled = false;
     }
   };
