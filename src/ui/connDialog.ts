@@ -14,6 +14,7 @@ import { CONN_COLORS, DRIVER_COLORS } from "./sqlutil";
 import { DRIVER_ABBR, fillBadge, hasIcon } from "./icons";
 import { closeLookPicker, openLookPicker } from "./lookPicker";
 import { folderNames } from "./scope";
+import { productionSection } from "./prodUi";
 
 function fmtLease(secs: number): string {
   if (secs >= 86400 && secs % 86400 === 0) return secs / 86400 + "d";
@@ -105,6 +106,8 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
   const inSslKey = h("input", { class: "input", type: "text", placeholder: "/path/to/client.key (optional)", value: cfg.sslKeyPath ?? "", spellcheck: false, "aria-label": "Client key path" });
   const chkTrust = h("input", { type: "checkbox", checked: cfg.trustServerCertificate === true });
   const chkRo = h("input", { type: "checkbox", checked: cfg.readOnly === true });
+  // v0.16: Production data source (colored bar, write confirmation, AI blocking)
+  const prodSec = productionSection(existing?.production ?? null, () => inName.value.trim());
   // ----- Kafka -----
   const k0 = existing?.kafka ?? {};
   let kProtocol = (k0.securityProtocol ?? "plaintext").toLowerCase();
@@ -828,6 +831,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       scope: cfg.scope ?? null,
       kafka: kafka ? collectKafka() : null,
       redis: driver === "redis" ? collectRedis() : null,
+      production: prodSec.value(),
     };
   };
   const sslShown = (): boolean => (driver === "postgres" || driver === "mysql") && sslFiles.style.display !== "none";
@@ -1013,6 +1017,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
       sslFiles,
       field("Color", h("div", { class: "swatches" }, swatches)),
       field("Icon", btnIcon),
+      prodSec.el,
       result,
     ),
     h("div", { class: "dialog-foot" }, btnTest, h("div", { class: "spacer" }), btnCancel, btnSave),

@@ -54,7 +54,14 @@ export type MenuCommand =
   | "openFile"
   | "runSqlFile"
   | "help"
-  | "welcomeTour";
+  | "welcomeTour"
+  | "explain"
+  | "sessions"
+  | "snippets"
+  | "showDdl"
+  | "importData"
+  | "newTable"
+  | "designTable";
 
 export interface AppMenuEntry {
   id?: MenuCommand;

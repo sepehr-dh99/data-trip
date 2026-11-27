@@ -9,6 +9,9 @@ import { showMenu } from "./menu";
 import { getSettings, onSettingsChange, updateSettings } from "./settings";
 import type { PageSize } from "./settings";
 import { toast } from "./toast";
+import { ValueViewer } from "./valueViewer";
+import type { ViewerCell } from "./valueViewer";
+import { wantsViewer } from "./valueFormat";
 
 const ROW_H = 34;
 const RN_MIN = 44;
@@ -126,6 +129,8 @@ export class ResultGrid {
   private inserts: InsertRow[] = [];
   private deleted = new Set<number>();
   private editor: HTMLInputElement | null = null;
+  /** v0.16: the cell value viewer docked right of the grid (created on first open). */
+  private viewer: ValueViewer | null = null;
   private submitting = false;
 
   // dom
@@ -918,11 +923,17 @@ export class ResultGrid {
     else if (k === "PageUp") (e.preventDefault(), this.move(-(Math.floor(this.scroller.clientHeight / ROW_H) - 1), 0, e.shiftKey));
     else if (k === "Home") (e.preventDefault(), this.move(mod ? -1e9 : 0, -1e9, e.shiftKey));
     else if (k === "End") (e.preventDefault(), this.move(mod ? 1e9 : 0, 1e9, e.shiftKey));
-    else if (k === "Enter" || k === "F2") {
+    else if (k === "Enter" && e.shiftKey && !mod) {
+      e.preventDefault();
+      this.openValueViewer();
+    } else if (k === "Enter" || k === "F2") {
       if (this.head) {
         e.preventDefault();
         this.startEdit(this.head);
       }
+    } else if (k === "Escape" && this.viewer?.open) {
+      e.preventDefault();
+      this.viewer.close();
     }
   }
 
@@ -1045,6 +1056,7 @@ export class ResultGrid {
       { sep: true },
       { label: "Export…", icon: "download", hint: MODK + "⇧E", onClick: () => this.cb.onExport(true) },
       { sep: true },
+      { label: "Open value", icon: "view", hint: "⇧↵", disabled: !cell || cell.c < 0, onClick: () => this.openValueViewer() },
       { label: "Edit cell", icon: "pencil", hint: "↵", disabled: !canEditCell, onClick: () => cell && this.startEdit(cell) },
       { label: "Set NULL", icon: "x", disabled: !editable, onClick: () => this.nullSelected() },
       { label: anyDeleted ? "Restore row" : "Delete row", icon: anyDeleted ? "undo" : "minus", danger: !anyDeleted, disabled: !editable, onClick: () => this.deleteSelected() },
@@ -1058,7 +1070,60 @@ export class ResultGrid {
     const t = e.target as HTMLElement;
     if (!t.closest(".g-body")) return;
     const p = this.hit(e);
-    if (p && p.c >= 0) this.startEdit(p);
+    if (!p || p.c < 0) return;
+    // Long / JSON / binary values open the value viewer; short ones keep the inline editor.
+    const ri = this.order[p.r];
+    if (ri !== undefined && wantsViewer(this.cols[p.c]?.typeName ?? "", this.getCell(ri, p.c))) {
+      this.anchor = this.head = p;
+      this.fullRefill = true;
+      this.schedule();
+      this.openValueViewer();
+      return;
+    }
+    this.startEdit(p);
+  }
+
+  // ---------------------------------------------------------------- value viewer (v0.16)
+
+  /** Opens the value viewer on the selected cell (⇧↵, double-click on long values, "Open value"). */
+  openValueViewer(): void {
+    this.commitEdit();
+    if (!this.viewer) {
+      this.viewer = new ValueViewer({
+        current: () => this.viewerCell(),
+        save: (ri, c, text) => {
+          if (!this.cellEditable(ri, c)) return;
+          const orig = this.getCell(ri, c);
+          if (orig !== null && String(orig) === text) return;
+          this.setCell(ri, c, this.parseValue(c, text, orig));
+          this.flash("Saved to the grid — Submit to write it");
+        },
+        closed: () => {
+          this.el.classList.remove("vv-open");
+          this.schedule();
+        },
+        focusGrid: () => this.focus(),
+      });
+      this.el.appendChild(this.viewer.el);
+    }
+    if (!this.head && this.order.length && this.cols.length) this.anchor = this.head = { r: 0, c: 0 };
+    this.el.classList.add("vv-open");
+    this.viewer.show();
+    this.schedule();
+  }
+
+  private viewerCell(): ViewerCell | null {
+    const p = this.head;
+    if (!p || p.c < 0 || p.c >= this.cols.length) return null;
+    const ri = this.order[p.r];
+    if (ri === undefined) return null;
+    const n = this.n();
+    let rowLabel = ri >= n ? "new row" : `row ${ri + 1 + (this.paging ? this.paging.offset : 0)}`;
+    const ctx = this.ctx;
+    if (ctx && ri < n && ctx.pk.length === 1 && ctx.pkIdx[0] !== undefined) rowLabel += ` · ${ctx.pk[0]} ${String(this.rows[ri][ctx.pkIdx[0]])}`;
+    const editable = this.editable() && this.cellEditable(ri, p.c);
+    const reason = !this.editable() ? this.reason || "Read-only result" : this.deleted.has(ri) ? "Row is marked for deletion" : "Computed column is read-only";
+    return { ri, c: p.c, column: this.cols[p.c].name, typeName: this.cols[p.c].typeName, value: this.getCell(ri, p.c), editable, reason, rowLabel };
   }
 
   private startEdit(p: Pos): void {
@@ -1300,6 +1365,7 @@ export class ResultGrid {
 
   private updateBar(): void {
     this.updatePager();
+    this.viewer?.update();
     const total = this.rows.length + this.inserts.length;
     const shown = this.order.length;
     this.countEl.textContent = this.opts.countLabel

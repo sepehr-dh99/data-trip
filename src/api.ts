@@ -41,6 +41,12 @@ import type {
   FileStat,
   SqlRunOptions,
   SqlRunProgress,
+  DdlRequest,
+  TableExtras,
+  ImportFormat,
+  ImportPreview,
+  ImportRequest,
+  ImportProgress,
 } from "./types";
 
 /** Normalizes any thrown value from invoke() into an Error with a readable message. */
@@ -80,8 +86,9 @@ export const api = {
   closeSession: (sessionId: string) => call<null>("close_session", { sessionId }),
   introspect: (sessionId: string) => call<SchemaNode[]>("introspect", { sessionId }),
 
-  execute: (sessionId: string, sql: string, maxRows: number) =>
-    call<QueryResult>("execute", { sessionId, sql, maxRows }),
+  /** `history: false` (v0.16): not recorded in the query history (polling / helper statements). */
+  execute: (sessionId: string, sql: string, maxRows: number, history?: boolean) =>
+    call<QueryResult>("execute", history === false ? { sessionId, sql, maxRows, history: false } : { sessionId, sql, maxRows }),
   cancel: (sessionId: string) => call<null>("cancel", { sessionId }),
   setAutoCommit: (sessionId: string, autoCommit: boolean) =>
     call<null>("set_auto_commit", { sessionId, autoCommit }),
@@ -221,4 +228,16 @@ export const api = {
   runSqlFile: (sessionId: string, path: string, options: SqlRunOptions, runId: string) =>
     call<SqlRunProgress>("run_sql_file", { sessionId, path, options, runId }),
   runSqlFileCancel: (runId: string) => call<null>("run_sql_file_cancel", { runId }),
+  // ── v0.16: Show DDL, table designer, import ──
+  /** CREATE statement(s) of one object, read from the catalog on that session. */
+  getDdl: (sessionId: string, request: DdlRequest) => call<string>("get_ddl", { sessionId, request }),
+  /** Column comments, default constraint names, identity columns… for the table designer. */
+  tableExtras: (sessionId: string, schema: string | null, table: string) => call<TableExtras>("table_extras", { sessionId, schema, table }),
+  /** Format detection + first rows (+ checks against target column types, one per source column). */
+  importPreview: (path: string, format: ImportFormat | null, checkTypes: (string | null)[] | null = null) =>
+    call<ImportPreview>("import_preview", { path, format, checkTypes }),
+  /** Streams the file into the table (events "import-progress"); resolves with the final progress. */
+  importRun: (sessionId: string, path: string, request: ImportRequest, runId: string) =>
+    call<ImportProgress>("import_run", { sessionId, path, request, runId }),
+  importCancel: (runId: string) => call<null>("import_cancel", { runId }),
 };

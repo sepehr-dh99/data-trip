@@ -13,6 +13,8 @@ import { Explorer } from "./explorer";
 import type { OpenConsoleOpts } from "./explorer";
 import { HistoryPanel } from "./history";
 import { GroupPane } from "./kafkaGroup";
+import { SessionsPane } from "./sessionsPane";
+import { prodOptions } from "./prodSafety";
 import { TopicPane } from "./kafkaTopic";
 import { KeyPane } from "./keyView";
 import type { KeyHost } from "./keyView";
@@ -43,6 +45,8 @@ import { initSqlFiles, openSqlFile, runSqlFileFlow } from "./sqlFiles";
 import { initHelp, isHelpOpen, openHelp } from "./help";
 import { maybeStartTour, startTour } from "./tour";
 import { checkForUpdates, initUpdates, setBeforeRestart } from "./updates";
+import { initDataTools } from "./dataTools";
+import { importData, openDesigner, showDdl } from "./dataActions";
 import type { Workspace, WsTab } from "./workspace";
 
 const IS_MAC = /Mac/.test(navigator.userAgent);
@@ -130,6 +134,7 @@ export class App {
       openPalette: () => this.openCommandPalette(),
       newCrossSource: (ids) => void this.newCrossSource(ids),
       runSqlFile: (id) => void runSqlFileFlow({ connId: id }),
+      openSessions: (id) => void this.openSessions(id),
       openHelp: () => openHelp(),
     });
     this.navigator = new Navigator({
@@ -197,6 +202,25 @@ export class App {
       activate: (c) => this.activate(c),
       currentConn: () => this.active?.connId ?? this.selectedConn,
       ensureConnected: (id) => this.ensureConn(id),
+    });
+    // v0.16: Show DDL, table designer and Import data open tabs / dialogs through this host.
+    initDataTools({
+      addTab: (pane) => {
+        this.tabs.push(pane);
+        this.stack.appendChild(pane.el);
+        this.activate(pane);
+      },
+      tabs: () => this.tabs,
+      activate: (pane) => this.activate(pane),
+      openConsole: (connId, o) => void this.openConsole(connId, { sql: o.sql, database: o.database, schema: o.schema, title: o.title }),
+      ensureConnected: (id) => this.ensureConn(id),
+      selectedTarget: () => this.explorer.selectedTarget(),
+      activeContext: () => {
+        const a = this.active;
+        if (!a) return null;
+        const c = this.activeConsole();
+        return { connId: a.connId, database: a.effectiveDatabase, schema: a.currentSchemaName(), table: c?.table ?? null };
+      },
     });
     // Help (v0.15): "Try it" buttons of the help center.
     initHelp({
@@ -321,7 +345,8 @@ export class App {
       else if (t instanceof GroupPane) tabs.push({ kind: "group", key, name, connId: t.connId, title: t.groupId, database: null });
     }
     // Every open tab has an entry, so indexes match this.tabs.
-    const active = this.active && tabs.length === this.tabs.length ? this.tabs.indexOf(this.active) : -1;
+    const savedTabs = this.tabs.filter((t) => t.kind !== "ddl" && t.kind !== "design");
+    const active = this.active && tabs.length === savedTabs.length ? savedTabs.indexOf(this.active) : -1;
     return { version: 1, tabs, active };
   }
 
@@ -673,6 +698,19 @@ export class App {
   }
 
   /** Opens (or focuses) the tab of a Kafka consumer group. */
+  /** v0.16: opens (or focuses) the Sessions & locks tab of a data source (its own dedicated session). */
+  private async openSessions(connId: string): Promise<void> {
+    const drv = store.conns.get(connId)?.config.driver;
+    if (drv !== "sqlite" && !(await this.ensureConn(connId))) return;
+    let pane = this.tabs.find((t): t is SessionsPane => t instanceof SessionsPane && t.matches(connId));
+    if (!pane) {
+      pane = new SessionsPane(connId);
+      this.tabs.push(pane);
+      this.stack.appendChild(pane.el);
+    }
+    this.activate(pane);
+  }
+
   private async openGroup(connId: string, groupId: string): Promise<void> {
     if (!(await this.ensureConn(connId))) return;
     const restored = this.findRestored("group", connId, groupId);
@@ -760,6 +798,8 @@ export class App {
   }
 
   private rememberClosed(t: TabPane): void {
+    // DDL / designer tabs (v0.16) are reopened from the explorer, not by "Reopen closed tab".
+    if (t.kind === "ddl" || t.kind === "design") return;
     const c = t instanceof ConsolePane ? t : null;
     this.closed.push({
       kind: t.kind,
@@ -984,6 +1024,18 @@ export class App {
       case "help":
         openHelp();
         return;
+      case "showDdl":
+        showDdl();
+        return;
+      case "importData":
+        importData();
+        return;
+      case "newTable":
+        openDesigner(null, true);
+        return;
+      case "designTable":
+        openDesigner(null, false);
+        return;
       case "welcomeTour":
         startTour();
         return;
@@ -1001,6 +1053,18 @@ export class App {
         return;
       case "formatSql":
         if (needConsole() && c && !c.isLineBased) c.formatSql();
+        return;
+      case "explain":
+        if (needConsole() && c && !c.isLineBased) void c.explain();
+        return;
+      case "sessions": {
+        const cid = this.active?.connId ?? this.selectedConn;
+        if (cid) void this.openSessions(cid);
+        else toast("Select a data source first", "info");
+        return;
+      }
+      case "snippets":
+        openSettings("snippets");
         return;
       case "askAi":
         this.askAi();
@@ -1133,6 +1197,9 @@ export class App {
     act("checkUpdates", "Check for updates…", "refresh", "", "update upgrade new version release");
     act("reconnect", curName ? `Reconnect ${curName}` : "Reconnect data source", "refresh", k("reconnect"), "connection", !cur);
     act("formatSql", "Format SQL", "sort", k("formatSql"), "beautify pretty", !c || c.isLineBased);
+    act("explain", "Explain plan", "layers", k("explain"), "explain analyze query plan performance index slow", !c || c.isLineBased);
+    act("sessions", curName ? `Sessions & locks of ${curName}` : "Sessions & locks", "server", "", "processlist activity blocking kill cancel running queries locks", !cur);
+    act("snippets", "Snippets…", "sliders", "", "live templates abbreviation expand settings");
     act("newConsole", "New console", "terminal", k("newConsole"));
     act("newConnection", "New connection…", "plus", "", "data source add");
     act("importDataGrip", "Import from DataGrip…", "download", "", "data sources");
@@ -1157,6 +1224,10 @@ export class App {
     act("openFile", "Open SQL file…", "folder", k("openFile"), "load script disk");
     act("runSqlFile", "Run SQL file on a data source…", "playAll", "", "execute script seed dump import batch");
     act("help", "Help", "search", k("help"), "documentation docs guide manual how troubleshooting");
+    act("showDdl", "Show DDL of the selected object", "view", k("showDdl"), "create statement definition source script table view function");
+    act("importData", "Import data (CSV / JSON) into a table…", "download", "", "csv tsv json ndjson load upload file wizard");
+    act("newTable", "New table…", "plus", "", "create table designer schema");
+    act("designTable", "Edit table (table designer)…", "pencil", "", "alter table designer columns indexes foreign keys");
     act("welcomeTour", "Welcome tour", "sparkle", "", "intro help onboarding");
     for (const p of getSettings().files.recent) {
       const name = p.slice(Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")) + 1);
@@ -1168,7 +1239,7 @@ export class App {
         group: "Data sources",
         label: e.config.name,
         icon: "database",
-        detail: DRIVER_LABELS[e.config.driver].split(" / ")[0] + (e.status === "connected" ? " · connected" : ""),
+        detail: DRIVER_LABELS[e.config.driver].split(" / ")[0] + (e.status === "connected" ? " · connected" : "") + (prodOptions(e.config) ? " · PROD" : ""),
         hint: "open console",
         keywords: e.config.folder ?? "",
         run: () => void this.openConsole(id),
@@ -1176,7 +1247,7 @@ export class App {
     }
     for (const t of this.strip.ordered()) {
       const e = store.conns.get(t.connId);
-      out.push({ group: "Open tabs", label: autoName(t), icon: t.kind === "console" ? "terminal" : t.kind === "key" ? "key" : t.kind === "topic" ? "topic" : "group", detail: e?.config.name, run: () => this.activate(t) });
+      out.push({ group: "Open tabs", label: autoName(t), icon: t.kind === "console" ? "terminal" : t.kind === "key" ? "key" : t.kind === "topic" ? "topic" : t.kind === "sessions" ? "server" : t.kind === "ddl" ? "view" : t.kind === "design" ? "table" : "group", detail: e?.config.name, run: () => this.activate(t) });
     }
     // Tables: only what the explorer already loaded (nothing is fetched for the palette).
     let n = 0;
@@ -1232,6 +1303,9 @@ export class App {
           { id: "saveFileAs", label: "Save as…", hint: k("saveFileAs"), disabled: !c },
           { id: "exportSelection", label: "Export selection as .sql…", disabled: !c },
           { id: "runSqlFile", label: "Run SQL file on a data source…" },
+          { id: "importData", label: "Import data…" },
+          { id: "newTable", label: "New table…" },
+          { id: "showDdl", label: "Show DDL", hint: k("showDdl") },
           sep,
           { id: "importDataGrip", label: "Import from DataGrip…" },
           { id: "vaultProfiles", label: "Vault profiles…" },
@@ -1276,10 +1350,12 @@ export class App {
           sep,
           { id: "formatSql", label: "Format SQL", hint: k("formatSql"), disabled: !c || c.isLineBased },
           { id: "askAi", label: "Ask AI…", hint: k("askAi") },
+          { id: "explain", label: "Explain plan", hint: k("explain"), disabled: !c || c.isLineBased },
           sep,
           { id: "attachSource", label: "Attach source…", disabled: !c || c.isLineBased },
           sep,
           { id: "reconnect", label: "Reconnect data source", hint: k("reconnect") },
+          { id: "sessions", label: "Sessions & locks" },
         ],
       },
       {
@@ -1341,6 +1417,14 @@ export class App {
         if (!c || (editable && !inEditor) || c.isLineBased) return;
         e.preventDefault();
         c.formatSql();
+        return;
+      }
+      case "explain": {
+        // v0.16: in the console's editor or with focus outside any text field
+        const inEditor = e.target instanceof HTMLElement && c !== null && c.el.contains(e.target) && e.target.closest(".c-editor") !== null;
+        if (!c || (editable && !inEditor) || c.isLineBased) return;
+        e.preventDefault();
+        void c.explain();
         return;
       }
       case "runStatement":
@@ -1413,6 +1497,12 @@ export class App {
       case "help":
         e.preventDefault();
         if (!isHelpOpen()) openHelp();
+        return;
+      case "showDdl":
+        // Not while typing in a text field (the editor keeps its own keys).
+        if (editable) return;
+        e.preventDefault();
+        showDdl();
         return;
     }
   }

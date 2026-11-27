@@ -6,10 +6,14 @@ pub mod child_env;
 pub mod commands;
 pub mod credentials;
 pub mod db;
+pub mod ddl;
+pub mod ddlgen;
 pub mod error;
 pub mod export;
 pub mod federation;
 pub mod fedsql;
+pub mod import;
+pub mod importfmt;
 pub mod model;
 pub mod profiles;
 pub mod session;
@@ -58,6 +62,7 @@ pub fn run() {
             app.manage(ai::AiState::default());
             app.manage(updater::UpdaterState::default());
             app.manage(sqlfile::SqlFileRuns::default());
+            app.manage(import::ImportRuns::default());
             app.manage(AppState {
                 store,
                 vault_cache,
@@ -142,6 +147,11 @@ pub fn run() {
             sqlfile::file_mtime,
             sqlfile::run_sql_file,
             sqlfile::run_sql_file_cancel,
+            ddl::get_ddl,
+            ddl::table_extras,
+            import::import_preview,
+            import::import_run,
+            import::import_cancel,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DataTrip");

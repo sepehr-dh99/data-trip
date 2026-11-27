@@ -12,9 +12,10 @@ import type { AppSettings, EditorFont, IdleMinutes, KeymapPreset, LineHeight, Pa
 import { THEMES, TOKEN_KEYS, TOKEN_PALETTE } from "./themes";
 import type { TokenKey } from "./themes";
 import { buildAiSettings } from "./aiSettings";
+import { buildSnippetSettings } from "./snippetSettings";
 import { checkForUpdates, onUpdateState, updateState } from "./updates";
 
-export type SettingsSection = "editor" | "appearance" | "results" | "tabs" | "keymap" | "data" | "ai" | "updates";
+export type SettingsSection = "editor" | "appearance" | "results" | "tabs" | "keymap" | "data" | "ai" | "updates" | "snippets";
 
 interface SectionDef {
   id: SettingsSection;
@@ -30,6 +31,7 @@ const SECTIONS: SectionDef[] = [
   { id: "results", label: "Results grid", short: "Rs", color: "#0a84ff", sub: "Paging, borders and value display" },
   { id: "tabs", label: "Console tabs", short: "Tb", color: "#ff9f0a", sub: "Placement, sorting and names" },
   { id: "keymap", label: "Keymap", short: "Km", color: "#30b0c7", sub: "Keyboard shortcuts" },
+  { id: "snippets", label: "Snippets", short: "Sn", color: "#ff2d55", sub: "Abbreviations that expand into SQL" },
   { id: "data", label: "Data & history", short: "Dh", color: "#34c759", sub: "History, safety and reconnects" },
   { id: "updates", label: "Updates", short: "Up", color: "#64d2ff", sub: "Version, checking and installing updates" },
   { id: "ai", label: "AI assistant", short: "AI", color: "#bf5af2", sub: "Codex, Claude Code, API key or Ollama · what is sent" },
@@ -126,6 +128,11 @@ class SettingsWindow {
       textField: (l, g, st, m, w) => this.textField(l, g, st, m, w),
       onSync: (f) => this.syncs.push(f),
     }));
+    this.section("snippets", buildSnippetSettings({
+      row: (t, d, c, x) => this.row(t, d, c, x),
+      toggle: (l, g, st) => this.toggle(l, g, st),
+      onSync: (f) => this.syncs.push(f),
+    }));
     for (const s of SECTIONS) {
       const sec = this.sections.get(s.id);
       if (sec) this.body.appendChild(sec.el);
@@ -220,6 +227,7 @@ class SettingsWindow {
       else if (id === "data") s.data = d.data;
       else if (id === "ai") s.ai = d.ai;
       else if (id === "updates") s.updates = d.updates;
+      else if (id === "snippets") s.snippets = d.snippets;
       else {
         s.tabs.placement = d.tabs.placement;
         s.tabs.sort = d.tabs.sort;

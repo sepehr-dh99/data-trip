@@ -36,6 +36,19 @@ export interface ConnectionConfig {
   kafka?: KafkaConfig | null;
   /** Redis only: standalone (host/port) or Sentinel. null = standalone. */
   redis?: RedisOptions | null;
+  /** v0.16: production data source (colored bar, write confirmation, AI blocking). null / enabled false = not marked. */
+  production?: ProductionOptions | null;
+}
+
+/** v0.16: production safety options of a data source (mirror of model.rs ProductionOptions). */
+export interface ProductionOptions {
+  enabled?: boolean;
+  /** Bar / tag color, e.g. "#FF1A3C". */
+  color?: string | null;
+  /** INSERT / UPDATE / DELETE / MERGE / DDL ask first (default true). */
+  confirmWrites?: boolean;
+  /** DROP / TRUNCATE require typing the data source name (default true). */
+  typeNameForDrop?: boolean;
 }
 
 export type RedisMode = "standalone" | "sentinel";
@@ -541,6 +554,110 @@ export interface SqlRunProgress {
   lastError: SqlRunFailure | null;
   finished: boolean;
   cancelled: boolean;
+  stopped: string | null;
+  note: string | null;
+}
+
+// ── v0.16: Show DDL, table extras, import (src-tauri/src/ddl.rs, import.rs) ──
+export type DdlKind = "table" | "view" | "materialized" | "function" | "procedure" | "sequence" | "index";
+
+export interface DdlRequest {
+  kind: DdlKind;
+  schema: string | null;
+  name: string;
+  /** Routines: the argument list as the explorer shows it (picks one overload). */
+  arguments?: string | null;
+  /** Indexes: their table. */
+  table?: string | null;
+  options: { indexes: boolean; comments: boolean; qualified: boolean };
+}
+
+export interface TableExtras {
+  comments: Record<string, string>;
+  /** SQL Server: default constraint name by column. */
+  defaultConstraints: Record<string, string>;
+  /** Identity / AUTO_INCREMENT columns ("*" = SQLite AUTOINCREMENT on the integer primary key). */
+  autoIncrement: string[];
+  fkOnDelete: Record<string, string>;
+  createSql: string | null;
+  tableComment: string | null;
+}
+
+export interface ImportFormat {
+  kind: "csv" | "json" | "ndjson" | null;
+  delimiter: string | null;
+  /** "" = no quoting. */
+  quote: string | null;
+  header: boolean | null;
+  encoding: "utf8" | "utf16le" | "utf16be" | "latin1" | null;
+  nullText: string;
+  dateFormat: string;
+  flatten: boolean | null;
+}
+
+export interface ImportInferred {
+  kind: "int" | "bigint" | "decimal" | "bool" | "date" | "timestamp" | "json" | "text";
+  maxLen: number;
+  precision: number;
+  scale: number;
+  nullable: boolean;
+}
+
+export interface ImportCheck {
+  value: string;
+  line: number;
+  message: string;
+  bad: number;
+  fix: { label: string; kind: "dateFormat" | "nullText"; value: string } | null;
+}
+
+export interface ImportPreview {
+  format: ImportFormat;
+  columns: string[];
+  rows: (string | null)[][];
+  lines: number[];
+  sampleRows: number;
+  totalRows: number | null;
+  estimatedRows: number;
+  fileSize: number;
+  warnings: string[];
+  encodingNote: string | null;
+  inferred: ImportInferred[];
+  checks: (ImportCheck | null)[];
+}
+
+export interface ImportRequest {
+  format: ImportFormat;
+  sourceColumns: string[];
+  target: { schema: string | null; table: string; createSql: string[] };
+  mapping: { source: number; column: string; typeName: string }[];
+  keyColumns: string[];
+  options: { truncate: boolean; onConflict: "fail" | "skip" | "update"; batchSize: number; transaction: "batch" | "single"; stopAfter: number };
+}
+
+export interface ImportFailure {
+  n: number;
+  line: number;
+  column: string | null;
+  value: string | null;
+  message: string;
+  row: (string | null)[];
+}
+
+export interface ImportProgress {
+  runId: string;
+  rowsRead: number;
+  inserted: number;
+  skipped: number;
+  failed: number;
+  bytesDone: number;
+  bytesTotal: number;
+  elapsedMs: number;
+  /** Failures since the previous event (dedupe by `n`). */
+  failures: ImportFailure[];
+  finished: boolean;
+  cancelled: boolean;
+  rolledBack: boolean;
   stopped: string | null;
   note: string | null;
 }

@@ -29,7 +29,9 @@ export type ActionId =
   | "saveFile"
   | "saveFileAs"
   | "openFile"
-  | "help";
+  | "help"
+  | "explain"
+  | "showDdl";
 
 export interface ActionInfo {
   id: ActionId;
@@ -62,6 +64,8 @@ export const ACTIONS: ActionInfo[] = [
   { id: "saveFileAs", name: "Save SQL file as…" },
   { id: "openFile", name: "Open SQL file…" },
   { id: "help", name: "Help" },
+  { id: "explain", name: "Explain plan" },
+  { id: "showDdl", name: "Show DDL" },
 ];
 
 type Table = Record<ActionId, string>;
@@ -90,6 +94,8 @@ const DATATRIP: Table = {
   saveFileAs: "Mod-Shift-S",
   openFile: "Mod-O",
   help: "F1",
+  explain: "Mod-Alt-E",
+  showDdl: "Mod-Alt-D",
 };
 
 export const PRESETS: Record<KeymapPreset, Table> = {

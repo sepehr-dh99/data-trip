@@ -843,3 +843,280 @@ aren't cached). Never rejects for provider problems: `error` says what went wron
   (word, quoted name / literal, else one character; at the end: the last token) gets a red wavy underline with the
   message on hover (`SqlEditor.setErrorMark`), and the error view gets **Go to error · line L, column C** (caret
   there). Cleared by any edit and on the next run. Cross-source and Redis / Kafka errors get none.
+
+## v0.16 — parameters, explain, sessions, snippets, production safety
+
+Approved designs: `/home/claude/canvas/project/ParamsExplain.dc.html` (U), `OpsSafety.dc.html` (W). Frontend only
+except two model fields and two macOS menu items; **no new commands**. Pure logic with node tests
+(`node scripts/test-ops.mjs`): `src/ui/params.ts`, `explainPlan.ts`, `sessionsData.ts`, `snippets.ts`, `prodSafety.ts`.
+UI: `paramsPopover.ts`, `explainView.ts`, `consoleOps.ts` (console glue), `sessionsPane.ts`, `opsDialogs.ts`,
+`opsEditor.ts` (CodeMirror), `snippetSettings.ts`, `prodUi.ts`; styles `src/styles/ops.css`.
+
+### Model
+- `ConnectionConfig.production: ProductionOptions | null` (`#[serde(default)]`; mirrored in `types.ts`):
+  `{ enabled: bool (default false), color: string|null ("#FF1A3C", "#ff9f0a", "#bf5af2", "#0a84ff", "#30d158"),
+  confirmWrites: bool (default true), typeNameForDrop: bool (default true) }`. Stored verbatim, enforced by the
+  frontend. The dialog writes null until the switch was ever turned on.
+- Settings: `snippets { user: Snippet[], hidden: string[] (built-ins removed), expandKey: "tab"|"enter"|"space",
+  inCompletion: bool }`, `Snippet { abbr ([A-Za-z_][A-Za-z0-9_]{0,31}), name, body, dialects: ("postgres"|"mysql"|
+  "mssql"|"sqlite")[] }`; `explain { analyze (false), buffers (false) }`.
+- Workspace: `WsConsole.params?: { remember, values: Record<key, {kind: "text"|"number"|"date", value, isNull}>,
+  at }` (only saved while "Remember values for this console" is on).
+- `TabPane.kind` gains `"sessions"` (not restored on launch). Menu command ids: `explain`, `sessions`, `snippets`
+  (macOS menu: Console › Explain plan, Console › Sessions & locks). Keymap action `explain` (Mod-Alt-E, all presets).
+
+### Query parameters (board U)
+- Detection (`scanParams`, per statement, SQL drivers only; none for Redis / Kafka): `:name` everywhere — not `::`,
+  not `:=`, not directly after an identifier character / `]` / `)` / quote (`arr[lo:hi]`); `?` for MySQL, SQLite,
+  SQL Server (never PostgreSQL: `?|` JSON operators), SQLite `?NNN` numbered; `$n` for PostgreSQL. Skipped: strings
+  (MySQL / `E'…'` backslash escapes), quoted identifiers, `--` / `#` (MySQL) / nested `/* */` comments, `$tag$`
+  bodies, and statements starting with PREPARE / CREATE FUNCTION / PROCEDURE / TRIGGER. Keys: `:name`, `$n`, and
+  positional `?1…` numbered across one run. Tokens are highlighted in the editor (`cm-sql-param`).
+- Inference (`describeParams`, cached explorer schema only): `col op :p`, `:p op col`, `col IN (…, :p`,
+  `col BETWEEN :a AND :b`, `SET col = :p`; aliases from FROM / JOIN / UPDATE / INTO → `table.column · type`, kind
+  number / date / text from the type.
+- Running a statement (or Run all / gutter ▶ / Explain) with parameters opens **Run with parameters** under it
+  (fixed-position popover): label + hint, text / number / date, value, NULL toggle, validation (number
+  `^[+-]?…$`; date `YYYY-MM-DD[ hh:mm[:ss[.ffffff]]][zone]`; empty number / date → "Enter a value or choose NULL";
+  empty text allowed), "Remember values for this console" (+ "last used N min ago"), Cancel Esc, Run ↵ / ⌘↵.
+- **Binding = literal substitution in the frontend** (decision: the drivers run statements through the simple
+  query protocol — sqlx `raw_sql`, tiberius `simple_query` — and real binds would need typed values per driver,
+  PostgreSQL casts to the compared column's type, and would not survive the pager wrapper or cross-source routing
+  without backend changes CI can't verify here). `paramLiteral`: NULL → `NULL`; number → validated text, negative in
+  parentheses (`x - (-1)`); date → quoted string; text → PostgreSQL `'…'` (`''` doubled) or `E'…'` with `\\` doubled
+  when it has a backslash; MySQL `'…'`, or `_utf8mb4 X'<hex>'` when it has a backslash / control character (safe with
+  and without NO_BACKSLASH_ESCAPES); SQL Server `N'…'`; SQLite `'…'`; NUL characters refused. Cross-source statements
+  are substituted in the SQLite dialect. The substituted text goes through paging, Count rows, Load more, history.
+- Result: chips `:id = 1042` above the result + **Edit parameters** (re-runs the original); a NULL compared with
+  `=` / `<>` / `!=` adds "A comparison with NULL is never true … write col IS NULL instead". Errors map back to the
+  original text (`mapParamError`: position through the substitution edits and the pager wrapper) for the underline;
+  the error view and Fix with AI get the original statement.
+
+### Explain (board U)
+- `explain` (⌥⌘E / Ctrl+Alt+E in the editor or outside text fields; console capsule **Explain**; Console menu; ⌘K):
+  the statement at the cursor (first of a selection; parameters asked first; not for cross-source / Redis / Kafka).
+  Statements: PostgreSQL `EXPLAIN (FORMAT JSON[, ANALYZE[, BUFFERS]])`; MySQL `EXPLAIN FORMAT=JSON`, with ANALYZE on
+  8.0.18+ (not MariaDB) `EXPLAIN ANALYZE` (text tree); SQLite `EXPLAIN QUERY PLAN` (tree from id / parent); SQL Server
+  `SET SHOWPLAN_XML ON` / statement / `SET SHOWPLAN_XML OFF` as separate executes (estimated plan; RelOp PhysicalOp /
+  EstimateRows / EstimatedTotalSubtreeCost / Object / Predicate, MissingIndex → hint). DDL is refused.
+- ANALYZE of a write (`classifyStatement`) asks first and runs `BEGIN` (MySQL `START TRANSACTION`) … `ROLLBACK`; in a
+  manual / typed transaction `SAVEPOINT dt_explain` … `ROLLBACK TO SAVEPOINT dt_explain` + `RELEASE`. The switches
+  persist in `settings.explain`; toggling them in the plan header re-explains.
+- Plan view (result item "Plan"): ANALYZE banner, header (info: EXPLAIN ANALYZE · execution · planning · time; ANALYZE
+  / BUFFERS switches; Tree / Raw; Copy plan), hint line, tree (node + relation / index, detail line; rows est → actual
+  with `×N under/over` when ≥ 10×; self time — inclusive `Actual Total Time × loops` minus children — or share of self
+  cost; cost; slowest node badge), details of the clicked node. Raw: PostgreSQL text plan rendered from the JSON,
+  MySQL JSON / tree text, SQLite tree, SQL Server XML. Hint (`planHint`): the full scan (Seq Scan, MySQL ALL / Table
+  scan, SQLite `SCAN t`, SQL Server Table / Clustered Index Scan) with the largest share, when dominant (slowest or
+  ≥ 30 %) and large (≥ 10 000 rows scanned; SQLite always), with a column from its filter (else the statement's
+  WHERE) → text + `CREATE INDEX idx_<table>_<col> ON <schema.table> (<col>);` (SQL Server: its MissingIndex).
+
+### Sessions & locks (board W)
+- Explorer data source menu **Sessions & locks** (SQL sources), Console menu, ⌘K → a tab (`SessionsPane`) per data
+  source with its **own session** (`open_session(connId, null)`, closed with the tab). SQLite → "doesn't apply".
+- Queries (`sessionQueries`): PostgreSQL `pg_stat_activity` + `array_to_string(pg_blocking_pids(pid), ',')`, duration
+  from query_start (active) / xact_start (idle in transaction) / state_change, `pid = pg_backend_pid()` = self,
+  non-client backend_type = background. MySQL `information_schema.PROCESSLIST` (Sleep → idle, Query → active, Daemon
+  / Binlog → background, `CONNECTION_ID()` = self) + `INNODB_TRX` (sleeping with a transaction → idle in transaction)
+  + lock waits from `sys.innodb_lock_waits`, else `performance_schema.data_lock_waits`, else
+  `information_schema.INNODB_LOCK_WAITS` (first that works). SQL Server `sys.dm_exec_sessions` + `dm_exec_requests`
+  (+ `blocking_session_id`) + `dm_exec_sql_text`, user processes, `@@SPID` = self.
+- UI: columns pid · user · application · state (dot, `blocks N` / `this tab` badges) · duration · waiting on · query;
+  Active only, Hide idle, search; Auto-refresh 2 / 5 / 10 s (default 5, only while visible); lock chain banner
+  (`lockChains`: roots that block and wait for nobody listed, largest first; cycles reported) with Select blocker;
+  row details with the full query, Copy query, **Cancel query** / **Kill session** → confirmation with the exact
+  command: PostgreSQL `SELECT pg_cancel_backend(pid)` / `pg_terminate_backend(pid)`, MySQL `KILL QUERY pid` /
+  `KILL pid`, SQL Server `KILL pid` (no cancel). The tab's own session is disabled; pids must be digits.
+
+### Snippets (board W)
+- Built-ins: sel, selw, cnt, ins, upd, del, j, lj, gb, ob, selc, today, lim (PG / MySQL / SQLite), top (SQL Server),
+  locks (PostgreSQL). A user snippet with a built-in's abbreviation replaces it (Reset to built-in), hidden
+  built-ins are removed (Restore built-in snippets).
+- Expansion (SQL consoles): the expand key (Tab default) with completion closed and a word before the caret (line
+  start / after whitespace, `(`, `,`, `;`; not in a string, comment or after `.`) equal to an abbreviation for the
+  console's dialect; with completion open Tab accepts a selected snippet item (items: label = abbreviation, detail
+  `{} name`, info = body). Bodies become CodeMirror `snippet()` templates: `$TABLE` → `${1:table}`, `$COLUMN` →
+  `${2:column}` (repeats linked), `$CURSOR` → `${3}`, `$SELECTION` → the text the typed abbreviation replaced, `$DATE`
+  → `'YYYY-MM-DD'` (unquoted inside quotes), braces escaped. A first `$TABLE` / `$COLUMN` field (or the caret after
+  FROM / JOIN / INTO / UPDATE) opens completion; inside a selected `table` / `column` field it lists the cached tables
+  / the statement's columns unfiltered. Settings › **Snippets**: list, editor (abbreviation, description, body,
+  placeholder chips, dialects), Expand with Tab / Enter / Space, Show in completion.
+
+### Production safety (board W)
+- Connection dialog section **Production data source** (switch, color, Confirm before writes, Type the data source
+  name for DROP / TRUNCATE, explorer preview). Marked sources: explorer `PROD` tag in the color, ⌘K detail "· PROD",
+  a `PRODUCTION · <name>` bar at the top of their consoles (note: writes ask / DROP & TRUNCATE ask / no confirmation).
+- Before running (after parameters): writes among the statements that run natively (`classifyStatement`: INSERT /
+  REPLACE / UPSERT, UPDATE, DELETE, MERGE, SELECT … INTO, data-modifying WITH, EXPLAIN ANALYZE of a write, DDL — CREATE
+  / ALTER / DROP / TRUNCATE / RENAME / GRANT / REVOKE / COMMENT —, CALL / EXEC / DO / COPY …) need confirmation when
+  `confirmWrites`, or when destructive (DROP / TRUNCATE) and `typeNameForDrop`. One write → dialog: data source ·
+  database, statement kind, table, filter (UPDATE / DELETE; "(no WHERE clause)" in red), **Affects** filled in later
+  from an estimate (PostgreSQL `EXPLAIN (FORMAT JSON)` Plan Rows — ModifyTable's input —, MySQL `EXPLAIN` rows,
+  DROP / TRUNCATE `pg_class.reltuples` / `information_schema.TABLES.TABLE_ROWS`; only with an open auto-commit
+  session and no typed transaction, 4 s cap), warning (no WHERE / data removed permanently), the statement, and the
+  typed name when required. Several → one summary dialog. Cancel → nothing runs. When the production dialog applies,
+  Settings › Confirm risky statements is not asked as well (otherwise it still applies).
+- AI: `isProdConnection` = marked production first; the name / folder "prod" and read-only heuristic stays as the
+  fallback; the refusal names the reason ("is marked as a production data source").
+- Not covered by the confirmation: grid edits (apply_edits), Run SQL file (keeps its own production warning) and
+  Redis / Kafka consoles.
+
+## v0.16 — value viewer, DDL, import, table designer
+
+Approved designs: `/home/claude/canvas/project/ValueDdl.dc.html` (T), `ImportDesign.dc.html` (V). Backend
+`src-tauri/src/ddl.rs` + `ddlgen.rs` (std-only text assembly, `rustc --edition 2021 --test src/ddlgen.rs`),
+`import.rs` + `importfmt.rs` (std-only parsing / conversion / SQL, `rustc --edition 2021 --test src/importfmt.rs`),
+state `import::ImportRuns`; one new session job `Job::Params { sql, params }` (`Session::exec_params`, rows affected;
+refused on read-only; `DbConn::exec_edit` is now pub). Frontend `src/ui/valueViewer.ts` + `valueFormat.ts` (pure),
+`ddlPane.ts`, `designerPane.ts` + `designerSql.ts` (pure), `importWizard.ts`, `sqlHighlight.ts` (pure), glue
+`dataTools.ts` / `dataActions.ts`, styles `src/styles/data.css`; node tests `node scripts/test-data-tools.mjs`.
+
+| command | args | returns |
+|---|---|---|
+| get_ddl | sessionId, request: DdlRequest | string (the CREATE statement(s), ends with "\n") |
+| table_extras | sessionId, schema: string\|null, table | TableExtras |
+| import_preview | path, format: ImportFormat\|null, checkTypes: (string\|null)[]\|null | ImportPreview |
+| import_run | sessionId, path, request: ImportRequest, runId | ImportProgress (final; events `import-progress`) |
+| import_cancel | runId | null |
+
+### Cell value viewer (frontend only)
+- A panel docked right of the ResultGrid (`.grid.vv-open`, width min(452px, 46%)); follows the selected cell (the
+  grid calls `viewer.update()` from `updateBar`). Opens on double-click of a cell that `wantsViewer` (string longer
+  than 120 chars or with a line break, json/jsonb column, `{…}`/`[…]` that parses, binary column; other cells keep the
+  inline editor), ⇧↵ with the grid focused, or the cell menu **Open value** (⇧↵). Esc closes it.
+- Modes Text | JSON | Hex; default Hex for bytea/BLOB/binary/varbinary/image or `0x…` values, JSON for json columns or
+  parseable JSON, else Text; a mode picked by hand sticks while the selection stays in that column. JSON uses its own
+  parser (numbers kept verbatim), 2-space pretty lines with ▾/▸ fold per container, Fold all (= every container
+  under the root) / Unfold all; Wrap (remembered, localStorage `dt.viewer.wrap`); size (UTF-8 bytes) + line count;
+  Copy (whole value). Caps: 2 MB of text, 20 000 JSON lines, 64 KB of hex (notes say so); binary cells carry the first
+  4 KB (v0.1 wire rule) — noted.
+- ✎ Edit (editable results only; not binary, not > 2 MB): CodeMirror `TextEditor` with JSON colors while valid; JSON
+  (json column or JSON mode) is validated live (`✕ message · line L, column C`, Save disabled). **Save to grid**
+  (⌘↵) → the grid's `setCell(ri, c, parseValue(...))`: a pending edit, Submit / Revert as before. A value that was
+  single-line is stored compacted (numbers verbatim), otherwise as typed.
+
+### Show DDL
+- `DdlRequest { kind: "table"|"view"|"materialized"|"function"|"procedure"|"sequence"|"index", schema, name, arguments?
+  (routine overload, as introspected), table? (indexes), options: { indexes, comments, qualified } }` (options default
+  true). Runs catalog queries with `Session::execute` on the explorer session of that database (no history).
+- PostgreSQL: CREATE TABLE built from pg_attribute (format_type, NOT NULL, pg_get_expr defaults, identity PG10+,
+  generated PG12+, non-default collation), pg_get_constraintdef (p, u, c, x, f), `PARTITION BY` (pg_get_partkeydef),
+  UNLOGGED, indexes not backing a constraint via pg_get_indexdef, COMMENT ON TABLE / COLUMN; views
+  `CREATE OR REPLACE VIEW … AS` pg_get_viewdef, materialized views (+ indexes); functions / procedures
+  pg_get_functiondef (+ COMMENT ON FUNCTION); sequences from pg_sequence (PG10+) + OWNED BY; foreign tables noted.
+  Unqualified: DataTrip's own names are bare and `ON schema.` of index defs / the routine header are stripped.
+- MySQL: SHOW CREATE TABLE / VIEW / FUNCTION / PROCEDURE (routines wrapped in `DELIMITER ;;`), MariaDB SHOW CREATE
+  SEQUENCE; indexes from information_schema.STATISTICS. Indexes off = plain / FULLTEXT / SPATIAL KEY lines dropped;
+  comments off = ` COMMENT '…'` clauses removed; qualified = `` `db`. `` inserted before the object name.
+- SQL Server: built from sys.columns / identity_columns / default_constraints / computed_columns / key_constraints /
+  foreign_keys / check_constraints / indexes (INCLUDE, filter, columnstore; XML / spatial noted) and MS_Description
+  (sp_addextendedproperty); views / procedures / functions / triggers OBJECT_DEFINITION (NULL → encrypted or no VIEW
+  DEFINITION permission); sequences from sys.sequences; PK / UQ indexes as ALTER TABLE … ADD CONSTRAINT.
+- SQLite: sqlite_master.sql of the table / view, its indexes (when on) and triggers; automatic indexes noted.
+- UI: explorer menus of tables / views / materialized views, routines, sequences and index rows get **Show DDL**
+  (hint = the shortcut); action `showDdl` (default Mod-Alt-D in every preset; acts on the explorer's selected row, else
+  the active console's table; not while typing in a text field), command id `showDdl` (File menu, palette). A tab
+  `TabPane.kind "ddl"` titled `<name> — DDL` (an open one for the same object is focused and reloaded): header path +
+  kind · data source, toggles (Indexes only for tables / materialized views; Comments and Schema-qualified disabled for
+  SQLite), Copy, **Open in console** (new console on that database, not run, toast); body = numbered, highlighted
+  lines starting with `-- db.schema.name · kind · source (driver)`; footer "Read from the catalog · N lines · HH:MM".
+  DDL and designer tabs are not restored on launch (workspace `active` index counts saved tabs only).
+  Note: macOS reserves ⌥⌘D for "Hide Dock" — remap in Settings › Keymap if it doesn't reach the app.
+
+### Table designer
+- Explorer: schema rows (and MySQL / SQLite database rows) › **New table…**; table rows › **Edit table…**; command ids
+  `newTable`, `designTable` (palette / File menu use the explorer selection or the active console). A tab
+  `TabPane.kind "design"` ("<table> — Design" / "New table — Design").
+- Loaded from the explorer's introspection (columns, PK, indexes, FKs) plus `table_extras`: `TableExtras { comments
+  (column → text), defaultConstraints (MSSQL column → constraint name), autoIncrement (identity / AUTO_INCREMENT
+  columns; "*" = SQLite AUTOINCREMENT), fkOnDelete (fk → action, NO ACTION omitted), createSql (SQLite), tableComment }`
+  (each part best-effort).
+- Columns grid: name, type (free text + ▾ per-dialect list `TYPE_LISTS`), Not null, Default (SQL expression; true /
+  false → 1 / 0 outside PostgreSQL, now() → SYSUTCDATETIME() / CURRENT_TIMESTAMP), PK (sets Not null), comment;
+  ▲▼ reorder, ✕ drop (new rows are removed), ↺ restore; rows marked new / changed / dropped. Indexes (name, columns as
+  typed, unique; the PK index is read-only) and Foreign keys (new: name, columns, referenced table + columns, ON DELETE;
+  existing: drop / restore only; "Referenced by" from explorer metadata).
+- SQL (`designSql`, `src/ui/designerSql.ts`): new table → CREATE TABLE (+ PRIMARY KEY, FK constraints; MSSQL
+  `CONSTRAINT PK_<t>`), CREATE INDEX, comments (PG COMMENT ON, MSSQL sp_addextendedproperty, MySQL inline COMMENT,
+  SQLite note). Existing: dropped FKs / indexes first, then per column — PG ADD / DROP / RENAME COLUMN, ALTER COLUMN
+  TYPE … USING col::type, SET / DROP NOT NULL, SET / DROP DEFAULT, COMMENT ON COLUMN; MySQL ADD COLUMN … AFTER / FIRST,
+  RENAME COLUMN (rename only), CHANGE / MODIFY COLUMN with the full definition (AUTO_INCREMENT and COMMENT kept),
+  reorder via MODIFY … AFTER; MSSQL ADD … NULL|NOT NULL [CONSTRAINT DF_<t>_<c> DEFAULT …], drop the default constraint
+  before DROP COLUMN / a default change, sp_rename for columns / indexes / the table, ALTER COLUMN type NULL|NOT NULL,
+  sp_add/update/dropextendedproperty; PK change (DROP CONSTRAINT <pk name> + ADD PRIMARY KEY; MySQL DROP PRIMARY KEY,
+  ADD PRIMARY KEY); new / changed indexes (changed = drop + create; renamed only → ALTER INDEX … RENAME / RENAME INDEX /
+  sp_rename); new FKs; table rename last. Identifiers quoted only when needed. Reorder on PG / MSSQL → note only.
+  SQLite: ADD COLUMN (unless PK or NOT NULL without default), RENAME COLUMN, DROP COLUMN, indexes in place; type / NOT
+  NULL / default / PK / order / FK changes → the rebuild: `PRAGMA foreign_keys = OFF; CREATE TABLE <t>_new (…);
+  INSERT INTO <t>_new (kept cols) SELECT original names FROM <t>; DROP TABLE <t>; ALTER TABLE <t>_new RENAME TO <t>;`
+  recreate indexes, `PRAGMA foreign_keys = ON;` (INTEGER PRIMARY KEY AUTOINCREMENT kept).
+- Apply… → confirmation (statements, data source · dialect · production flag; MySQL: "commits each DDL statement on
+  its own…") → a dedicated session (`open_session`, closed afterwards) runs `BEGIN` / `BEGIN TRANSACTION`, the
+  statements via `execute` (so they are in the history), COMMIT; any error → ROLLBACK, the message and the failing
+  statement are shown. MySQL: no transaction, stops at the first error. SQLite PRAGMAs run outside the transaction.
+  Then `store.refreshDb` and the design reloads ("✓ Applied N statements in X ms · table reloaded"). Read-only data
+  sources: Apply disabled.
+
+### Import data
+- `ImportFormat { kind: "csv"|"json"|"ndjson"|null, delimiter, quote ("" = none, null = "), header, encoding:
+  "utf8"|"utf16le"|"utf16be"|"latin1"|null, nullText, dateFormat, flatten }` — null = detect. Detection (first 1 MiB):
+  BOM / valid UTF-8 / UTF-16 without BOM (zero-byte pattern) / else Latin-1 (Windows-1252, note); kind by extension
+  (.csv .tsv .tab .txt .json .ndjson .jsonl) then content (`[` → array, `{` → NDJSON); delimiter among , ; Tab | with
+  the most consistent field count over ≤ 40 complete records; header = first row has no empty / duplicate / numeric /
+  date values.
+- CSV parser (`importfmt::CsvParser`, streaming): quoted fields with doubled quotes, delimiters and line breaks inside
+  quotes, CRLF / LF / CR, BOM dropped by the decoder, blank lines skipped, records keep their 1-based start line;
+  unterminated quote reported. JSON arrays are split element by element (`JsonArraySplitter`) and parsed with
+  serde_json; NDJSON line by line. JSON objects: nested objects → `a.b` columns when flatten (default), arrays / other
+  objects → JSON text, null → NULL; columns = union of keys in the sample, in first-seen order.
+- NULL rules: empty field (CSV) is NULL; a value equal to nullText is NULL (JSON: only nullText).
+- `ImportPreview { format (effective, all set), columns, rows (first 50), lines, sampleRows (≤ 1000), totalRows (exact
+  when the whole file fit in 1 MiB) | null, estimatedRows, fileSize, warnings (one column → "delimiter is probably
+  wrong", ragged rows, undecodable characters, Latin-1 mojibake → "most likely UTF-8", header off, unterminated quote,
+  bad JSON records), encodingNote, inferred: { kind: int|bigint|decimal|bool|date|timestamp|json|text, maxLen,
+  precision, scale, nullable }[], checks: (ImportCheck|null)[] }`. `checkTypes[i]` = target type of source column i:
+  each sample value is converted; `ImportCheck { value, line, message, bad (count), fix: { label, kind:
+  "dateFormat"|"nullText", value } | null }` — fix = the first of `DATE_CANDIDATES` parsing every sample value, or
+  "Treat “x” as NULL" when all failing values are the same short text.
+- Conversion (`importfmt::convert`, per target type class): int types → i64 (12.0 accepted); numeric / decimal / money
+  / float → validated number text (SQLite: number); bool (bool, boolean, bit, tinyint(1)) ← true/false/t/f/yes/no/y/n/
+  1/0 → PG 'true'/'false', MSSQL bit, MySQL / SQLite 1/0; date → `YYYY-MM-DD`; timestamp / datetime / datetime2 →
+  `YYYY-MM-DD HH:MM:SS[.f]` (zone kept for timestamptz / datetimeoffset and SQLite); values parsed with dateFormat
+  (tokens y M d H m s S; Y/D accepted; lower-case `mm` before any hour = month) else ISO (`-` or `/`, `T` or space,
+  Z / ±HH[:MM]); char/varchar(n) length checked; other types as text. A row with a failing value is reported (line,
+  column, value, message) without reaching the server.
+- `ImportRequest { format (the preview's effective one), sourceColumns, target: { schema, table, createSql: string[] (run
+  first) }, mapping: { source (index), column, typeName }[], keyColumns, options: { truncate, onConflict:
+  fail|skip|update, batchSize (1–100000), transaction: batch|single, stopAfter (failed rows; 0 = never) } }`.
+- import_run: refused on read-only and for Redis / Kafka. A blocking thread reads 256 KB chunks and sends batches
+  of rows; each batch becomes multi-row INSERTs with bound parameters, rows per statement = min(batch, param limit /
+  columns) with limits PG 65 000, MySQL 65 000, SQLite 32 000, MSSQL 2 000 parameters and ≤ 1000 rows. PG placeholders
+  `CAST($n AS <column type>)`, MySQL / SQLite `?`, MSSQL `@Pn`. Conflicts: PG / SQLite `ON CONFLICT DO NOTHING` /
+  `ON CONFLICT (keys) DO UPDATE SET c = EXCLUDED.c`; MySQL `INSERT IGNORE` / `ON DUPLICATE KEY UPDATE c = VALUES(c)`;
+  MSSQL skip = `INSERT … SELECT … FROM (VALUES …) AS s (…) WHERE NOT EXISTS (… key match)`, update = `MERGE … WHEN
+  MATCHED THEN UPDATE … WHEN NOT MATCHED THEN INSERT …;`. Update needs the keys mapped (also skip on MSSQL); a table
+  without non-key columns updates nothing. Skip counts `rows − affected` as skipped.
+- Transactions: **batch** — BEGIN / INSERTs / COMMIT per batch; a failing batch is rolled back and retried row by row
+  (each row on its own) to report the failing rows. **single** — BEGIN at the start (TRUNCATE inside it, except MySQL
+  where it runs first with a note), a SAVEPOINT `dt_import` per statement (MSSQL SAVE TRANSACTION), failing statements
+  rolled back to it and retried row by row with a savepoint each; at the end COMMIT only when nothing failed, else
+  ROLLBACK (`rolledBack`, counts reset, note "One transaction (all or nothing) …"). A server that ends the transaction
+  stops the run. `stopAfter` failed rows → stopped. TRUNCATE (SQLite `DELETE FROM`) runs before the rows.
+- `ImportProgress { runId, rowsRead, inserted (update mode: inserted or updated), skipped, failed, bytesDone,
+  bytesTotal, elapsedMs, failures: { n (sequence, dedupe), line, column, value, message, row (mapped source values) }[]
+  (new since the previous event; first 1000 kept), finished, cancelled, rolledBack, stopped, note }`, events at most
+  every 150 ms plus one per batch with failures and a final one. import_cancel: flag + `Session::cancel`; an open
+  transaction is rolled back.
+- UI (`importWizard.ts`): explorer table rows › **Import data…** (that table), schema rows (and MySQL / SQLite
+  database rows) › Import data… (choose a table or create one), command id `importData` (File menu, palette). Steps
+  File (native open dialog: csv tsv txt tab json ndjson jsonl) → Format (file type, delimiter, quote, header,
+  flatten, encoding, NULL text, date format; preview re-read on every change; warnings) → Target (existing table:
+  name / contains auto-mapping, a menu per source column incl. "skip", the backend checks with one-click fixes; new
+  table: name (file name), include / name / type per column with `typeForKind` defaults per dialect and the ▾ type
+  list) → Options (truncate with warning, conflict seg only with the key mapped, batch size, transactions, stop after,
+  SQL plan text, production note) → Import (production or truncate → confirm first; a dedicated session; progress bar
+  by bytes, counts, rows/s and time left, failed rows (first 200 shown), Stop; afterwards Save failed rows as CSV…
+  (line + mapped source columns + error), Copy errors, Open <table>). Closing while running continues in the
+  background with a toast at the end. The explorer database is refreshed after a created table / inserted rows.
+- Not in this version: dropping a file onto the wizard, pasting from the clipboard (the board's "Paste from
+  clipboard"), Pause.

@@ -449,7 +449,8 @@ impl DbConn {
         })
     }
 
-    fn exec_edit<'a>(
+    /// One parameterized statement (row edits, v0.16 import); rows affected.
+    pub fn exec_edit<'a>(
         &'a mut self,
         sql: &'a str,
         params: &'a [Value],

@@ -5,6 +5,8 @@ import { api } from "../api";
 import { h, icon } from "./dom";
 import { typeInfo } from "./redis";
 import type { TabPane } from "./tabs";
+import { parseRemembered } from "./params";
+import type { RememberedParams } from "./params";
 
 export type WsKind = TabPane["kind"];
 
@@ -38,6 +40,8 @@ export interface WsConsole {
   crossSource?: boolean;
   /** v0.15: the .sql file the console is bound to (absent / null = a plain console). */
   file?: { path: string; mtimeMs: number | null; dirty: boolean } | null;
+  /** v0.16: parameter values remembered for this console ("Remember values for this console"). */
+  params?: RememberedParams | null;
 }
 
 export interface WsTab {
@@ -96,6 +100,7 @@ function parseConsole(v: unknown): WsConsole {
     fedShown: c.fedShown === true,
     crossSource: c.crossSource === true,
     file: parseFile(c.file),
+    params: parseRemembered(c.params),
   };
 }
 

@@ -37,6 +37,11 @@ pub enum Job {
     ListDatabases,
     ServerObjects,
     Edits(Vec<RowEdit>),
+    /// v0.16 import: one parameterized statement (multi-row INSERT); returns rows affected.
+    Params {
+        sql: String,
+        params: Vec<serde_json::Value>,
+    },
     Simple(String),
     RedisScan {
         pattern: String,
@@ -371,6 +376,15 @@ impl Session {
                     let n = conn.apply_edits(&edits, manual).await?;
                     Ok(JobOut::Count(n))
                 }
+                Job::Params { sql, params } => {
+                    if self.config.read_only {
+                        return Err(AppError::new(
+                            "This connection is read-only; writes are not allowed",
+                        ));
+                    }
+                    self.begin_if_needed(conn).await?;
+                    Ok(JobOut::Count(conn.exec_edit(&sql, &params).await?))
+                }
                 Job::Simple(sql) => {
                     conn.run_simple(&sql).await?;
                     Ok(JobOut::Unit)
@@ -499,6 +513,18 @@ impl Session {
 
     pub async fn apply_edits(self: &Arc<Self>, edits: Vec<RowEdit>) -> AppResult<u64> {
         match self.run(Job::Edits(edits)).await? {
+            JobOut::Count(n) => Ok(n),
+            _ => Err(AppError::new("Unexpected result")),
+        }
+    }
+
+    /// Runs one parameterized statement (v0.16 import); returns rows affected. No history.
+    pub async fn exec_params(
+        self: &Arc<Self>,
+        sql: String,
+        params: Vec<serde_json::Value>,
+    ) -> AppResult<u64> {
+        match self.run(Job::Params { sql, params }).await? {
             JobOut::Count(n) => Ok(n),
             _ => Err(AppError::new("Unexpected result")),
         }

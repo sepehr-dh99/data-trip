@@ -4,6 +4,7 @@ import { api } from "../api";
 import type { AiProviderId, AiProviderStatus, ConnectionConfig, Driver } from "../types";
 import { getSettings } from "./settings";
 import type { AppSettings } from "./settings";
+import { prodOptions } from "./prodSafety";
 
 export const AI_PROVIDER_NAMES: Record<AiProviderId, string> = {
   codex: "Codex CLI",
@@ -25,16 +26,20 @@ export type { ContextInput, PickedTable, SchemaContext } from "./aiContext";
 /** "prod" / "production" as a word of the name or folder ("Prod PG", "eu-prod", "prod_db", folder "Production"). */
 const PROD = /(?:^|[^a-z0-9])prod(?:uction)?(?:[^a-z0-9]|$)/i;
 
-/** A data source is treated as production when it is read-only or its name / folder says "prod". */
+/**
+ * A data source is treated as production when it is marked so in its connection dialog (v0.16, the primary signal),
+ * else (fallback heuristic) when it is read-only or its name / folder says "prod".
+ */
 export function isProdConnection(c: ConnectionConfig | null | undefined): boolean {
   if (!c) return false;
+  if (prodOptions(c)) return true;
   return c.readOnly === true || PROD.test(c.name) || PROD.test(c.folder ?? "");
 }
 
 /** Why AI is refused for this data source (Settings › Block AI for production), or null. */
 export function aiBlockedReason(c: ConnectionConfig | null | undefined, s: AppSettings = getSettings()): string | null {
   if (!c || !s.ai.blockProd || !isProdConnection(c)) return null;
-  const why = c.readOnly ? "is read-only" : "looks like production";
+  const why = prodOptions(c) ? "is marked as a production data source" : c.readOnly ? "is read-only" : "looks like production";
   return `AI is off for “${c.name}”: it ${why} and “Block AI for production data sources” is on (Settings › AI assistant).`;
 }
 

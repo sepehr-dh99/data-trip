@@ -509,6 +509,150 @@ Also good to know: a name that is no data source, database or schema is underlin
     keywords: "authentication failed password access denied login failed user wrong credentials",
     related: ["connect", "trouble-vault-denied"],
   },
+  // ------------------------------------------------------------------ v0.16
+  {
+    id: "query-parameters",
+    topic: "console",
+    title: "Query parameters",
+    lead: "Write :name, ? or $1 in a statement and DataTrip asks for the values when you run it.",
+    body: `- \`:name\` works everywhere; \`?\` in MySQL, SQLite and SQL Server; \`$1\`, \`$2\`… in PostgreSQL. Casts (\`::int\`), strings, comments and $$ bodies are left alone. Parameters are highlighted in the editor.
+- {key:runStatement} opens **Run with parameters** under the statement: one row per parameter with the column it is compared to (from the cached schema), text / number / date, the value and a **NULL** toggle. Invalid numbers and dates are flagged.
+- **Remember values for this console** keeps them for the next run (and across restarts with restore on launch).
+- The values used appear as chips above the result; **Edit parameters** runs it again.
+
+> Values are written into the statement as properly quoted literals for the data source's dialect (numbers checked, text escaped, dates quoted), so paging, Count rows and cross-source queries keep working.
+
+> \`col = NULL\` never matches a row — use \`col IS NULL\` to find missing values.
+
+\`\`\`sql
+SELECT id, status, total FROM orders
+WHERE customer_id = :customer_id AND created_at >= :from_date;
+\`\`\``,
+    keywords: "bind variables placeholders prepared statement question mark dollar named parameter",
+    related: ["consoles", "explain-plan"],
+  },
+  {
+    id: "explain-plan",
+    topic: "console",
+    title: "Explain plan",
+    lead: "See how the database runs a statement: the plan tree with estimated vs actual rows, time per step and an index hint.",
+    body: `1. Put the caret in a statement and press {key:explain} (or **Explain** in the console toolbar, Console › Explain plan, ⌘K).
+2. The plan replaces the results: each node with its relation / index, rows estimated → actual (×N flags a misestimate), self time or share of cost, and cost. The slowest node is marked; click a node for its details.
+3. **ANALYZE** executes the statement for real timings (PostgreSQL, MySQL 8.0.18+); **BUFFERS** adds I/O (PostgreSQL). A write is only analyzed after you confirm, inside BEGIN … ROLLBACK.
+4. **Raw** shows the text plan; **Copy plan** copies it. A full scan with a filter on a column gets a hint and **Copy CREATE INDEX**.
+
+> PostgreSQL uses EXPLAIN (FORMAT JSON), MySQL EXPLAIN FORMAT=JSON / EXPLAIN ANALYZE, SQLite EXPLAIN QUERY PLAN and SQL Server SHOWPLAN_XML (estimated plan).`,
+    keywords: "explain analyze query plan slow performance index seq scan cost buffers showplan",
+    tryIt: { label: "Explain the statement at the cursor", command: "explain" },
+    related: ["consoles", "query-parameters"],
+  },
+  {
+    id: "sessions-locks",
+    topic: "console",
+    title: "Sessions & locks",
+    lead: "Right-click a data source → Sessions & locks: every server session, what it runs, how long, and who blocks whom.",
+    body: `- Columns: pid, user, application, state, duration, what it waits on and the query. Filter **Active only**, **Hide idle** or search; **Auto-refresh** every 2, 5 or 10 s.
+- Lock-wait chains are traced: the banner names the session at the head of the chain (**Select blocker**), blocked sessions are tinted.
+- Select a row for the full query, **Copy query**, **Cancel query** or **Kill session**. The confirmation shows the exact command (PostgreSQL \`pg_cancel_backend\` / \`pg_terminate_backend\`, MySQL \`KILL QUERY\` / \`KILL\`, SQL Server \`KILL\`).
+- The tab queries through its own session, which can't be cancelled or killed. SQLite has no server sessions.
+
+> Listing other users' sessions and killing them needs privileges (PostgreSQL pg_signal_backend / superuser, MySQL PROCESS / CONNECTION_ADMIN, SQL Server VIEW SERVER STATE / ALTER ANY CONNECTION).`,
+    keywords: "processlist pg_stat_activity blocking locks deadlock kill cancel terminate running queries activity monitor",
+    tryIt: { label: "Open Sessions & locks", command: "sessions" },
+    related: ["production-safety"],
+  },
+  {
+    id: "snippets",
+    topic: "console",
+    title: "Snippets",
+    lead: "Type an abbreviation like sel and press Tab: it expands into SQL with placeholders to fill in.",
+    body: `- Built-ins: \`sel\`, \`selw\`, \`cnt\`, \`ins\`, \`upd\`, \`del\`, \`j\`, \`lj\`, \`gb\`, \`ob\`, \`lim\` / \`top\`, \`locks\` (PostgreSQL)…
+- Tab expands when the completion list isn't open; snippets also appear in completion (marked {}), where Tab or ↵ expands the selected one.
+- Placeholders: \`$CURSOR\` (where the caret lands), \`$TABLE\` / \`$COLUMN\` (fields completed with table / column names; Tab jumps to the next, Esc leaves), \`$SELECTION\` (text you selected before typing the abbreviation), \`$DATE\` (today).
+- Settings › Snippets lists them: edit a built-in (Reset to built-in undoes it), add your own, pick the dialects, the expand key (Tab / Enter / Space) and whether they show in completion.`,
+    keywords: "live templates abbreviations expand tab templates placeholders",
+    tryIt: { label: "Open Settings › Snippets", command: "snippets" },
+    related: ["consoles"],
+  },
+  {
+    id: "production-safety",
+    topic: "connect",
+    title: "Production data sources",
+    lead: "Mark a data source as Production in its connection dialog: a colored bar in its consoles and confirmations before writes.",
+    body: `- Connection dialog › **Production data source**: pick a color. The explorer shows a PROD tag, ⌘K results too, and its consoles a thin **PRODUCTION · name** bar.
+- **Confirm before writes** (on by default): INSERT, UPDATE, DELETE, MERGE and DDL first show the statement kind, table, WHERE filter and estimated rows (PostgreSQL / MySQL planner estimate). UPDATE / DELETE without WHERE get a warning.
+- **Type the data source name for DROP / TRUNCATE** (on by default): an extra step for statements that remove whole tables or all rows.
+- Plain SELECTs run as usual. On production sources this confirmation replaces "Confirm risky statements" (you're never asked twice).
+- AI is blocked for production data sources while "Block AI for production data sources" is on (names containing "prod" and read-only sources still count when nothing is marked).`,
+    keywords: "production prod safety confirm writes drop truncate guard color bar dangerous",
+    related: ["connect", "sessions-locks", "ai-assistant"],
+  },
+
+  // ------------------------------------------------------------------ v0.16: value viewer, DDL, import, designer
+  {
+    id: "value-viewer",
+    topic: "results",
+    title: "View and edit long values (JSON, text, binary)",
+    lead: "Long, multi-line, JSON and binary cells open in a value viewer docked right of the result grid. It follows the selected cell.",
+    body: `- Open it with a **double-click** on a long / JSON / binary cell (short values still edit inline), **{bind:Shift-Enter}** with the grid focused, or right-click › **Open value**.
+- **Text**, **JSON** (formatted and colored; ▾ / ▸ fold a node, **Fold all** / **Unfold all**) and **Hex** (the default for bytea / BLOB / varbinary). **Wrap** wraps long lines; the size and line count are shown on the right.
+- **Copy** copies the whole value. Very large values show their first 2 MB.
+
+## Editing
+On an editable result, **✎ Edit** opens the value in an editor. JSON is checked as you type (the error shows its line and column). **Save to grid** ({bind:Mod-Enter}) puts it in the grid as a pending change — **Submit** writes it like any other cell edit, **Revert** drops it.
+
+> Numbers in JSON are kept exactly as written, so big ids don't lose digits. Binary values (shown as 0x…, the first 4 KB) can't be edited here.`,
+    keywords: "json viewer cell value long text blob bytea hex binary fold format pretty edit large",
+    related: ["results"],
+  },
+  {
+    id: "show-ddl",
+    topic: "results",
+    title: "Show DDL",
+    lead: "Right-click a table, view, materialized view, routine, sequence or index in the explorer › Show DDL ({key:showDdl}) to see its CREATE statement.",
+    body: `A read-only tab "name — DDL" shows the statement read from the database catalog, highlighted:
+- Tables: columns with types, defaults, NOT NULL and identity, constraints (primary / unique / check / foreign keys), and — toggle **Indexes** — their indexes, plus **Comments**.
+- Views and routines show their source; sequences their settings.
+- **Schema-qualified** writes \`schema.table\` names.
+- **Copy**, or **Open in console** to edit and run a changed version (nothing runs until you do).
+
+{key:showDdl} works on the object selected in the explorer, or on the table of the active console.
+
+> PostgreSQL and SQL Server DDL is assembled from the system catalog; MySQL uses SHOW CREATE …; SQLite shows the statement stored in sqlite_master.`,
+    keywords: "ddl create statement definition source script schema export structure show create",
+    related: ["table-designer"],
+  },
+  {
+    id: "import-data",
+    topic: "results",
+    title: "Import data from CSV or JSON",
+    lead: "Right-click a table (or a schema) › Import data… — a 5-step wizard streams a CSV, TSV, JSON array or NDJSON file into a table.",
+    body: `1. **File**: choose the file (any size: it is read in chunks, never whole).
+2. **Format**: the delimiter, quote, header row and encoding are detected — change anything and the preview of the first 50 rows updates. Empty fields are NULL; **Treat as NULL** adds a text such as \`n/a\`. **Date format** (e.g. \`dd/MM/yyyy\`) reads dates that aren't YYYY-MM-DD; they are stored as ISO.
+3. **Target**: map each file column to a column of an existing table (matched by name; each column is checked against its type, with one-click fixes such as "Use dd/MM/yyyy"), or **create a new table** with inferred, editable types.
+4. **Options**: empty the table first, what to do when the key already exists (fail the row, skip, or update), batch size, and **Commit each batch** or **One transaction** (all or nothing). The SQL that will run is shown.
+5. **Import**: progress, inserted / skipped / failed counts and the failed rows with their reason. **Stop** stops (an open transaction is rolled back). Save the failed rows as CSV to fix and import them again.
+
+Rows are written with bound parameters in multi-row INSERTs, kept under each server's parameter limit. A dedicated session is used, so your consoles' transactions aren't touched.
+
+> On MySQL "Skip" uses INSERT IGNORE, which also turns some other row errors into warnings. On SQL Server, Skip / Update need the primary key mapped.`,
+    keywords: "import csv tsv json ndjson load upload file bulk insert wizard upsert truncate encoding delimiter",
+    tryIt: { label: "Import data…", command: "importData" },
+    related: ["table-designer", "run-sql-file"],
+  },
+  {
+    id: "table-designer",
+    topic: "results",
+    title: "Design a table",
+    lead: "Right-click a schema › New table…, or a table › Edit table…: columns, indexes and foreign keys in a grid, with the exact SQL shown as you go.",
+    body: `- **Columns**: name, type (▾ lists the engine's types; any type can be typed), Not null, Default (an SQL expression: \`'text'\`, \`0\`, \`now()\`), PK and comment. ▲▼ reorder, ✕ drops, ↺ restores. Rows are marked new, changed or dropped.
+- **Indexes** and **Foreign keys** tabs add or drop indexes / constraints.
+- The **SQL preview** shows exactly what runs: CREATE TABLE for a new table, ALTER TABLE … for an existing one, in the engine's syntax. SQLite can't change a column's type, NOT NULL, default, key or order in place: DataTrip rebuilds the table (copy → drop → rename).
+- **Apply…** asks first, then runs the statements in one transaction (PostgreSQL, SQL Server, SQLite: if one fails, nothing changes). MySQL commits each DDL statement on its own: they run in order and stop at the first error. The explorer refreshes and the design reloads.`,
+    keywords: "table designer create alter add column drop rename type index foreign key primary key schema ddl",
+    tryIt: { label: "New table…", command: "newTable" },
+    related: ["show-ddl", "import-data"],
+  },
 ];
 
 /** Error text → troubleshooting article (first match wins). `vault`: the data source uses Vault. */

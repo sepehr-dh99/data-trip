@@ -35,7 +35,10 @@ import { getSettings, onSettingsChange, updateSettings } from "./settings";
 import { openSettings } from "./settingsDialog";
 import { formatBinding, shortcutLabel } from "./keymap";
 import { FED_DRIVERS, TABLE_DRAG_MIME, setTableDrag, sourceRef } from "./federation";
+import { prodOptions, prodTagClass } from "./prodSafety";
 import type { TableDrag } from "./federation";
+import { importData, openDesigner, showDdl } from "./dataActions";
+import type { DbTarget } from "./dataTools";
 
 const OVERSCAN = 8;
 const GEAR_PATH =
@@ -92,6 +95,8 @@ export interface ExplorerHost {
   newCrossSource(connIds: string[]): void;
   /** Data source menu › Run SQL file… (v0.15). */
   runSqlFile(connId: string): void;
+  /** Data source menu › Sessions & locks (v0.16). */
+  openSessions?(connId: string): void;
   /** Sidebar toolbar: ? (help center). */
   openHelp(): void;
 }
@@ -151,6 +156,8 @@ interface RowSpec {
   dragKey?: string;
   /** A table / view row: dragged into a console it inserts its name (attaching its data source when needed). */
   dragTable?: TableDrag;
+  /** v0.16: the object Show DDL / Edit table / Import data act on (⌥⌘D uses the selected row's). */
+  target?: DbTarget;
   /** Connection id of a connection row (⌘/Ctrl-click multi-selection). */
   multiConn?: string;
   /** Folder appearance: icon stroked and name tinted in the folder's color. */
@@ -437,6 +444,9 @@ export class Explorer {
       badge,
       meta: metaParts.length ? metaParts.reverse().join(" · ") : undefined,
       metaCls: custom ? "drv" : undefined,
+      // v0.16: production data sources carry a colored PROD tag
+      tag: prodOptions(e.config) ? "PROD" : undefined,
+      tagCls: prodOptions(e.config) ? "prod-tag " + prodTagClass(prodOptions(e.config)?.color ?? "") : undefined,
       // Every connection shows a disclosure triangle: on an idle one it connects first.
       expandable: e.status !== "error" || connected,
       cls: "conn " + e.status,
@@ -574,11 +584,29 @@ export class Explorer {
       onContext: (ev) =>
         showMenu(ev.clientX, ev.clientY, [
           { label: "New console here", icon: "terminal", onClick: () => this.host.openConsole(id, { database: consoleDb }) },
+          ...this.schemaLevelItems(e, d.name),
           { label: "Refresh", icon: "refresh", onClick: () => void this.refreshDb(id, d.name) },
           { sep: true },
           { label: "Copy name", icon: "copy", onClick: () => this.host.copy(d.name) },
         ]),
     };
+  }
+
+  /** v0.16: "New table…" / "Import data…" on a database row of MySQL / SQLite (no schema level). */
+  private schemaLevelItems(e: ConnEntry, db: string): { label: string; icon: string; onClick: () => void }[] {
+    if (!this.skipSchemaLevel(e)) return [];
+    const schema = e.dbs.get(db)?.schemas[0]?.name ?? (e.config.driver === "sqlite" ? "main" : db);
+    const t: DbTarget = { connId: e.config.id, database: db, schema, kind: "schema" };
+    return [
+      { label: "New table…", icon: "plus", onClick: () => openDesigner(t, true) },
+      { label: "Import data…", icon: "download", onClick: () => importData(t) },
+    ];
+  }
+
+  /** v0.16: the selected row's object (Show DDL ⌥⌘D, palette actions). */
+  selectedTarget(): DbTarget | null {
+    if (!this.selected) return null;
+    return this.flat.find((f) => f.spec.key === this.selected)?.spec.target ?? null;
   }
 
   private async loadDb(e: ConnEntry, db: string): Promise<void> {
@@ -598,10 +626,13 @@ export class Explorer {
       meta: isDefault ? "default" : undefined,
       expandable: true,
       cls: "schema",
+      target: FED_DRIVERS.has(e.config.driver) ? { connId: id, database: db, schema: s.name, kind: "schema" } : undefined,
       children: () => this.schemaFolders(e, db, s),
       onContext: (ev) =>
         showMenu(ev.clientX, ev.clientY, [
           { label: "New console", icon: "terminal", onClick: () => this.host.openConsole(id, { database: consoleDb, schema: s.name }) },
+          { label: "New table…", icon: "plus", onClick: () => openDesigner({ connId: id, database: db, schema: s.name, kind: "schema" }, true) },
+          { label: "Import data…", icon: "download", onClick: () => importData({ connId: id, database: db, schema: s.name, kind: "schema" }) },
           { label: "Refresh", icon: "refresh", onClick: () => void this.refreshDb(id, db) },
           { sep: true },
           { label: "Copy name", icon: "copy", onClick: () => this.host.copy(s.name) },
@@ -628,17 +659,39 @@ export class Explorer {
     if (tables.length) out.push(folder("tables", "Tables", "table", tables.length, () => tables.map((t) => this.tableSpec(e, db, s, t))));
     if (views.length) out.push(folder("views", "Views", "view", views.length, () => views.map((t) => this.tableSpec(e, db, s, t))));
     if (mviews.length) out.push(folder("mviews", "Materialized views", "matview", mviews.length, () => mviews.map((t) => this.tableSpec(e, db, s, t))));
-    if (s.routines?.length) out.push(folder("routines", "Routines", "func", s.routines.length, () => s.routines.map((r) => this.routineSpec(base, r))));
+    if (s.routines?.length) out.push(folder("routines", "Routines", "func", s.routines.length, () => s.routines.map((r) => this.routineSpec(base, r, e, db, s.name))));
     if (s.sequences?.length) {
-      out.push(folder("seqs", "Sequences", "seq", s.sequences.length, () => s.sequences.map((q) => ({ key: `${base}seq:${q}`, label: q, icon: "seq", cls: "leaf" }))));
+      out.push(folder("seqs", "Sequences", "seq", s.sequences.length, () => s.sequences.map((q): RowSpec => {
+          const target: DbTarget = { connId: id, database: db, schema: s.name, name: q, kind: "sequence" };
+          return {
+            key: `${base}seq:${q}`,
+            label: q,
+            icon: "seq",
+            cls: "leaf",
+            target,
+            onContext: (ev: MouseEvent) =>
+              showMenu(ev.clientX, ev.clientY, [
+                { label: "Show DDL", icon: "view", hint: shortcutLabel("showDdl"), onClick: () => showDdl(target) },
+                { label: "Copy name", icon: "copy", onClick: () => this.host.copy(q) },
+              ]),
+          };
+        })));
     }
     if (out.length === 0) out.push(this.note(`em:${base}`, "Empty"));
     return out;
   }
 
-  private routineSpec(base: string, r: RoutineNode): RowSpec {
+  private routineSpec(base: string, r: RoutineNode, e: ConnEntry, db: string, schema: string): RowSpec {
     const sig = `${r.name}(${r.arguments ?? ""})`;
+    const target: DbTarget = { connId: e.config.id, database: db, schema, name: r.name, kind: r.kind, arguments: r.arguments };
     return {
+      target,
+      onContext: (ev: MouseEvent) =>
+        showMenu(ev.clientX, ev.clientY, [
+          { label: "Show DDL", icon: "view", hint: shortcutLabel("showDdl"), onClick: () => showDdl(target) },
+          { sep: true },
+          { label: "Copy name", icon: "copy", onClick: () => this.host.copy(r.name) },
+        ]),
       key: `${base}r:${sig}`,
       label: r.name,
       icon: r.kind === "procedure" ? "proc" : "func",
@@ -662,6 +715,9 @@ export class Explorer {
     const fkLabel = (fk: ForeignKeyNode): string => `→ ${fk.refSchema && fk.refSchema !== s.name ? fk.refSchema + "." : ""}${fk.refTable}(${fk.refColumns.join(", ")})`;
     const ixTag = (ix: IndexNode): string | undefined => (ix.primary ? "PK" : ix.unique ? "unique" : undefined);
     const hasKids = t.columns.length > 0;
+    const ddlTarget: DbTarget = { connId: id, database: db, schema: s.name, name: t.name, kind: t.kind };
+    const sqlSrc = FED_DRIVERS.has(e.config.driver);
+    const isTable = t.kind === "table";
     return {
       key,
       label: t.name,
@@ -670,6 +726,7 @@ export class Explorer {
       cls: "table",
       title: t.comment ? `${s.name}.${t.name} — ${t.comment}` : `${s.name}.${t.name}`,
       dragTable: FED_DRIVERS.has(e.config.driver) ? { connId: id, database: db, schema: s.name, table: t.name } : undefined,
+      target: FED_DRIVERS.has(e.config.driver) ? ddlTarget : undefined,
       onOpen: () => this.expanded.add(colsKey),
       onClick: (ev, spec) => {
         if (ev.detail > 1) return;
@@ -684,6 +741,18 @@ export class Explorer {
         showMenu(ev.clientX, ev.clientY, [
           { label: "Open data", icon: "table", onClick: openData },
           { sep: true },
+          ...(sqlSrc
+            ? [
+                { label: "Show DDL", icon: "view", hint: shortcutLabel("showDdl"), onClick: () => showDdl(ddlTarget) },
+                ...(isTable
+                  ? [
+                      { label: "Edit table…", icon: "pencil", onClick: () => openDesigner(ddlTarget, false) },
+                      { label: "Import data…", icon: "download", onClick: () => importData(ddlTarget) },
+                    ]
+                  : []),
+                { sep: true },
+              ]
+            : []),
           { label: "Copy name", icon: "copy", onClick: () => this.host.copy(t.name) },
           { label: "Copy qualified name", icon: "copy", onClick: () => this.host.copy(q) },
           { sep: true },
@@ -740,6 +809,14 @@ export class Explorer {
               tag: ixTag(ix),
               cls: "leaf",
               title: `${ix.name} (${ix.columns.join(", ")})${ix.unique ? " UNIQUE" : ""}`,
+              target: sqlSrc ? { connId: id, database: db, schema: s.name, name: ix.name, kind: "index" as const, table: t.name } : undefined,
+              onContext: sqlSrc
+                ? (ev: MouseEvent) =>
+                    showMenu(ev.clientX, ev.clientY, [
+                      { label: "Show DDL", icon: "view", hint: shortcutLabel("showDdl"), onClick: () => showDdl({ connId: id, database: db, schema: s.name, name: ix.name, kind: "index", table: t.name }) },
+                      { label: "Copy name", icon: "copy", onClick: () => this.host.copy(ix.name) },
+                    ])
+                : undefined,
             })),
           );
         }
@@ -1596,6 +1673,7 @@ export class Explorer {
       { label: "Reconnect", icon: "refresh", hint: shortcutLabel("reconnect"), onClick: () => void this.reconnect(id) },
       { label: "New console", icon: "terminal", disabled: !connected, onClick: () => this.host.openConsole(id) },
       { label: "Run SQL file…", icon: "playAll", disabled: !FED_DRIVERS.has(e.config.driver), onClick: () => this.host.runSqlFile(id) },
+      { label: "Sessions & locks", icon: "server", disabled: !FED_DRIVERS.has(e.config.driver), onClick: () => this.host.openSessions?.(id) },
       { label: "Refresh", icon: "refresh", disabled: !connected, onClick: () => void this.refresh(id) },
       { sep: true },
       { label: "Edit…", icon: "pencil", onClick: () => this.host.editConnection(id) },

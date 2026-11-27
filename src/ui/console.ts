@@ -34,6 +34,15 @@ import { AiAssist } from "./aiPanel";
 import { docWithoutPending } from "./aiEditor";
 import { FileBinding } from "./sqlFiles";
 import { errorHelpButton } from "./help";
+import { confirmWrites, paramBar, paramError, prepareParams, runExplain } from "./consoleOps";
+import type { ParamRun, PreparedRun } from "./consoleOps";
+import { parseRemembered } from "./params";
+import type { RememberedParams } from "./params";
+import { closeParamsPopover } from "./paramsPopover";
+import { prodBar } from "./prodUi";
+import { analyzeSupported } from "./explainPlan";
+import { renderPlanView } from "./explainView";
+import { updateSettings } from "./settings";
 
 const DEFAULT_MAX_ROWS = 500;
 const MOD = /Mac/.test(navigator.userAgent) ? "⌘" : "Ctrl+";
@@ -77,6 +86,8 @@ interface ResultItem {
   fed?: boolean;
   /** The sources it ran with ("Load more" runs it again with them). */
   fedSources?: FedSource[];
+  /** v0.16: ran with parameters (chips above the result, Edit parameters). */
+  params?: ParamRun | null;
 }
 
 /** An extra data source attached to a console for cross-source queries. */
@@ -280,6 +291,14 @@ export class ConsolePane implements TabPane {
   private typedTx = false;
   /** "Drop to attach …" hint while a table is dragged over the editor. */
   private dropEl: HTMLElement = h("div", { class: "fed-drop", hidden: true, "aria-hidden": "true" });
+  /** v0.16: Explain (⌥⌘E) in the capsule controls. */
+  private btnExplain: HTMLButtonElement;
+  /** v0.16: parameter values of this console (persisted with the workspace when "Remember" is on). */
+  private paramMemory: RememberedParams | null = null;
+  /** v0.16: chips of the active result's parameter values. */
+  private paramBarEl: HTMLElement = h("div", { class: "pr-host", hidden: true });
+  /** v0.16: PRODUCTION · <name> bar. */
+  private prod: { el: HTMLElement; refresh: () => void; dispose: () => void };
   /** SQL files (v0.15): the .sql file this console is bound to, File ▾, changed-on-disk banner. */
   readonly file: FileBinding = new FileBinding({
     view: () => this.editor.cmView,
@@ -330,7 +349,12 @@ export class ConsolePane implements TabPane {
       "Ask AI",
       h("span", { class: "ai-kbd" }, shortcutLabel("askAi")),
     );
-    this.controls = h("div", { class: "cap-controls" }, this.file.button, this.btnAi, this.btnRun, this.btnStop, this.btnRunAll, this.btnFed, this.btnTx);
+    this.btnExplain = h(
+      "button",
+      { class: "cap-btn ghost explain-btn", type: "button", title: `Explain plan (${shortcutLabel("explain") || "⌥⌘E"})`, onclick: () => void this.explain() },
+      "Explain",
+    );
+    this.controls = h("div", { class: "cap-controls" }, this.file.button, this.btnAi, this.btnRun, this.btnStop, this.btnRunAll, this.btnExplain, this.btnFed, this.btnTx);
     this.btnTx.hidden = driver === "redis" || driver === "kafka";
     this.syncTxLabel();
     this.waitText = h("span", null, "Running…");
@@ -387,9 +411,10 @@ export class ConsolePane implements TabPane {
     const splitter = h("div", { class: "c-split", role: "separator", "aria-orientation": "horizontal", "aria-label": "Resize editor", title: "Drag to resize" });
     this.bindSplitter(splitter);
     this.bar = new FilterBar(driver, { onApply: (where, order) => this.applyBar(where, order) });
-    const results = h("div", { class: "c-results" }, this.tabsEl, this.bar.el, this.bodyEl);
+    const results = h("div", { class: "c-results" }, this.tabsEl, this.bar.el, this.paramBarEl, this.bodyEl);
     this.fedEl = h("div", { class: "fed-strip", role: "group", "aria-label": "Sources", hidden: true });
-    this.el = h("div", { class: "console" }, this.fedEl, this.file.banner, this.editorWrap, splitter, results);
+    this.prod = prodBar(() => this.connId);
+    this.el = h("div", { class: "console" }, this.prod.el, this.fedEl, this.file.banner, this.editorWrap, splitter, results);
     this.editorWrap.appendChild(this.dropEl);
     // The guide card goes away as soon as the user types (or pastes / deletes) in the editor.
     this.editorWrap.addEventListener("beforeinput", () => this.hideGuide());
@@ -570,6 +595,7 @@ export class ConsolePane implements TabPane {
       fedShown: this.fedShown,
       crossSource: this.crossSource,
       file: this.file.snapshot(),
+      params: this.paramMemory?.remember ? this.paramMemory : null,
     };
   }
 
@@ -582,6 +608,7 @@ export class ConsolePane implements TabPane {
     this.needsConnect = store.conns.get(this.connId)?.status !== "connected";
     this.dbHint = ws.dbHint;
     if (ws.file) this.file.restore(ws.file);
+    this.paramMemory = parseRemembered(ws.params);
     this.schemaExplicit = ws.schemaExplicit && this.schema !== null;
     this.editor.setCursor(Math.min(ws.cursor, ws.sql.length));
     if (!this.isLineBased && FED_DRIVERS.has(this.driver)) {
@@ -842,6 +869,8 @@ export class ConsolePane implements TabPane {
     const s = this.session;
     this.session = null;
     this.ai.dispose();
+    this.prod.dispose();
+    closeParamsPopover();
     this.editor.destroy();
     if (s) {
       if (!this.autoCommit) await api.rollback(s.sessionId).catch(() => undefined);
@@ -914,6 +943,7 @@ export class ConsolePane implements TabPane {
   private syncTxLabel(): void {
     this.btnTx.hidden = this.isLineBased;
     this.btnAi.hidden = this.isLineBased;
+    this.btnExplain.hidden = this.isLineBased;
     clear(this.btnTx);
     this.btnTx.append(this.autoCommit ? "Auto" : "Manual", h("span", { class: "tx-caret", "aria-hidden": "true" }, "▾"));
     this.btnTx.classList.toggle("manual", !this.autoCommit);
@@ -1009,7 +1039,11 @@ export class ConsolePane implements TabPane {
    */
   private async runList(stmts: string[], opts: { append?: boolean } = {}): Promise<void> {
     if (this.running || stmts.length === 0) return;
-    if (!(await this.confirmRisky(stmts))) return;
+    // v0.16: parameters (:name, ?, $n) → popover → values substituted as literals
+    const prepared = await this.prepareRun(stmts, "Run");
+    if (!prepared || this.running) return;
+    stmts = prepared.stmts;
+    if (!(await this.confirmWrites(stmts))) return;
     if (this.running) return;
     // v0.15: the error underline of the previous run goes away
     this.editor.clearErrorMark();
@@ -1043,9 +1077,10 @@ export class ConsolePane implements TabPane {
             const fr = await api.federatedExecute(sources, sql, DEFAULT_MAX_ROWS);
             if (!this.alive) return;
             this.addFedResult(sql, fr, base + i + 1, total, sources);
+            this.tagParams(prepared.info[i]);
           } catch (e) {
             if (!this.alive) return;
-            this.addError(sql, errMsg(e), base + i + 1, total, false, true);
+            this.addError(prepared.info[i]?.original ?? sql, errMsg(e), base + i + 1, total, false, true);
             if (!handleActionError(e)) toast(errMsg(e), "error");
             break;
           }
@@ -1091,6 +1126,7 @@ export class ConsolePane implements TabPane {
             counted = await runOne();
           }
           if (counted) autoCount = counted;
+          this.tagParams(prepared.info[i]);
           this.trackTx(sql);
           if (!this.isLineBased && /^\s*(create|alter|drop|rename)\b/i.test(sql)) schemaTouched = true;
           if (this.isKafka && /^\s*(create|delete)\s+topic\b/i.test(sql)) void loadOverview(this.connId, true);
@@ -1098,8 +1134,11 @@ export class ConsolePane implements TabPane {
           if (!this.alive) return;
           // v0.15: underline where the statement failed (when the driver reported a position / line)
           const ran = (e as { executed?: unknown }).executed;
-          const spot = this.isLineBased ? null : this.errorSpot(e, sql, typeof ran === "string" ? ran : sql);
-          this.addError(sql, errMsg(e), base + i + 1, total, isConnectionLost(rawMsg(e)), false, spot);
+          const pr = prepared.info[i];
+          const executed = typeof ran === "string" ? ran : sql;
+          // parameterized statements: positions are mapped back to the text with its :name / ? / $n tokens
+          const spot = this.isLineBased ? null : pr ? this.errorSpot(paramError(e, pr, executed), pr.original, pr.original) : this.errorSpot(e, sql, executed);
+          this.addError(pr?.original ?? sql, errMsg(e), base + i + 1, total, isConnectionLost(rawMsg(e)), false, spot);
           toast(errMsg(e), "error");
           break;
         }
@@ -1246,6 +1285,7 @@ export class ConsolePane implements TabPane {
     clear(this.bodyEl);
     this.tabsEl.classList.remove("multi");
     this.bar.hide();
+    this.syncParamBar();
   }
 
   private showEmptyResults(): void {
@@ -1533,10 +1573,149 @@ export class ConsolePane implements TabPane {
   }
 
   /** Shows the filter bar for the active result (or hides it). */
+  /** v0.16: marks the result just added as run with parameters. */
+  private tagParams(run: ParamRun | null | undefined): void {
+    const it = this.items[this.items.length - 1];
+    if (it && run) it.params = run;
+    this.syncParamBar();
+  }
+
+  /** v0.16: chips of the active result's parameter values (+ Edit parameters, NULL hint). */
+  private syncParamBar(): void {
+    const it = this.items[this.activeItem];
+    const run = it?.params ?? null;
+    this.paramBarEl.hidden = !run;
+    if (!run) {
+      this.paramBarEl.replaceChildren();
+      return;
+    }
+    this.paramBarEl.replaceChildren(paramBar(run, () => void this.runList([run.original])));
+  }
+
+  /** v0.16: scans for parameters and asks for their values (null = cancelled). */
+  private prepareRun(stmts: string[], action: string): Promise<PreparedRun | null> {
+    if (this.isLineBased) return Promise.resolve({ stmts, info: stmts.map(() => null) });
+    return prepareParams(
+      {
+        driver: this.driver,
+        view: this.editor.cmView,
+        wrap: this.editorWrap,
+        schemas: this.schemas(),
+        defaultSchema: this.currentSchemaName(),
+        memory: this.paramMemory,
+        setMemory: (m) => {
+          this.paramMemory = m;
+          this.host.onWorkspace();
+        },
+        dialectFor: (sql) => (this.routeOf(sql).kind === "federated" ? "sqlite" : this.driver),
+        locate: (sql) => this.locateStatement(this.editor.getText(), sql),
+        action,
+      },
+      stmts,
+    );
+  }
+
+  /**
+   * v0.16: production data sources confirm writes (statement kind, table, filter, estimated rows; DROP / TRUNCATE with
+   * the typed name); otherwise the "Confirm risky statements" check — never both.
+   */
+  private async confirmWrites(stmts: string[]): Promise<boolean> {
+    if (this.isLineBased) return true;
+    const writes = stmts.filter((s) => this.routeOf(s).kind === "native");
+    const prod = await confirmWrites(
+      {
+        config: store.conns.get(this.connId)?.config,
+        driver: this.driver,
+        database: this.effectiveDatabase,
+        sessionId: async () => {
+          if (!this.autoCommit || this.typedTx || !this.session) return null;
+          return this.session.sessionId;
+        },
+      },
+      writes,
+    );
+    if (prod !== null) return prod;
+    return this.confirmRisky(stmts);
+  }
+
+  // ---------------------------------------------------------------- v0.16 explain
+
+  /** Explain plan (⌥⌘E): the statement at the cursor (or the selection's first) as a plan tree in the result area. */
+  async explain(analyzeOverride?: boolean, buffersOverride?: boolean): Promise<void> {
+    if (this.running) return;
+    if (this.isLineBased) {
+      toast("Explain is for SQL consoles", "info");
+      return;
+    }
+    const r = this.editor.getSelectionOrStatementAtCursor();
+    const list = r ? this.editor.splitText(r.text) : [];
+    if (!list.length) {
+      toast("Nothing to explain at the cursor", "info");
+      return;
+    }
+    if (list.length > 1) toast("Explain shows one statement — explaining the first", "info");
+    if (this.routeOf(list[0]).kind !== "native") {
+      toast("Explain isn't available for cross-source statements", "info");
+      return;
+    }
+    const prepared = await this.prepareRun([list[0]], "Explain");
+    if (!prepared || this.running) return;
+    const sql = prepared.stmts[0];
+    const st = getSettings().explain;
+    const analyze = analyzeOverride ?? st.analyze;
+    const buffers = buffersOverride ?? st.buffers;
+    if (analyzeOverride !== undefined || buffersOverride !== undefined) updateSettings((s) => (s.explain = { analyze, buffers }));
+    this.editor.clearErrorMark();
+    this.clearResults();
+    this.bodyEl.appendChild(this.waitEl);
+    this.setRunning(true, analyze ? "Explaining (ANALYZE runs the statement)…" : "Explaining…");
+    try {
+      if (this.needsConnect) await this.wake();
+      const sess = await this.ensureSession();
+      const ver = this.status.serverVersion || sess.serverVersion;
+      const can = analyzeSupported(this.driver, ver);
+      const out = await runExplain(sess.sessionId, this.driver, sql, { analyze: analyze && can, buffers: buffers && analyze && can, serverVersion: ver, manualTx: !this.autoCommit || this.typedTx });
+      if (!this.alive) return;
+      if (!out) {
+        this.waitEl.remove();
+        this.showEmptyIfNoResults();
+        return;
+      }
+      const at = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      const view = renderPlanView(out.plan, {
+        analyzeSupported: can,
+        buffersSupported: this.driver === "postgres",
+        analyze: analyze && can,
+        buffers: buffers && analyze && can,
+        write: out.write,
+        kind: out.kind,
+        at,
+        onToggle: (a, b) => void this.explain(a, b),
+      });
+      const item = this.addItem("Plan", sql, h("div", { class: "pv-host" }, view), "rows");
+      item.params = prepared.info[0];
+      this.syncParamBar();
+      this.status.text = "Plan";
+      this.status.rows = null;
+      this.status.elapsedMs = out.plan.executionMs;
+      if (analyze && !can) toast(this.driver === "mysql" ? "EXPLAIN ANALYZE needs MySQL 8.0.18 or later — showing the estimated plan" : "This data source has no EXPLAIN ANALYZE — showing the estimated plan", "info");
+    } catch (e) {
+      if (!this.alive) return;
+      const pr = prepared.info[0];
+      this.addError(pr?.original ?? list[0], `Explain failed: ${errMsg(e)}`, 1, 1);
+      toast(errMsg(e), "error");
+    } finally {
+      this.waitEl.remove();
+      if (this.alive) this.setRunning(false, this.status.text.startsWith("Explain") ? "Done" : this.status.text);
+      this.host.onExecuted(this.connId);
+    }
+  }
+
   private syncBar(): void {
     const it = this.items[this.activeItem];
     if (it?.filter) this.bar.show(it.filter, this.driver);
     else this.bar.hide();
+    this.syncParamBar();
   }
 
   private applyBar(where: string, order: string): void {

@@ -128,11 +128,16 @@ pub async fn execute(
     session_id: String,
     sql: String,
     max_rows: u32,
+    history: Option<bool>,
 ) -> AppResult<QueryResult> {
     let s = state.sessions.get(&session_id)?;
     let started = Instant::now();
     let res = s.execute(sql.clone(), max_rows as usize).await;
     let elapsed = started.elapsed().as_millis() as i64;
+    // v0.16: helper statements (Sessions & locks polling, explain / estimate plumbing) pass history = false.
+    if history == Some(false) {
+        return res;
+    }
     match &res {
         Ok(r) => {
             let rows = match r.rows_affected {

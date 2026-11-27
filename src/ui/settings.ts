@@ -6,6 +6,8 @@ import { DEFAULT_THEME, TOKEN_KEYS, getTheme } from "./themes";
 import type { TokenKey } from "./themes";
 import { getDensity, setDensity } from "./prefs";
 import type { Density } from "./prefs";
+import { defaultSnippetSettings, mergeSnippetSettings } from "./snippets";
+import type { SnippetSettings } from "./snippets";
 
 export type EditorFont = "jetbrains" | "sf" | "fira" | "cascadia" | "system";
 export type LineHeight = "tight" | "normal" | "loose";
@@ -118,6 +120,10 @@ export interface AppSettings {
     /** No AI at all for production data sources. */
     blockProd: boolean;
   };
+  /** v0.16: snippets (Settings › Snippets). */
+  snippets: SnippetSettings;
+  /** v0.16: Explain plan switches (remembered between runs). */
+  explain: { analyze: boolean; buffers: boolean };
 }
 
 export const FONT_STACKS: Record<EditorFont, string> = {
@@ -149,6 +155,8 @@ export function defaultSettings(): AppSettings {
     files: { recent: [], targets: {} },
     help: { tourDone: false },
     ai: { provider: "codex", model: "", baseUrl: "", ollamaModel: "", autoTables: true, samples: false, blockProd: true },
+    snippets: defaultSnippetSettings(),
+    explain: { analyze: false, buffers: false },
   };
 }
 
@@ -177,6 +185,7 @@ export function mergeSettings(raw: unknown): AppSettings {
   const up = isObj(raw.updates) ? raw.updates : {};
   const fl = isObj(raw.files) ? raw.files : {};
   const hp = isObj(raw.help) ? raw.help : {};
+  const ex = isObj(raw.explain) ? raw.explain : {};
   const targets: Record<string, FileTarget> = {};
   if (isObj(fl.targets)) {
     for (const path of Object.keys(fl.targets).slice(-200)) {
@@ -269,6 +278,8 @@ export function mergeSettings(raw: unknown): AppSettings {
       samples: bool(ai.samples, d.ai.samples),
       blockProd: bool(ai.blockProd, d.ai.blockProd),
     },
+    snippets: mergeSnippetSettings(raw.snippets),
+    explain: { analyze: bool(ex.analyze, d.explain.analyze), buffers: bool(ex.buffers, d.explain.buffers) },
   };
 }
 

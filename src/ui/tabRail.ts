@@ -92,6 +92,9 @@ function kindLabel(t: TabPane): string {
   if (t.kind === "console") return t.table ? "Tables" : "Consoles";
   if (t.kind === "key") return "Redis keys";
   if (t.kind === "topic") return "Kafka topics";
+  if (t.kind === "sessions") return "Sessions & locks";
+  if (t.kind === "ddl") return "DDL";
+  if (t.kind === "design") return "Table designer";
   return "Consumer groups";
 }
 
@@ -134,6 +137,8 @@ export function fullPath(t: TabPane): string {
     path = parts.join(".");
   } else if (t.kind === "console") path = `${t.title}${db ? " · " + db : ""}`;
   else if (t.kind === "key") path = `${db ?? "db0"} · ${t.title}`;
+  else if (t.kind === "sessions") path = t.title;
+  else if (t.kind === "ddl" || t.kind === "design") path = `${db ? db + " · " : ""}${t.title}`;
   else path = `${t.kind === "topic" ? "topic" : "group"} ${t.title}`;
   return conn ? `${path} — ${conn}` : path;
 }

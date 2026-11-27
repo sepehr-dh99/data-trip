@@ -75,6 +75,26 @@ pub struct ConnectionConfig {
     /// Redis only: standalone (host/port) or Sentinel. None = standalone.
     #[serde(default)]
     pub redis: Option<RedisOptions>,
+    /// v0.16: production data source (colored bar, write confirmation, AI blocking). UI-only; stored verbatim.
+    #[serde(default)]
+    pub production: Option<ProductionOptions>,
+}
+
+/// v0.16: production safety options of a data source (enforced by the frontend).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductionOptions {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bar / tag color, e.g. "#FF1A3C".
+    #[serde(default)]
+    pub color: Option<String>,
+    /// INSERT / UPDATE / DELETE / MERGE / DDL ask for confirmation first.
+    #[serde(default = "default_true")]
+    pub confirm_writes: bool,
+    /// DROP / TRUNCATE require typing the data source name.
+    #[serde(default = "default_true")]
+    pub type_name_for_drop: bool,
 }
 
 /// Redis topology. In sentinel mode `host`/`port` are ignored: the sentinels report the master.

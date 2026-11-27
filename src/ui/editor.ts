@@ -29,6 +29,7 @@ import { onSettingsChange } from "./settings";
 import { REDIS_COMMANDS, redisLinesAt, splitRedisLines } from "./redis";
 import { CONSUME_FLAGS, KAFKA_COMMANDS, PRODUCE_FIELDS } from "./kafka";
 import { aiEditorExtension } from "./aiEditor";
+import { opsEditorExtension } from "./opsEditor";
 import { refPathBefore } from "./federation";
 import { ViewPlugin, hoverTooltip } from "@codemirror/view";
 import type { DecorationSet, ViewUpdate } from "@codemirror/view";
@@ -591,6 +592,8 @@ export class SqlEditor {
       aiEditorExtension(),
       fedExtensions(this.fedHolder),
       errorMarkExtension(),
+      // v0.16: parameter highlighting + snippets
+      opsEditorExtension({ driver: () => this.driver, tables: () => this.tableNames(), columns: (st, pos) => this.columnsAt(st, pos) }),
       highlightActiveLineGutter(),
       highlightActiveLine(),
       history(),
@@ -970,6 +973,28 @@ export class SqlEditor {
   /** The current error mark (null = none). */
   get errorMark(): { from: number; to: number; message: string } | null {
     return this.state.field(errorMarkField, false) ?? null;
+  }
+
+  /** v0.16: table names for snippet $TABLE completion (default schema bare, other schemas qualified). */
+  private tableNames(): string[] {
+    const keys = Object.keys(this.schema);
+    const bare = new Set(keys.filter((k) => !k.includes(".")));
+    return keys.filter((k) => !k.includes(".") || !bare.has(k.slice(k.lastIndexOf(".") + 1))).sort((a, b) => a.localeCompare(b));
+  }
+
+  /** v0.16: columns of the tables named in the statement at `pos` (snippet $COLUMN completion). */
+  private columnsAt(st: EditorState, pos: number): string[] {
+    const s = statementAt(st.doc.toString(), pos, splitOptsFor(this.driver));
+    const text = s ? s.text : st.doc.lineAt(pos).text;
+    const out = new Set<string>();
+    const re = /\b(?:from|join|into|update)\s+((?:[A-Za-z_][\w$]*\.)?[A-Za-z_][\w$]*)/gi;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text))) {
+      const name = m[1];
+      const cols = this.schema[name] ?? this.schema[name.toLowerCase()] ?? Object.entries(this.schema).find(([k]) => k.toLowerCase() === name.toLowerCase())?.[1];
+      for (const c of cols ?? []) out.add(c);
+    }
+    return [...out];
   }
 
   setSchema(schema: Record<string, string[]>, driver: Driver): void {
