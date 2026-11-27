@@ -870,6 +870,8 @@ pub fn open_browser(url: &str) -> AppResult<()> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // Inside an AppImage the browser must use the system's libraries, not the image's.
+    crate::child_env::clean_std(&mut cmd);
     match cmd.spawn() {
         Ok(mut child) => {
             // Reap the launcher so it does not linger as a zombie.

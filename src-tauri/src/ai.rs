@@ -487,6 +487,8 @@ async fn run_cli(bin: &Path, args: &[String], cwd: &Path, input: &str) -> AppRes
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Inside an AppImage: don't let the CLI (and its `node`) load the image's bundled libraries.
+    crate::child_env::clean_tokio(&mut cmd);
     // GUI apps get a minimal PATH (macOS): node-based CLIs need `node` from the same places we searched.
     if let Some(path) = child_path(bin) {
         cmd.env("PATH", path);
@@ -779,9 +781,11 @@ fn extra_dirs() -> Vec<PathBuf> {
 }
 
 fn search_dirs() -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = crate::child_env::strip_appimage_dirs(
+        std::env::var_os("PATH")
+            .map(|p| std::env::split_paths(&p).collect())
+            .unwrap_or_default(),
+    );
     for d in extra_dirs() {
         if !dirs.contains(&d) {
             dirs.push(d);

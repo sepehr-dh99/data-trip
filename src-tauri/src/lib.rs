@@ -2,6 +2,7 @@
 
 pub mod ai;
 pub mod app_menu;
+pub mod child_env;
 pub mod commands;
 pub mod credentials;
 pub mod db;
