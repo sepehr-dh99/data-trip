@@ -1,6 +1,7 @@
 // Node tests of the v0.16 pure logic (CONTRACT.md v0.16): query parameters (src/ui/params.ts), explain plan parsing
 // (src/ui/explainPlan.ts), sessions & locks (src/ui/sessionsData.ts), snippets (src/ui/snippets.ts) and statement
-// classification for production safety (src/ui/prodSafety.ts).
+// classification for production safety (src/ui/prodSafety.ts); v0.17: grid edit / Redis / Kafka confirmation helpers,
+// the SQL Server actual plan (STATISTICS XML) and the driver-aware error → help article matching (src/help/articles.ts).
 // Run: node scripts/test-ops.mjs   (Node ≥ 22.18; older Node 22: node --experimental-strip-types …)
 import assert from "node:assert/strict";
 import { register } from "node:module";
@@ -26,6 +27,7 @@ const E = await import("../src/ui/explainPlan.ts");
 const S = await import("../src/ui/sessionsData.ts");
 const N = await import("../src/ui/snippets.ts");
 const W = await import("../src/ui/prodSafety.ts");
+const A = await import("../src/help/articles.ts");
 
 let failed = 0;
 let passed = 0;
@@ -268,6 +270,13 @@ test("explain statements per dialect", () => {
   assert.equal(E.explainRequest("mysql", "SELECT 1", { analyze: true, buffers: false, serverVersion: "8.0.17" }).format, "mysql-json");
   assert.equal(E.explainRequest("mysql", "SELECT 1", { analyze: true, buffers: false, serverVersion: "10.11.6-MariaDB" }).format, "mysql-json");
   assert.deepEqual(E.explainRequest("mssql", "SELECT 1", { analyze: false, buffers: false, serverVersion: "" }).pre, ["SET SHOWPLAN_XML ON"]);
+  // v0.17: SQL Server ANALYZE = actual plan via STATISTICS XML; the marker makes the backend return only the plans
+  const ms = E.explainRequest("mssql", "UPDATE t SET a = 1;", { analyze: true, buffers: false, serverVersion: "" });
+  assert.deepEqual([ms.pre, ms.post, ms.analyze, ms.format], [["SET STATISTICS XML ON"], ["SET STATISTICS XML OFF"], true, "mssql-xml"]);
+  assert.equal(ms.sql, E.MSSQL_SHOWPLAN_MARKER + " UPDATE t SET a = 1");
+  assert.equal(E.explainRequest("mssql", "SELECT 1", { analyze: false, buffers: false, serverVersion: "" }).sql, "/*datatrip:showplan*/ SELECT 1");
+  assert.equal(E.analyzeSupported("mssql", "Microsoft SQL Server 2019"), true);
+  assert.equal(E.analyzeSupported("sqlite", ""), false);
   assert.equal(E.explainRequest("sqlite", "SELECT 1", { analyze: false, buffers: false, serverVersion: "" }).sql, "EXPLAIN QUERY PLAN SELECT 1");
 });
 test("PostgreSQL JSON plan: tree, self time, slowest, hint, raw", () => {
@@ -450,6 +459,224 @@ test("user snippets override, hide and merge", () => {
   assert.equal(eff[eff.length - 1].abbr, "x");
   assert.equal(s.expandKey, "space");
   assert.equal(N.dialectLabel(["postgres", "mysql"]), "PG, MySQL");
+});
+
+// ---------------------------------------------------------------- v0.17: SQL Server actual plan (STATISTICS XML)
+
+const MSSQL_ACTUAL = `<?xml version="1.0" encoding="utf-16"?>
+<ShowPlanXML xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" Version="1.564" Build="16.0.4135.4" xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan">
+  <BatchSequence>
+    <Batch>
+      <Statements>
+        <StmtSimple StatementText="SELECT o.id, c.name FROM dbo.orders o JOIN dbo.customers c ON c.id = o.customer_id WHERE o.status = N'paid'" StatementId="1" StatementCompId="1" StatementType="SELECT" RetrievedFromCache="true" StatementSubTreeCost="12.4107" StatementEstRows="1200" SecurityPolicyApplied="false" StatementOptmLevel="FULL" QueryHash="0x4E1A2B3C4D5E6F70" QueryPlanHash="0x0F1E2D3C4B5A6978" CardinalityEstimationModelVersion="160">
+          <StatementSetOptions QUOTED_IDENTIFIER="true" ARITHABORT="true" CONCAT_NULL_YIELDS_NULL="true" ANSI_NULLS="true" ANSI_PADDING="true" ANSI_WARNINGS="true" NUMERIC_ROUNDABORT="false" />
+          <QueryPlan DegreeOfParallelism="4" MemoryGrant="4096" CachedPlanSize="64" CompileTime="3" CompileCPU="3" CompileMemory="560">
+            <ThreadStat Branches="1" UsedThreads="4">
+              <ThreadReservation NodeId="0" ReservedThreads="4" />
+            </ThreadStat>
+            <MemoryGrantInfo SerialRequiredMemory="1536" SerialDesiredMemory="2048" RequiredMemory="1600" DesiredMemory="4096" RequestedMemory="4096" GrantWaitTime="0" GrantedMemory="4096" MaxUsedMemory="2304" MaxQueryMemory="1024000" />
+            <OptimizerHardwareDependentProperties EstimatedAvailableMemoryGrant="204800" EstimatedPagesCached="51200" EstimatedAvailableDegreeOfParallelism="4" MaxCompileMemory="1048576" />
+            <QueryTimeStats CpuTime="210" ElapsedTime="64" />
+            <RelOp NodeId="0" PhysicalOp="Parallelism" LogicalOp="Gather Streams" EstimateRows="1200" EstimateIO="0" EstimateCPU="0.0298" AvgRowSize="40" EstimatedTotalSubtreeCost="12.4107" Parallel="true" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+              <OutputList>
+                <ColumnReference Database="[shop]" Schema="[dbo]" Table="[orders]" Alias="[o]" Column="id" />
+              </OutputList>
+              <RunTimeInformation>
+                <RunTimeCountersPerThread Thread="0" ActualRows="25480" ActualEndOfScans="1" ActualExecutions="1" ActualElapsedms="63" ActualCPUms="2" />
+              </RunTimeInformation>
+              <Parallelism>
+                <RelOp NodeId="1" PhysicalOp="Hash Match" LogicalOp="Inner Join" EstimateRows="1200" EstimateIO="0" EstimateCPU="0.21" AvgRowSize="40" EstimatedTotalSubtreeCost="12.3809" Parallel="true" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+                  <OutputList />
+                  <MemoryFractions Input="1" Output="1" />
+                  <RunTimeInformation>
+                    <RunTimeCountersPerThread Thread="4" ActualRows="6400" ActualEndOfScans="1" ActualExecutions="1" ActualElapsedms="60" ActualCPUms="21" InputMemoryGrant="1024" OutputMemoryGrant="1024" UsedMemoryGrant="576" />
+                    <RunTimeCountersPerThread Thread="3" ActualRows="6300" ActualEndOfScans="1" ActualExecutions="1" ActualElapsedms="58" ActualCPUms="20" />
+                    <RunTimeCountersPerThread Thread="2" ActualRows="6380" ActualEndOfScans="1" ActualExecutions="1" ActualElapsedms="59" ActualCPUms="20" />
+                    <RunTimeCountersPerThread Thread="1" ActualRows="6400" ActualEndOfScans="1" ActualExecutions="1" ActualElapsedms="57" ActualCPUms="19" />
+                    <RunTimeCountersPerThread Thread="0" ActualRows="0" ActualEndOfScans="0" ActualExecutions="0" />
+                  </RunTimeInformation>
+                  <Hash>
+                    <DefinedValues />
+                    <HashKeysBuild><ColumnReference Database="[shop]" Schema="[dbo]" Table="[customers]" Alias="[c]" Column="id" /></HashKeysBuild>
+                    <RelOp NodeId="2" PhysicalOp="Index Scan" LogicalOp="Index Scan" EstimateRows="5000" EstimateIO="0.0231" EstimateCPU="0.0056" AvgRowSize="30" EstimatedTotalSubtreeCost="0.0287" TableCardinality="5000" Parallel="true" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+                      <OutputList />
+                      <RunTimeInformation>
+                        <RunTimeCountersPerThread Thread="4" ActualRows="1250" ActualRowsRead="1250" ActualEndOfScans="1" ActualExecutions="1" ActualElapsedms="4" ActualCPUms="1" ActualScans="1" ActualLogicalReads="9" />
+                        <RunTimeCountersPerThread Thread="3" ActualRows="1250" ActualRowsRead="1250" ActualEndOfScans="1" ActualExecutions="1" ActualElapsedms="3" ActualCPUms="1" ActualScans="1" ActualLogicalReads="9" />
+                        <RunTimeCountersPerThread Thread="2" ActualRows="1250" ActualRowsRead="1250" ActualEndOfScans="1" ActualExecutions="1" ActualElapsedms="3" ActualCPUms="1" ActualScans="1" ActualLogicalReads="9" />
+                        <RunTimeCountersPerThread Thread="1" ActualRows="1250" ActualRowsRead="1250" ActualEndOfScans="1" ActualExecutions="1" ActualElapsedms="2" ActualCPUms="1" ActualScans="1" ActualLogicalReads="9" />
+                        <RunTimeCountersPerThread Thread="0" ActualRows="0" ActualEndOfScans="0" ActualExecutions="0" />
+                      </RunTimeInformation>
+                      <IndexScan Ordered="false" ForcedIndex="false" ForceSeek="false" ForceScan="false" NoExpandHint="false" Storage="RowStore">
+                        <DefinedValues />
+                        <Object Database="[shop]" Schema="[dbo]" Table="[customers]" Index="[IX_customers_name]" Alias="[c]" IndexKind="NonClustered" Storage="RowStore" />
+                      </IndexScan>
+                    </RelOp>
+                    <RelOp NodeId="3" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="1200" EstimateIO="11.2" EstimateCPU="0.275" AvgRowSize="24" EstimatedTotalSubtreeCost="11.475" TableCardinality="1000000" Parallel="true" EstimateRebinds="0" EstimateRewinds="0" EstimatedExecutionMode="Row">
+                      <OutputList />
+                      <RunTimeInformation>
+                        <RunTimeCountersPerThread Thread="4" ActualRows="6400" ActualRowsRead="251000" ActualEndOfScans="1" ActualExecutions="1" ActualElapsedms="55" ActualCPUms="40" ActualScans="1" ActualLogicalReads="3100" />
+                        <RunTimeCountersPerThread Thread="3" ActualRows="6300" ActualRowsRead="249000" ActualEndOfScans="1" ActualExecutions="1" ActualElapsedms="52" ActualCPUms="39" ActualScans="1" ActualLogicalReads="3050" />
+                        <RunTimeCountersPerThread Thread="2" ActualRows="6380" ActualRowsRead="250500" ActualEndOfScans="1" ActualExecutions="1" ActualElapsedms="54" ActualCPUms="40" ActualScans="1" ActualLogicalReads="3090" />
+                        <RunTimeCountersPerThread Thread="1" ActualRows="6400" ActualRowsRead="249500" ActualEndOfScans="1" ActualExecutions="1" ActualElapsedms="51" ActualCPUms="38" ActualScans="1" ActualLogicalReads="3060" />
+                        <RunTimeCountersPerThread Thread="0" ActualRows="0" ActualEndOfScans="0" ActualExecutions="0" />
+                      </RunTimeInformation>
+                      <IndexScan Ordered="false" ForcedIndex="false" ForceScan="false" NoExpandHint="false" Storage="RowStore">
+                        <DefinedValues />
+                        <Object Database="[shop]" Schema="[dbo]" Table="[orders]" Index="[PK_orders]" Alias="[o]" IndexKind="Clustered" Storage="RowStore" />
+                        <Predicate>
+                          <ScalarOperator ScalarString="[shop].[dbo].[orders].[status] as [o].[status]=N'paid'">
+                            <Compare CompareOp="EQ"><ScalarOperator><Identifier><ColumnReference Database="[shop]" Schema="[dbo]" Table="[orders]" Alias="[o]" Column="status" /></Identifier></ScalarOperator><ScalarOperator><Const ConstValue="N'paid'" /></ScalarOperator></Compare>
+                          </ScalarOperator>
+                        </Predicate>
+                      </IndexScan>
+                    </RelOp>
+                  </Hash>
+                </RelOp>
+              </Parallelism>
+            </RelOp>
+          </QueryPlan>
+        </StmtSimple>
+      </Statements>
+    </Batch>
+  </BatchSequence>
+</ShowPlanXML>`;
+
+test("SQL Server actual plan: RunTimeCountersPerThread, misestimate, self time, hint", () => {
+  const sql = "SELECT o.id, c.name FROM dbo.orders o JOIN dbo.customers c ON c.id = o.customer_id WHERE o.status = N'paid'";
+  const plan = E.parsePlan("mssql-xml", [[MSSQL_ACTUAL]], true, sql);
+  assert.equal(plan.analyze, true);
+  assert.deepEqual(plan.nodes.map((n) => [n.depth, n.name]), [
+    [0, "Parallelism"],
+    [1, "Hash Match"],
+    [2, "Index Scan on dbo.customers c (IX_customers_name)"],
+    [2, "Clustered Index Scan on dbo.orders o (PK_orders)"],
+  ]);
+  const [gather, hash, cust, orders] = plan.nodes;
+  // ActualRows summed over the threads; a parallel operator every thread ran once = one execution
+  assert.deepEqual([gather.actRows, gather.loops, hash.actRows, hash.loops, cust.actRows, orders.actRows, orders.loops], [25480, 1, 25480, 1, 5000, 25480, 1]);
+  assert.equal(E.misestimate(orders) > 20, true);
+  assert.equal(E.misestimate(cust), 1);
+  // inclusive time = the slowest thread; self = inclusive − children
+  assert.deepEqual([gather.totalMs, hash.totalMs, cust.totalMs, orders.totalMs], [63, 60, 4, 55]);
+  assert.deepEqual([gather.selfMs, hash.selfMs, cust.selfMs, orders.selfMs], [3, 1, 4, 55]);
+  assert.equal(plan.slowest, 3);
+  assert.equal(orders.removed, 1_000_000 - 25480);
+  assert.equal(plan.executionMs, 64);
+  assert.equal(plan.planningMs, 3);
+  assert.match(orders.extras.join(" | "), /Actual rows: 25480, executions: 4, threads: 4, rows read: 1000000/);
+  assert.equal(plan.hint.createIndex, "CREATE INDEX idx_orders_status ON dbo.orders (status);");
+  assert.match(plan.hint.text, /reads 1M rows to keep 25k \(97% removed by the filter\)/);
+  // the estimated plan (no RunTimeInformation) still parses as before
+  const est = E.parsePlan("mssql-xml", [[MSSQL_ACTUAL.replace(/<RunTimeInformation>[\s\S]*?<\/RunTimeInformation>/g, "").replace(/<QueryTimeStats[^>]*\/>/, "")]], false, sql);
+  assert.equal(est.analyze, false);
+  assert.equal(est.nodes[3].actRows, null);
+  assert.equal(est.executionMs, null);
+});
+test("SQL Server actual plan: nested loops executions, operators that never ran, batch mode", () => {
+  const xml = `<ShowPlanXML><BatchSequence><Batch><Statements><StmtSimple><QueryPlan CompileTime="1">
+<QueryTimeStats CpuTime="9" ElapsedTime="12" />
+<RelOp NodeId="0" PhysicalOp="Nested Loops" LogicalOp="Inner Join" EstimateRows="40" EstimatedTotalSubtreeCost="0.9">
+ <RunTimeInformation><RunTimeCountersPerThread Thread="0" ActualRows="1200" ActualEndOfScans="1" ActualExecutions="1" ActualElapsedms="11" /></RunTimeInformation>
+ <NestedLoops Optimized="false">
+  <RelOp NodeId="1" PhysicalOp="Hash Match" LogicalOp="Aggregate" EstimateRows="40" EstimatedTotalSubtreeCost="0.5" EstimatedExecutionMode="Batch">
+   <RunTimeInformation><RunTimeCountersPerThread Thread="0" ActualRows="1200" Batches="2" ActualEndOfScans="0" ActualExecutions="1" ActualExecutionMode="Batch" ActualElapsedms="2" /></RunTimeInformation>
+   <Hash><RelOp NodeId="2" PhysicalOp="Columnstore Index Scan" LogicalOp="Index Scan" EstimateRows="100000" EstimatedTotalSubtreeCost="0.4" EstimatedExecutionMode="Batch">
+    <RunTimeInformation><RunTimeCountersPerThread Thread="0" ActualRows="100000" ActualRowsRead="100000" Batches="112" ActualEndOfScans="0" ActualExecutions="1" ActualExecutionMode="Batch" ActualElapsedms="6" /></RunTimeInformation>
+    <IndexScan><Object Schema="[dbo]" Table="[events]" Index="[CCI_events]" /></IndexScan></RelOp></Hash></RelOp>
+  <RelOp NodeId="3" PhysicalOp="Clustered Index Seek" LogicalOp="Clustered Index Seek" EstimateRows="1" EstimatedTotalSubtreeCost="0.3">
+   <RunTimeInformation><RunTimeCountersPerThread Thread="0" ActualRows="1200" ActualEndOfScans="0" ActualExecutions="1200" ActualElapsedms="2" /></RunTimeInformation>
+   <IndexScan><Object Schema="[dbo]" Table="[users]" Index="[PK_users]" /></IndexScan></RelOp>
+  <RelOp NodeId="4" PhysicalOp="Filter" LogicalOp="Filter" EstimateRows="1" EstimatedTotalSubtreeCost="0.01" />
+ </NestedLoops></RelOp>
+</QueryPlan></StmtSimple></Statements></Batch></BatchSequence></ShowPlanXML>`;
+  const plan = E.parsePlan("mssql-xml", [[xml]], true);
+  const [nl, agg, cci, seek, filter] = plan.nodes;
+  assert.deepEqual([seek.loops, seek.actRows, E.misestimate(seek)], [1200, 1, 1]);
+  assert.deepEqual([filter.actRows, filter.loops], [0, 0]);
+  // batch mode reports its own time: made inclusive (2 + 6), so self time stays 2
+  assert.deepEqual([cci.totalMs, agg.totalMs, agg.selfMs, nl.selfMs], [6, 8, 2, 1]);
+  assert.match(agg.extras.join(" | "), /batch mode/);
+  assert.equal(E.misestimate(agg), 30);
+  assert.deepEqual([plan.executionMs, plan.planningMs], [12, 1]);
+});
+
+// ---------------------------------------------------------------- v0.17: production confirmation helpers
+
+test("grid edits: counts, statements, +N more", () => {
+  const edits = [
+    { kind: "update", schema: "public", table: "orders", key: { id: 7 }, changes: { status: "paid", note: "it's ok" }, columnTypes: { id: "int4", status: "text", note: "text" } },
+    { kind: "update", schema: "public", table: "orders", key: { id: 8 }, changes: { total: "12.50", flag: true }, columnTypes: { id: "int4", total: "numeric", flag: "bool" } },
+    { kind: "insert", schema: "public", table: "orders", key: {}, changes: { id: "9", status: null }, columnTypes: { id: "int8", status: "text" } },
+    { kind: "insert", schema: "public", table: "orders", key: {}, changes: {}, columnTypes: {} },
+    { kind: "delete", schema: "public", table: "orders", key: { id: 3, region: null }, changes: {}, columnTypes: { id: "int4", region: "text" } },
+  ];
+  const s = W.summarizeEdits(edits);
+  assert.deepEqual([s.updates, s.inserts, s.deletes, s.tables], [2, 2, 1, ["public.orders"]]);
+  assert.equal(W.editCountsText(s), "2 updates, 2 inserts, 1 delete");
+  assert.equal(W.editCountsText(W.summarizeEdits(edits.slice(4))), "1 delete");
+  const pg = W.editStatements(edits, "postgres");
+  assert.deepEqual(pg, [
+    `UPDATE "public"."orders" SET "status" = 'paid', "note" = 'it''s ok' WHERE "id" = 7`,
+    `UPDATE "public"."orders" SET "total" = 12.50, "flag" = TRUE WHERE "id" = 8`,
+    `INSERT INTO "public"."orders" ("id", "status") VALUES (9, NULL)`,
+    `INSERT INTO "public"."orders" DEFAULT VALUES`,
+    `DELETE FROM "public"."orders" WHERE "id" = 3 AND "region" IS NULL`,
+  ]);
+  const my = W.editStatements(edits, "mysql");
+  assert.equal(my[1], "UPDATE `public`.`orders` SET `total` = 12.50, `flag` = 1 WHERE `id` = 8");
+  assert.equal(my[3], "INSERT INTO `public`.`orders` () VALUES ()");
+  assert.equal(W.editStatements([{ ...edits[0], schema: "dbo" }], "mssql")[0], "UPDATE [dbo].[orders] SET [status] = N'paid', [note] = N'it''s ok' WHERE [id] = 7");
+  // a numeric-looking text in a text column stays quoted
+  assert.equal(W.cellLiteral("007", "varchar(10)", "postgres"), "'007'");
+  const list = W.statementListText(Array.from({ length: 12 }, (_, i) => `DELETE FROM t WHERE id = ${i}`));
+  assert.equal(list.split("\n").length, 9);
+  assert.match(list, /DELETE FROM t WHERE id = 7;\n-- \+4 more$/);
+  assert.equal(W.statementListText(["SET a 1"], 8, 1600, ""), "SET a 1");
+});
+test("Redis command classification", () => {
+  const c = (l) => W.classifyRedisCommand(l);
+  for (const r of ["GET user:1", "HGETALL s", "SCAN 0 MATCH x*", "TTL k", "KEYS *", "CONFIG GET maxmemory", "SORT l", "INFO", "ACL WHOAMI", "SCRIPT EXISTS abc", "XRANGE s - +", "  "]) assert.equal(c(r).write, false, r);
+  for (const w of ["SET a 1", "del a", "UNLINK a b", "EXPIRE k 60", "PEXPIREAT k 1", "HSET h f v", "LPUSH l x", "RPUSHX l x", "INCRBY n 2", "ZADD z 1 a", "SINTERSTORE d a b", "SORT l STORE d", "CONFIG SET maxmemory 1gb", "JSON.SET k $ 1", "EVAL 'return 1' 0", "XADD s * f v", "RENAME a b"]) assert.equal(c(w).write, true, w);
+  assert.deepEqual([c("SET 'my key' 1").target, c("SET \"a b\" 1").target], ["my key", "a b"]);
+  assert.deepEqual([c("FLUSHDB").destructive, c("flushall async").destructive, c("SWAPDB 0 1").destructive, c("SCRIPT FLUSH").destructive, c("DEL a").destructive], [true, true, true, true, false]);
+  assert.equal(c("FLUSHDB").target, null);
+  assert.equal(c("DEL a b c").keys, 3);
+  assert.equal(c("config set x 1").kind, "CONFIG SET");
+});
+test("Kafka command / action classification", () => {
+  const k = (l) => W.classifyKafkaCommand(l);
+  for (const r of ["topics", "groups", "describe topic orders", "consume orders --latest --limit 5"]) assert.equal(k(r).write, false, r);
+  assert.deepEqual([k('produce orders key=1 value="a b"').write, k("produce orders value=1").target], [true, "orders"]);
+  assert.deepEqual([k("create topic t2 partitions=3").kind, k("create topic t2").destructive], ["create topic", false]);
+  const d = k("DELETE TOPIC orders.v1");
+  assert.deepEqual([d.write, d.destructive, d.target, d.kind], [true, true, "orders.v1", "delete topic"]);
+  assert.equal(W.kafkaActionText({ kind: "produce", topic: "orders", partition: null, key: "k 1", value: "{}", headers: 2 }), 'produce orders key="k 1" (+2 headers) value={}');
+  assert.equal(W.kafkaActionText({ kind: "delete topic", topic: "orders" }), "delete topic orders");
+  assert.equal(W.kafkaActionText({ kind: "create topic", topic: "t", partitions: 3, replication: 2 }), "create topic t partitions=3 replication=2");
+  assert.equal(W.kafkaActionText({ kind: "reset offsets", group: "g", topic: "t", to: "offset", value: 42, partitions: 3 }), "reset offsets of group g on t to offset 42");
+});
+test("error help is driver-aware (Redis / Kafka commands, not SQL)", () => {
+  const f = A.errorArticleFor;
+  assert.equal(f("ERR wrong number of arguments for 'hset' command", { driver: "redis" }), "trouble-redis-command");
+  assert.equal(f("WRONGTYPE Operation against a key holding the wrong kind of value", { driver: "redis" }), "trouble-redis-command");
+  assert.equal(f("ERR unknown command 'FOO', with args beginning with: ", { driver: "redis" }), "trouble-redis-command");
+  assert.equal(f("READONLY You can't write against a read only replica.", { driver: "redis" }), "trouble-redis-server");
+  assert.equal(f("OOM command not allowed when used memory > 'maxmemory'.", { driver: "redis" }), "trouble-redis-server");
+  assert.equal(f("NOAUTH Authentication required.", { driver: "redis" }), "trouble-auth");
+  // the same words on a SQL source don't lead to the Redis articles
+  assert.equal(f('syntax error at or near "SELEC"', { driver: "postgres" }), null);
+  assert.equal(f("ERR syntax error"), null);
+  assert.equal(f('Unknown command "consum". Commands: topics, …', { driver: "kafka" }), "trouble-kafka-command");
+  assert.equal(f('Expected name=value, got "x" (quote values containing spaces)', { driver: "kafka" }), "trouble-kafka-command");
+  assert.equal(f("Could not create topic orders: Broker: Topic already exists", { driver: "kafka" }), "trouble-kafka-admin");
+  assert.equal(f('Consumer group "g" is Stable; stop its consumers (the group must be Empty) before resetting offsets', { driver: "kafka" }), "trouble-kafka-admin");
+  assert.equal(f("Could not connect to Kafka: timeout", { driver: "kafka" }), "trouble-kafka-transport");
+  assert.equal(f("No data source named 'x'", { driver: "redis" }), null);
+  assert.equal(f("No data source named 'x'", { driver: "postgres" }), "cross-source");
+  const ids = new Set(A.ARTICLES.map((a) => a.id));
+  for (const m of A.ERROR_HELP) assert.ok(ids.has(m.id), m.id);
+  for (const a of A.ARTICLES) for (const r of a.related ?? []) assert.ok(ids.has(r), `${a.id} → ${r}`);
 });
 
 console.log(`${passed} passed, ${failed} failed`);

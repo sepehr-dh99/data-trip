@@ -203,14 +203,16 @@ export async function runExplain(
   if (wrapTx && !o.askedWrite) {
     const ok = await confirmDialog(
       `Explain ANALYZE this ${c.kind}?`,
-      `ANALYZE runs the statement to measure it. DataTrip runs it inside ${o.manualTx ? "a savepoint" : "BEGIN"} … ROLLBACK, so its changes are undone — but triggers still fire, sequences advance and locks are taken while it runs.`,
+      `ANALYZE runs the statement to measure it${driver === "mssql" ? " (SET STATISTICS XML)" : ""}. DataTrip runs it inside ${o.manualTx ? "a savepoint" : driver === "mssql" ? "BEGIN TRANSACTION" : "BEGIN"} … ROLLBACK, so its changes are undone — but triggers still fire, ${driver === "mssql" ? "identity values advance" : "sequences advance"} and locks are taken while it runs.`,
       "Run inside ROLLBACK",
       true,
     );
     if (!ok) return null;
   }
-  const begin = o.manualTx ? "SAVEPOINT dt_explain" : driver === "mysql" ? "START TRANSACTION" : "BEGIN";
-  const end = o.manualTx ? "ROLLBACK TO SAVEPOINT dt_explain" : "ROLLBACK";
+  // SQL Server (v0.17 actual plan): BEGIN TRANSACTION … ROLLBACK TRANSACTION, savepoints via SAVE TRANSACTION
+  const ms = driver === "mssql";
+  const begin = o.manualTx ? (ms ? "SAVE TRANSACTION dt_explain" : "SAVEPOINT dt_explain") : driver === "mysql" ? "START TRANSACTION" : ms ? "BEGIN TRANSACTION" : "BEGIN";
+  const end = o.manualTx ? (ms ? "ROLLBACK TRANSACTION dt_explain" : "ROLLBACK TO SAVEPOINT dt_explain") : ms ? "ROLLBACK TRANSACTION" : "ROLLBACK";
   let res: QueryResult;
   if (wrapTx) await api.execute(sid, begin, 1, false);
   try {
@@ -223,7 +225,7 @@ export async function runExplain(
   } finally {
     if (wrapTx) {
       await api.execute(sid, end, 1, false).catch(() => undefined);
-      if (o.manualTx) await api.execute(sid, "RELEASE SAVEPOINT dt_explain", 1, false).catch(() => undefined);
+      if (o.manualTx && !ms) await api.execute(sid, "RELEASE SAVEPOINT dt_explain", 1, false).catch(() => undefined);
     }
   }
   const rows = req.format === "mysql-tree" ? res.rows.map((r) => [r[0]]) : res.rows;

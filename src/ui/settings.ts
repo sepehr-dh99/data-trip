@@ -36,6 +36,8 @@ export interface CustomTabGroup {
 /** v0.15: idle-disconnect choices (Settings › Data & history); 0 = never. */
 export type IdleMinutes = 0 | 5 | 15 | 30 | 60 | 120;
 export const IDLE_MINUTES: IdleMinutes[] = [5, 15, 30, 60, 120, 0];
+/** v0.17: choices of Settings › Data & history › "Release hidden results above" (rows per console); 0 = never. */
+export const HIBERNATE_ROWS: number[] = [25_000, 100_000, 500_000, 0];
 
 export interface AppSettings {
   editor: {
@@ -80,6 +82,8 @@ export interface AppSettings {
     autoReconnect: boolean;
     /** v0.15: close a console's database session after this many idle minutes (0 = never). */
     idleDisconnectMinutes: IdleMinutes;
+    /** v0.17: rows a hibernated console may keep in memory (over all its results) before they are released; 0 = never. */
+    hibernateResultRows: number;
   };
   /** In-app updates (v0.14). */
   updates: {
@@ -150,7 +154,7 @@ export function defaultSettings(): AppSettings {
     results: { pageSize: 500, borders: true, typeColors: true, countRows: false, nullText: "NULL", maxColWidth: 320 },
     tabs: { placement: "top", sort: "manual", group: "source", naming: "table", customGroups: [], pinned: [] },
     keymap: { preset: "datatrip", overrides: {} },
-    data: { historyDays: 90, restoreConsoles: true, confirmRisky: true, autoReconnect: true, idleDisconnectMinutes: 15 },
+    data: { historyDays: 90, restoreConsoles: true, confirmRisky: true, autoReconnect: true, idleDisconnectMinutes: 15, hibernateResultRows: 100_000 },
     updates: { auto: true, background: false, prerelease: false, skipped: "" },
     files: { recent: [], targets: {} },
     help: { tourDone: false },
@@ -257,6 +261,7 @@ export function mergeSettings(raw: unknown): AppSettings {
       confirmRisky: bool(x.confirmRisky, d.data.confirmRisky),
       autoReconnect: bool(x.autoReconnect, d.data.autoReconnect),
       idleDisconnectMinutes: oneOf<IdleMinutes>(x.idleDisconnectMinutes, IDLE_MINUTES, d.data.idleDisconnectMinutes),
+      hibernateResultRows: Math.round(num(x.hibernateResultRows, d.data.hibernateResultRows, 0, 100_000_000)),
     },
     updates: {
       auto: bool(up.auto, d.updates.auto),

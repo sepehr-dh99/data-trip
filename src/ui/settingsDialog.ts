@@ -7,7 +7,7 @@ import { HISTORY_CHANGED } from "./history";
 import { toast } from "./toast";
 import { ACTIONS, PRESETS, PRESET_LABELS, bindingOf, conflictFor, eventToBinding, formatBinding, setBinding } from "./keymap";
 import type { ActionId } from "./keymap";
-import { FONT_LABELS, FONT_STACKS, IDLE_MINUTES, defaultSettings, effectiveTokenColors, getSettings, lineHeightPx, onSettingsChange, updateSettings } from "./settings";
+import { FONT_LABELS, FONT_STACKS, HIBERNATE_ROWS, IDLE_MINUTES, defaultSettings, effectiveTokenColors, getSettings, lineHeightPx, onSettingsChange, updateSettings } from "./settings";
 import type { AppSettings, EditorFont, IdleMinutes, KeymapPreset, LineHeight, PageSize } from "./settings";
 import { THEMES, TOKEN_KEYS, TOKEN_PALETTE } from "./themes";
 import type { TokenKey } from "./themes";
@@ -588,9 +588,20 @@ class SettingsWindow {
     idleSel.addEventListener("change", () => updateSettings((s) => (s.data.idleDisconnectMinutes = Number(idleSel.value) as IdleMinutes)));
     this.syncs.push(() => (idleSel.value = String(S().data.idleDisconnectMinutes)));
     const idle = this.row("Disconnect idle consoles after", "Closes a console’s database session when it sat unused (never during a transaction or a running query); the next run reconnects silently", idleSel, "idle timeout session close disconnect");
+    // v0.17: hidden consoles beyond the 10 most recent drop their result rows above this many (0 = never)
+    const hibSel = h("select", { class: "st-input st-select", "aria-label": "Release hidden results above" });
+    const hibLabel = (n: number): string => (n === 0 ? "Never" : `${n.toLocaleString()} rows`);
+    for (const n of HIBERNATE_ROWS) hibSel.appendChild(h("option", { value: String(n) }, hibLabel(n)));
+    hibSel.addEventListener("change", () => updateSettings((s) => (s.data.hibernateResultRows = Number(hibSel.value))));
+    this.syncs.push(() => {
+      const v = S().data.hibernateResultRows;
+      if (!HIBERNATE_ROWS.includes(v) && !hibSel.querySelector(`option[value="${v}"]`)) hibSel.appendChild(h("option", { value: String(v) }, hibLabel(v)));
+      hibSel.value = String(v);
+    });
+    const hib = this.row("Release hidden results above", "Consoles you haven't used among the last 10 free their result grids; above this many rows per console the rows are dropped too and come back with Run again", hibSel, "memory hibernate release results rows consoles");
     const clearBtn = h("button", { class: "st-pill", type: "button", onclick: () => void this.clearHistory(clearBtn) }, "Clear history…");
     const wipe = this.row("Clear query history", "Delete every entry of every data source from the History panel", clearBtn, "delete remove history");
-    this.section("data", [keep, restore, confirm, auto, idle, wipe]);
+    this.section("data", [keep, restore, confirm, auto, idle, hib, wipe]);
   }
 
   // ------------------------------------------------------------------ Updates

@@ -1,7 +1,7 @@
 // Production safety (v0.16, board W): statement classification for the write confirmation, the production flag of a
 // data source and the estimate queries. Pure (no DOM), node tests: node scripts/test-ops.mjs.
-import type { ConnectionConfig, Driver } from "../types";
-import { maskCode } from "./params";
+import type { Cell, ConnectionConfig, Driver, RowEdit } from "../types";
+import { maskCode, stringLiteral } from "./params";
 
 /** Colors offered in the connection dialog (board W). */
 export const PROD_COLORS: { name: string; hex: string }[] = [
@@ -248,4 +248,213 @@ export function formatEstimate(n: number, c: StatementClass): string {
   if (c.destructive) return c.kind === "DROP TABLE" ? `all ~${fmt} rows and the table` : `all ~${fmt} rows`;
   if (c.noWhere) return `~${fmt} — every row`;
   return `~${fmt} (planner estimate)`;
+}
+
+// ---------------------------------------------------------------- v0.17: grid edits
+
+export interface EditSummary {
+  updates: number;
+  inserts: number;
+  deletes: number;
+  /** Target tables as shown (`public.orders`), in first-seen order. */
+  tables: string[];
+}
+
+export function summarizeEdits(edits: RowEdit[]): EditSummary {
+  const out: EditSummary = { updates: 0, inserts: 0, deletes: 0, tables: [] };
+  for (const e of edits) {
+    if (e.kind === "update") out.updates++;
+    else if (e.kind === "insert") out.inserts++;
+    else out.deletes++;
+    const t = e.schema ? `${e.schema}.${e.table}` : e.table;
+    if (!out.tables.includes(t)) out.tables.push(t);
+  }
+  return out;
+}
+
+/** "2 updates, 1 insert, 3 deletes" (kinds with 0 left out). */
+export function editCountsText(s: EditSummary): string {
+  const part = (n: number, one: string): string => (n ? `${n} ${one}${n === 1 ? "" : "s"}` : "");
+  return [part(s.updates, "update"), part(s.inserts, "insert"), part(s.deletes, "delete")].filter(Boolean).join(", ") || "no changes";
+}
+
+function quoteIdentFor(driver: Driver, name: string): string {
+  if (driver === "mysql") return "`" + name.replace(/`/g, "``") + "`";
+  if (driver === "mssql") return "[" + name.replace(/]/g, "]]") + "]";
+  return '"' + name.replace(/"/g, '""') + '"';
+}
+
+const NUMERIC_COL = /int|serial|numeric|decimal|float|double|real|money|number|bit\b/i;
+
+/** A cell as an SQL literal for display (the backend binds the values as parameters). */
+export function cellLiteral(v: Cell, type: string, driver: Driver): string {
+  if (v === null || v === undefined) return "NULL";
+  if (typeof v === "boolean") return driver === "postgres" ? (v ? "TRUE" : "FALSE") : v ? "1" : "0";
+  if (typeof v === "number") return Number.isFinite(v) ? String(v) : stringLiteral(String(v), driver);
+  const s = String(v);
+  if (NUMERIC_COL.test(type) && /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i.test(s.trim())) return s.trim();
+  return stringLiteral(s.replace(/\u0000/g, ""), driver);
+}
+
+/**
+ * The statements apply_edits runs for the pending grid changes (same shape as the backend's `build_edit`), with the
+ * values written in as literals so they can be read in the confirmation.
+ */
+export function editStatements(edits: RowEdit[], driver: Driver): string[] {
+  const q = (n: string): string => quoteIdentFor(driver, n);
+  const where = (e: RowEdit): string =>
+    Object.entries(e.key)
+      .map(([k, v]) => (v === null ? `${q(k)} IS NULL` : `${q(k)} = ${cellLiteral(v, e.columnTypes[k] ?? "", driver)}`))
+      .join(" AND ");
+  return edits.map((e) => {
+    const table = (e.schema && e.schema.trim() ? q(e.schema) + "." : "") + q(e.table);
+    const changes = Object.entries(e.changes);
+    if (e.kind === "insert") {
+      if (!changes.length) return driver === "mysql" ? `INSERT INTO ${table} () VALUES ()` : `INSERT INTO ${table} DEFAULT VALUES`;
+      return `INSERT INTO ${table} (${changes.map(([k]) => q(k)).join(", ")}) VALUES (${changes.map(([k, v]) => cellLiteral(v, e.columnTypes[k] ?? "", driver)).join(", ")})`;
+    }
+    if (e.kind === "update") return `UPDATE ${table} SET ${changes.map(([k, v]) => `${q(k)} = ${cellLiteral(v, e.columnTypes[k] ?? "", driver)}`).join(", ")} WHERE ${where(e)}`;
+    return `DELETE FROM ${table} WHERE ${where(e)}`;
+  });
+}
+
+/** The statement list of the confirmation: the first `max` statements (each + `end`), then "-- +N more". */
+export function statementListText(stmts: string[], max = 8, maxChars = 1600, end = ";"): string {
+  const shown: string[] = [];
+  let chars = 0;
+  for (const s of stmts) {
+    if (shown.length >= max || (shown.length > 0 && chars + s.length > maxChars)) break;
+    const one = s.length > 400 ? s.slice(0, 400) + "…" : s;
+    shown.push(one + end);
+    chars += one.length;
+  }
+  const rest = stmts.length - shown.length;
+  return shown.join("\n") + (rest > 0 ? `\n${end === ";" ? "-- " : "# "}+${rest} more` : "");
+}
+
+// ---------------------------------------------------------------- v0.17: Redis commands
+
+/** Splits a Redis command line like the backend (redis-cli style quotes); never throws. */
+export function redisArgs(line: string): string[] {
+  const out: string[] = [];
+  let i = 0;
+  const n = line.length;
+  while (i < n) {
+    while (i < n && /\s/.test(line[i])) i++;
+    if (i >= n) break;
+    let cur = "";
+    const q = line[i];
+    if (q === '"' || q === "'") {
+      i++;
+      while (i < n && line[i] !== q) {
+        if (line[i] === "\\" && i + 1 < n) {
+          cur += line[i + 1];
+          i += 2;
+          continue;
+        }
+        cur += line[i++];
+      }
+      i++;
+    } else {
+      while (i < n && !/\s/.test(line[i])) cur += line[i++];
+    }
+    out.push(cur);
+  }
+  return out;
+}
+
+export interface CommandClass {
+  /** Upper-case command (SET, CONFIG SET, FLUSHDB, produce, delete topic…). */
+  kind: string;
+  /** Changes data or server state. */
+  write: boolean;
+  /** Removes a whole keyspace / topic: asks for the typed name (like DROP / TRUNCATE). */
+  destructive: boolean;
+  /** First key / topic, when the command names one. */
+  target: string | null;
+  /** Number of keys a multi-key delete names (DEL / UNLINK), else 0. */
+  keys: number;
+}
+
+const REDIS_WRITES = new Set(
+  (
+    "SET SETEX SETNX PSETEX MSET MSETNX APPEND GETSET GETDEL GETEX DEL UNLINK PERSIST MOVE COPY RESTORE HSET HSETNX " +
+    "HMSET HDEL LPOP RPOP LSET LREM LTRIM LINSERT LMOVE BLMOVE RPOPLPUSH BRPOPLPUSH LMPOP BLMPOP BLPOP BRPOP SADD SREM " +
+    "SPOP SMOVE ZADD ZINCRBY ZMPOP BZMPOP BZPOPMIN BZPOPMAX ZRANGESTORE XADD XDEL XTRIM XGROUP XACK XCLAIM XAUTOCLAIM " +
+    "XSETID PFADD PFMERGE GEOADD GEOSEARCHSTORE SETRANGE SETBIT BITOP BITFIELD FLUSHDB FLUSHALL SWAPDB SCRIPT FUNCTION " +
+    "SHUTDOWN DEBUG MIGRATE REPLICAOF SLAVEOF JSON.SET JSON.DEL JSON.FORGET JSON.ARRAPPEND JSON.ARRINSERT JSON.ARRPOP " +
+    "JSON.ARRTRIM JSON.NUMINCRBY JSON.NUMMULTBY JSON.STRAPPEND JSON.TOGGLE JSON.CLEAR JSON.MERGE JSON.MSET"
+  ).split(" "),
+);
+const REDIS_WRITE_PREFIX = ["INCR", "DECR", "EXPIRE", "PEXPIRE", "RENAME", "HINCRBY", "LPUSH", "RPUSH", "ZREM", "ZPOP", "EVAL", "FCALL"];
+/** Commands that wipe a whole database / the server (typed name like DROP / TRUNCATE). */
+const REDIS_DESTRUCTIVE = new Set(["FLUSHDB", "FLUSHALL", "SWAPDB", "SHUTDOWN"]);
+
+/**
+ * What a Redis console line does, mirroring the backend's write list (`db/redis.rs is_write_command`): reads pass,
+ * writes ask on production, FLUSHDB / FLUSHALL / SWAPDB / SHUTDOWN are destructive.
+ */
+export function classifyRedisCommand(line: string): CommandClass {
+  const args = redisArgs(line.trim());
+  const name = (args[0] ?? "").toUpperCase();
+  const rest = args.slice(1);
+  const sub = (rest[0] ?? "").toUpperCase();
+  const out: CommandClass = { kind: name, write: false, destructive: false, target: rest[0] ?? null, keys: 0 };
+  if (!name) return out;
+  if (name === "CONFIG" || name === "ACL" || name === "SCRIPT" || name === "FUNCTION" || name === "XGROUP" || name === "CLIENT" || name === "CLUSTER") {
+    out.kind = sub ? `${name} ${sub}` : name;
+    out.target = null;
+  }
+  if (REDIS_WRITES.has(name)) out.write = true;
+  else if (name === "CONFIG") out.write = sub === "SET" || sub === "REWRITE" || sub === "RESETSTAT";
+  else if (name === "ACL") out.write = !["WHOAMI", "LIST", "USERS", "CAT", "GETUSER", "LOG", "GENPASS", "DRYRUN", "HELP"].includes(sub);
+  else if (name === "SORT") out.write = rest.some((a) => a.toUpperCase() === "STORE");
+  else if (REDIS_WRITE_PREFIX.some((p) => name.startsWith(p)) || (name.startsWith("S") && name.endsWith("STORE")) || (name.startsWith("Z") && name.endsWith("STORE"))) out.write = true;
+  if (name === "SCRIPT" || name === "FUNCTION") out.write = sub !== "EXISTS" && sub !== "LIST" && sub !== "DUMP" && sub !== "STATS" && sub !== "HELP";
+  if (REDIS_DESTRUCTIVE.has(name) || ((name === "SCRIPT" || name === "FUNCTION") && sub === "FLUSH")) {
+    out.destructive = true;
+    out.target = null;
+  }
+  if (name === "DEL" || name === "UNLINK") out.keys = rest.length;
+  if (name === "FLUSHDB" || name === "FLUSHALL" || name === "SHUTDOWN" || name === "SWAPDB") out.target = null;
+  return out;
+}
+
+// ---------------------------------------------------------------- v0.17: Kafka actions
+
+/** What a Kafka console line does (`produce`, `create topic`, `delete topic` change the cluster; the rest read). */
+export function classifyKafkaCommand(line: string): CommandClass {
+  const args = redisArgs(line.trim());
+  const w0 = (args[0] ?? "").toLowerCase();
+  const w1 = (args[1] ?? "").toLowerCase();
+  const out: CommandClass = { kind: w0, write: false, destructive: false, target: null, keys: 0 };
+  if (w0 === "produce") {
+    out.write = true;
+    out.target = args[1] ?? null;
+  } else if ((w0 === "create" || w0 === "delete") && w1 === "topic") {
+    out.kind = `${w0} topic`;
+    out.write = true;
+    out.destructive = w0 === "delete";
+    out.target = args[2] ?? null;
+  }
+  return out;
+}
+
+/** Kafka actions of the panes (dialogs), for the production confirmation. */
+export type KafkaAction =
+  | { kind: "produce"; topic: string; partition: number | null; key: string | null; value: string | null; headers: number }
+  | { kind: "create topic"; topic: string; partitions: number; replication: number }
+  | { kind: "delete topic"; topic: string }
+  | { kind: "reset offsets"; group: string; topic: string; to: string; value: number | null; partitions: number };
+
+/** The equivalent console command / description shown in the confirmation's code block. */
+export function kafkaActionText(a: KafkaAction): string {
+  const arg = (s: string): string => (/^[^\s"'=]+$/.test(s) ? s : JSON.stringify(s));
+  if (a.kind === "produce") {
+    const v = a.value === null ? null : a.value.length > 600 ? a.value.slice(0, 600) + "…" : a.value;
+    return ["produce", arg(a.topic), a.key !== null ? `key=${arg(a.key)}` : "", a.partition !== null ? `partition=${a.partition}` : "", a.headers ? `(+${a.headers} header${a.headers === 1 ? "" : "s"})` : "", v !== null ? `value=${arg(v)}` : ""].filter(Boolean).join(" ");
+  }
+  if (a.kind === "create topic") return `create topic ${arg(a.topic)} partitions=${a.partitions} replication=${a.replication}`;
+  if (a.kind === "delete topic") return `delete topic ${arg(a.topic)}`;
+  return `reset offsets of group ${arg(a.group)} on ${arg(a.topic)} to ${a.to}${a.value !== null ? " " + a.value : ""}`;
 }

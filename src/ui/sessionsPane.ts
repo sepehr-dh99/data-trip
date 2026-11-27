@@ -12,6 +12,7 @@ import type { SessionAction, SessionRow } from "./sessionsData";
 import { store } from "./state";
 import type { TabPane } from "./tabs";
 import { toast } from "./toast";
+import type { WsSessions } from "./workspace";
 import "../styles/ops.css";
 
 const INTERVALS = [2, 5, 10] as const;
@@ -47,8 +48,24 @@ export class SessionsPane implements TabPane {
   private detailEl: HTMLElement;
   private noteEl: HTMLElement;
   private searchInput: HTMLInputElement;
+  /** v0.17: restored on launch and not shown yet: nothing is loaded (no session) until first shown. */
+  private lazy: (() => Promise<boolean>) | null = null;
+  /** v0.17: filters / auto-refresh changed (the shell saves the workspace). */
+  onChange: (() => void) | null = null;
 
-  constructor(public connId: string) {
+  /**
+   * `init.state`: filters and auto-refresh of a restored tab; `init.ensure`: restored on launch — connect (and
+   * load) only when the tab is first shown.
+   */
+  constructor(public connId: string, init: { state?: WsSessions | null; ensure?: () => Promise<boolean> } = {}) {
+    const st = init.state;
+    if (st) {
+      this.activeOnly = st.activeOnly;
+      this.hideIdle = st.hideIdle;
+      this.query = st.query;
+      this.auto = st.auto;
+      this.every = INTERVALS.find((n) => n === st.every) ?? 5;
+    }
     this.headEl = h("div", { class: "ss-head" });
     this.searchInput = h("input", {
       type: "search",
@@ -58,8 +75,10 @@ export class SessionsPane implements TabPane {
       oninput: () => {
         this.query = this.searchInput.value;
         this.renderTable();
+        this.onChange?.();
       },
     });
+    this.searchInput.value = this.query;
     this.filterEl = h("div", { class: "ss-filters" });
     this.chainEl = h("div", { class: "ss-chain", hidden: true });
     this.tableEl = h("div", { class: "ss-table", role: "grid", "aria-label": "Sessions" });
@@ -77,7 +96,43 @@ export class SessionsPane implements TabPane {
       this.renderTable();
       return;
     }
+    if (init.ensure) {
+      this.lazy = init.ensure;
+      this.renderTable();
+      return;
+    }
     void this.load();
+    this.schedule();
+  }
+
+  /** v0.17: what restore on launch saves for this tab. */
+  snapshot(): WsSessions {
+    return { activeOnly: this.activeOnly, hideIdle: this.hideIdle, query: this.query, auto: this.auto, every: this.every };
+  }
+
+  /** v0.17: a restored tab shown for the first time: connect the data source, then load and start refreshing. */
+  private async startLazy(): Promise<void> {
+    const ensure = this.lazy;
+    if (!ensure) return;
+    this.lazy = null;
+    this.loading = true;
+    this.renderTable();
+    let ok = false;
+    try {
+      ok = await ensure();
+    } catch {
+      ok = false;
+    }
+    this.loading = false;
+    if (!this.alive) return;
+    if (!ok) {
+      this.lazy = ensure;
+      this.error = `Couldn't connect to ${this.connName}. Show the tab again to retry.`;
+      this.renderTable();
+      return;
+    }
+    this.error = null;
+    await this.load();
     this.schedule();
   }
 
@@ -97,6 +152,10 @@ export class SessionsPane implements TabPane {
   }
   focus(): void {
     this.el.focus({ preventScroll: true });
+    if (this.lazy) {
+      if (this.visible && !this.loading) void this.startLazy();
+      return;
+    }
     if (this.visible && this.auto && !this.loading) void this.load(true);
   }
   updateSchema(): void {}
@@ -233,6 +292,7 @@ export class SessionsPane implements TabPane {
             this.every = n;
             this.renderHead();
             this.schedule();
+            this.onChange?.();
           },
         }, `${n} s`),
       ),
@@ -247,6 +307,7 @@ export class SessionsPane implements TabPane {
               this.auto = !this.auto;
               this.renderHead();
               this.schedule();
+              this.onChange?.();
             }),
             this.auto ? seg : null,
             h("span", { class: "ss-live" + (this.auto ? " on" : "") }, this.loading && !live ? "loading…" : live ? `${this.auto ? "● live" : "paused"} · ${live}` : ""),
@@ -267,11 +328,13 @@ export class SessionsPane implements TabPane {
         this.activeOnly = !this.activeOnly;
         this.renderFilters();
         this.renderTable();
+        this.onChange?.();
       }),
       this.swBtn("Hide idle", this.hideIdle || this.activeOnly, () => {
         this.hideIdle = !this.hideIdle;
         this.renderFilters();
         this.renderTable();
+        this.onChange?.();
       }, this.activeOnly),
       h("label", { class: "ss-search" }, icon("search", 12), this.searchInput),
       h("div", { class: "spacer" }),

@@ -1,5 +1,5 @@
 // Restore consoles on launch: the open tabs (manual order, active tab, console text / cursor / bindings / attached
-// cross-source sources, Redis key / Kafka topic / group tabs) are saved to <config>/workspace.json through the
+// cross-source sources, Redis key / Kafka topic / group tabs, v0.17: Sessions & locks and Show DDL tabs) are saved to <config>/workspace.json through the
 // backend (debounced, and flushed when the window goes away) and reopened lazily on the next start.
 import { api } from "../api";
 import { h, icon } from "./dom";
@@ -7,6 +7,7 @@ import { typeInfo } from "./redis";
 import type { TabPane } from "./tabs";
 import { parseRemembered } from "./params";
 import type { RememberedParams } from "./params";
+import type { DdlKind } from "../types";
 
 export type WsKind = TabPane["kind"];
 
@@ -44,6 +45,28 @@ export interface WsConsole {
   params?: RememberedParams | null;
 }
 
+/** v0.17: a Sessions & locks tab (filters and auto-refresh). */
+export interface WsSessions {
+  activeOnly: boolean;
+  hideIdle: boolean;
+  query: string;
+  auto: boolean;
+  /** Auto-refresh interval in seconds (2 | 5 | 10). */
+  every: number;
+}
+
+/** v0.17: a Show DDL tab (its DDL is read again when the tab is first shown). */
+export interface WsDdl {
+  kind: DdlKind;
+  /** The real database name. */
+  database: string | null;
+  schema: string | null;
+  name: string;
+  arguments: string | null;
+  table: string | null;
+  options: { indexes: boolean; comments: boolean; qualified: boolean };
+}
+
 export interface WsTab {
   kind: WsKind;
   /** Stable tab key at save time (pinned tabs / custom groups refer to it). */
@@ -58,6 +81,10 @@ export interface WsTab {
   console?: WsConsole;
   /** Redis key tabs: last known key type (tab icon before loading). */
   keyType?: string;
+  /** v0.17: Sessions & locks tabs. */
+  sessions?: WsSessions;
+  /** v0.17: Show DDL tabs. */
+  ddl?: WsDdl;
 }
 
 export interface Workspace {
@@ -73,7 +100,31 @@ export interface Workspace {
 type Obj = Record<string, unknown>;
 const isObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !Array.isArray(v);
 const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
-const KINDS: readonly WsKind[] = ["console", "key", "topic", "group"];
+const KINDS: readonly WsKind[] = ["console", "key", "topic", "group", "sessions", "ddl"];
+const DDL_KINDS: readonly DdlKind[] = ["table", "view", "materialized", "function", "procedure", "sequence", "index"];
+
+function parseSessions(v: unknown): WsSessions {
+  const o = isObj(v) ? v : {};
+  const every = o.every === 2 || o.every === 10 ? o.every : 5;
+  return { activeOnly: o.activeOnly === true, hideIdle: o.hideIdle === true, query: str(o.query) ?? "", auto: o.auto !== false, every };
+}
+
+function parseDdl(v: unknown): WsDdl | null {
+  if (!isObj(v)) return null;
+  const kind = DDL_KINDS.includes(v.kind as DdlKind) ? (v.kind as DdlKind) : null;
+  const name = str(v.name);
+  if (!kind || !name) return null;
+  const o = isObj(v.options) ? v.options : {};
+  return {
+    kind,
+    database: str(v.database),
+    schema: str(v.schema),
+    name,
+    arguments: str(v.arguments),
+    table: str(v.table),
+    options: { indexes: o.indexes !== false, comments: o.comments !== false, qualified: o.qualified !== false },
+  };
+}
 
 function parseSource(v: unknown): WsSource | null {
   if (!isObj(v)) return null;
@@ -120,6 +171,8 @@ export function parseWorkspace(raw: unknown): Workspace {
     const connId = str(t.connId);
     const title = str(t.title);
     if (!kind || !connId || title === null) continue;
+    const ddl = kind === "ddl" ? parseDdl(t.ddl) : null;
+    if (kind === "ddl" && !ddl) continue;
     out.tabs.push({
       kind,
       key: str(t.key) ?? "",
@@ -129,6 +182,8 @@ export function parseWorkspace(raw: unknown): Workspace {
       database: str(t.database),
       console: kind === "console" ? parseConsole(t.console) : undefined,
       keyType: str(t.keyType) ?? undefined,
+      sessions: kind === "sessions" ? parseSessions(t.sessions) : undefined,
+      ddl: ddl ?? undefined,
     });
   }
   const a = typeof raw.active === "number" ? Math.floor(raw.active) : -1;

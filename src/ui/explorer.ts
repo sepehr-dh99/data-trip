@@ -36,6 +36,7 @@ import { openSettings } from "./settingsDialog";
 import { formatBinding, shortcutLabel } from "./keymap";
 import { FED_DRIVERS, TABLE_DRAG_MIME, setTableDrag, sourceRef } from "./federation";
 import { prodOptions, prodTagClass } from "./prodSafety";
+import { confirmProdRedisAction } from "./prodUi";
 import type { TableDrag } from "./federation";
 import { importData, openDesigner, showDdl } from "./dataActions";
 import type { DbTarget } from "./dataTools";
@@ -1006,6 +1007,9 @@ export class Explorer {
     if (text === null) return;
     const ttl = parseTtlInput(text);
     if (ttl === undefined) return;
+    // v0.17: production sources confirm the write
+    const prod = await confirmProdRedisAction({ config: e.config, where: dbLabel(db), title: "Change a TTL on production?", command: ttl === null ? "PERSIST" : "EXPIRE", keys: [k.key], args: ttl === null ? [] : [String(ttl)], okLabel: ttl === null ? "Remove expiry" : "Set TTL" });
+    if (prod === false) return;
     try {
       await api.redisSetTtl(st.sid, k.key, ttl);
       k.ttl = ttl;
@@ -1018,7 +1022,9 @@ export class Explorer {
   }
 
   private async deleteKey(e: ConnEntry, db: string, st: RedisState, k: RedisKey): Promise<void> {
-    const ok = await confirmDialog("Delete key?", `“${k.key}” will be removed from ${dbLabel(db)}. This can't be undone.`, "Delete", true);
+    // v0.17: on a production source its confirmation replaces the plain one (never two prompts)
+    const prod = await confirmProdRedisAction({ config: e.config, where: dbLabel(db), title: "Delete a key on production?", command: "DEL", keys: [k.key], okLabel: "Delete key" });
+    const ok = prod ?? (await confirmDialog("Delete key?", `“${k.key}” will be removed from ${dbLabel(db)}. This can't be undone.`, "Delete", true));
     if (!ok) return;
     try {
       const n = await api.redisDelete(st.sid, [k.key]);
@@ -1035,12 +1041,14 @@ export class Explorer {
     const keys = st.trie.collect(f);
     if (keys.length === 0) return;
     const partial = st.done ? "" : " The scan has not finished, so the server may hold more keys with this prefix; they are not touched.";
-    const ok = await confirmDialog(
+    // v0.17: a bulk delete on a production source asks for the typed data source name (like DROP / TRUNCATE)
+    const prod = await confirmProdRedisAction({ config: e.config, where: dbLabel(db), title: `Delete ${keys.length.toLocaleString()} key${keys.length === 1 ? "" : "s"} under “${f.path}*” on production?`, command: "DEL", keys, bulk: true, note: `Only keys already loaded in this tree are deleted.${partial}`, okLabel: `Delete ${keys.length.toLocaleString()} key${keys.length === 1 ? "" : "s"}` });
+    const ok = prod ?? (await confirmDialog(
       "Delete keys?",
       `Delete the ${keys.length.toLocaleString()} loaded key${keys.length === 1 ? "" : "s"} under “${f.path}*” from ${dbLabel(db)}? Only keys already loaded in this tree are deleted.${partial} This can't be undone.`,
       `Delete ${keys.length.toLocaleString()} key${keys.length === 1 ? "" : "s"}`,
       true,
-    );
+    ));
     if (!ok) return;
     try {
       let removed = 0;

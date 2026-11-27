@@ -8,6 +8,8 @@ import { humanSize } from "./format";
 import { ResultGrid } from "./grid";
 import { promptDialog } from "./prompt";
 import { dbLabel, parseTtlInput, redisSession, ttlLong, typeInfo } from "./redis";
+import { confirmProdRedisAction } from "./prodUi";
+import { errorHelpButton } from "./help";
 import { store } from "./state";
 import type { TabPane } from "./tabs";
 import { toast } from "./toast";
@@ -238,6 +240,9 @@ export class KeyPane implements TabPane {
     if (text === null) return;
     const ttl = parseTtlInput(text);
     if (ttl === undefined) return;
+    // v0.17: production sources confirm the write
+    const prod = await confirmProdRedisAction({ config: store.conns.get(this.connId)?.config, where: dbLabel(this.db), title: "Change a TTL on production?", command: ttl === null ? "PERSIST" : "EXPIRE", keys: [this.key], args: ttl === null ? [] : [String(ttl)], okLabel: ttl === null ? "Remove expiry" : "Set TTL" });
+    if (prod === false) return;
     try {
       const s = await redisSession(this.connId, this.db);
       await api.redisSetTtl(s.sessionId, this.key, ttl);
@@ -251,7 +256,9 @@ export class KeyPane implements TabPane {
 
   private async remove(): Promise<void> {
     if (this.readOnly) return;
-    const ok = await confirmDialog("Delete key?", `“${this.key}” will be removed from ${dbLabel(this.db)}. This can't be undone.`, "Delete", true);
+    // v0.17: on a production source its confirmation replaces the plain one (never two prompts)
+    const prod = await confirmProdRedisAction({ config: store.conns.get(this.connId)?.config, where: dbLabel(this.db), title: "Delete a key on production?", command: "DEL", keys: [this.key], okLabel: "Delete key" });
+    const ok = prod ?? (await confirmDialog("Delete key?", `“${this.key}” will be removed from ${dbLabel(this.db)}. This can't be undone.`, "Delete", true));
     if (!ok) return;
     try {
       const s = await redisSession(this.connId, this.db);
@@ -341,7 +348,7 @@ export class KeyPane implements TabPane {
     clear(this.bodyEl);
     const v = this.value;
     if (this.error && !v) {
-      this.bodyEl.append(h("div", { class: "r-message err", role: "alert" }, icon("alert", 20), h("div", { class: "r-message-title" }, "Could not read the key"), h("div", { class: "r-error-text" }, this.error)));
+      this.bodyEl.append(h("div", { class: "r-message err", role: "alert" }, icon("alert", 20), h("div", { class: "r-message-title" }, "Could not read the key"), h("div", { class: "r-error-text" }, this.error), errorHelpButton(this.error, { driver: "redis" })));
       return;
     }
     if (!v) {

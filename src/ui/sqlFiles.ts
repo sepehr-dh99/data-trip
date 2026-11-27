@@ -278,6 +278,19 @@ interface DiskVersion {
   bom: boolean;
 }
 
+/** v0.17: everything a binding knows ("Reopen closed tab" brings it back without reading the file again). */
+export interface FileMemo {
+  path: string;
+  /** Last saved / loaded text (the dirty baseline). */
+  saved: string;
+  mtimeMs: number | null;
+  eol: "\n" | "\r\n";
+  bom: boolean;
+  dirty: boolean;
+  /** A changed-on-disk version the user hadn't decided about yet (banner). */
+  pending: DiskVersion | null;
+}
+
 export class FileBinding {
   /** Bound file, null = a plain console. */
   path: string | null = null;
@@ -354,7 +367,35 @@ export class FileBinding {
     this.path = f.path;
     this.mtime = f.mtimeMs;
     this.saved = this.text();
+    // v0.17: keep the unsaved-changes dot (and the close prompt) until the baseline is known, also when unreadable
+    this.isDirty = f.dirty;
     void this.loadBaseline(f.dirty);
+  }
+
+  /** v0.17: the binding for "Reopen closed tab" (null for a plain console / a read-only compare tab). */
+  memo(): FileMemo | null {
+    if (!this.path || this.readOnly) return null;
+    return { path: this.path, saved: this.saved, mtimeMs: this.mtime, eol: this.eol, bom: this.bom, dirty: this.isDirty, pending: this.pending };
+  }
+
+  /**
+   * v0.17: "Reopen closed tab": the console (already holding the closed tab's text) is bound to the same file with the
+   * same baseline and mtime, so Save writes there with the external-change check (FILE_CHANGED) and the dot is right.
+   */
+  adopt(m: FileMemo): void {
+    this.path = m.path;
+    this.saved = m.saved;
+    this.mtime = m.mtimeMs;
+    this.eol = m.eol;
+    this.bom = m.bom;
+    this.pending = m.pending;
+    this.isDirty = m.dirty;
+    this.hideBanner();
+    this.recompute();
+    if (this.pending) this.showChanged();
+    this.hooks.renamed(baseName(m.path));
+    // changed while the tab was closed?
+    void this.checkDisk();
   }
 
   private async loadBaseline(wasDirty: boolean): Promise<void> {

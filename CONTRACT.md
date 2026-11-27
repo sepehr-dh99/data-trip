@@ -959,7 +959,8 @@ UI: `paramsPopover.ts`, `explainView.ts`, `consoleOps.ts` (console glue), `sessi
 - AI: `isProdConnection` = marked production first; the name / folder "prod" and read-only heuristic stays as the
   fallback; the refusal names the reason ("is marked as a production data source").
 - Not covered by the confirmation: grid edits (apply_edits), Run SQL file (keeps its own production warning) and
-  Redis / Kafka consoles.
+  Redis / Kafka consoles. (v0.17: grid edits, Redis and Kafka are covered now — see "v0.17 — gap fixes (safety
+  coverage…)".)
 
 ## v0.16 — value viewer, DDL, import, table designer
 
@@ -1120,3 +1121,131 @@ refused on read-only; `DbConn::exec_edit` is now pub). Frontend `src/ui/valueVie
   background with a toast at the end. The explorer database is refreshed after a created table / inserted rows.
 - Not in this version: dropping a file onto the wizard, pasting from the clipboard (the board's "Paste from
   clipboard"), Pause.
+
+## v0.17 — gap fixes (tab restore, file binding, grid hibernation)
+
+Frontend only; no new commands. Pure logic with node tests: `src/ui/hibernate.ts` (`node scripts/test-hibernate.mjs`).
+
+### Restored tabs
+- `WsTab.kind` gains `"sessions"` and `"ddl"` (supersedes "not restored on launch" in both v0.16 sections). Table
+  designer tabs are still **not** restored (an unsaved design would be stale; reopen with Edit table…); the workspace
+  `active` index counts every tab except designers.
+- `WsTab.sessions?: WsSessions { activeOnly, hideIdle, query, auto, every: 2|5|10 }` (default 5). Restored
+  `SessionsPane(connId, { state, ensure })` opens no session and runs nothing until first shown; then it connects the
+  data source (`ensureConn`, usual recovery), loads and starts auto-refresh (failure → message, retried on the next
+  show). Filter / interval changes save the workspace (`onChange`). "Reopen closed tab" brings a Sessions tab back with
+  its filters too (before v0.17 it wrongly opened a Kafka group tab).
+- `WsTab.ddl?: WsDdl { kind: DdlKind, database (real name), schema, name, arguments, table, options: { indexes,
+  comments, qualified } }`; a tab without a valid kind / name is skipped. Restored `DdlPane(target, { lazy: true,
+  options })` reads the DDL (`get_ddl`, connecting first) when first shown; toggles save the workspace. DDL tabs of
+  non-SQL drivers are dropped. DDL tabs are still not on the "Reopen closed tab" stack.
+- As before, tabs whose data source no longer exists are dropped silently.
+
+### File binding
+- "Reopen closed tab" keeps the console's binding: `FileBinding.memo(): FileMemo { path, saved (baseline text),
+  mtimeMs, eol, bom, dirty, pending (undecided changed-on-disk version) } | null` (null for plain / read-only compare
+  consoles) is stored on the closed-tab stack; `adopt(memo)` after reopening restores it without reading the file
+  (title = file name, ● = dirty, the changed-on-disk banner if one was pending), then runs `checkDisk()`. Save writes
+  to the same file with `expectedMtimeMs`, so `FILE_CHANGED` still guards it.
+- App restart (v0.15 `WsConsole.file`): unchanged, plus `restore()` keeps `dirty` from the workspace until the file's
+  baseline is read (also when it can't be read), so the ● and the close prompt stay.
+
+### Result-grid hibernation
+- Consoles in most-recently-used order (the editor hibernation order and count: `LIVE_CONSOLES` = 10). After every
+  `touchConsole` (activation / focus / creation) and after a run that ended while the console was hidden,
+  `planHibernation(mru, { live: 10, rowBudget: data.hibernateResultRows })` returns per console `keep | hibernate |
+  release`: the first 10 and every visible, running (`busy`) or pending-edit console keep; the others hibernate, and
+  release when their kept rows (sum over results, released ones count 0) exceed the budget (> 0).
+- **Hibernate**: each result grid's `viewState()` (scroll — tracked from scroll events, since a hidden grid reads 0 —,
+  anchor / head selection, widths, base widths, client sort column / direction, filter text, pill meta, value viewer
+  open) is kept, `ResultGrid.dispose()` (settings listener, ResizeObserver, animation frame, inline editor, value
+  viewer, DOM) and an empty slot takes its element's place. The `QueryResult` (`item.last`), paging, filter-bar state,
+  parameters and maxRows stay. Shown again (console `focus()` → the active result; result tab activation → that one)
+  → `makeGrid` + `applyGrid` (cross-source: read-only `setResult`) + `setPaging` + `setServerSort` + `restoreView`.
+  Never while the grid has pending edits (the whole console is skipped).
+- **Release**: rows dropped (`item.last.rows = []`, columns kept), the slot becomes an `r-message` "Results released to
+  save memory" with "<n> rows · <columns>", the statement and **Run again** → rebuilds an empty grid with the column
+  headers and `rerun(item)` (same session via `ensureSession`, the substituted statement = same parameter values; paged
+  results reload their page, cross-source ones re-run with their sources), then re-applies widths / sort / filter /
+  scroll. The filter bar is hidden while released. Nothing re-runs by itself.
+
+### Settings
+- `data.hibernateResultRows`: number, default 100 000, clamped 0–100 000 000, 0 = never release rows. Settings › Data &
+  history › "Release hidden results above": 25 000 / 100 000 / 500 000 rows / Never (another stored value is shown as
+  an extra option).
+- Unchanged and still relevant: `data.restoreConsoles` (restore on launch), `data.idleDisconnectMinutes`; the live
+  editor / grid count (10) is a constant, not a setting.
+
+## v0.17 — gap fixes (safety coverage, Redis/Kafka help, MSSQL actual plan)
+
+Frontend plus one backend change (`db/mssql.rs`); **no new commands**. Pure logic with node tests
+(`node scripts/test-ops.mjs`): `src/ui/prodSafety.ts` (classifiers, edit statements), `src/ui/explainPlan.ts` (actual
+plan), `src/help/articles.ts` (`errorArticleFor`).
+
+### Production confirmation: grid edits, Redis, Kafka
+- All use the v0.16 production dialog (`opsConfirm`, production color, typed-name step) and the same rule: asked when
+  **Confirm before writes**, or when destructive and **Type the data source name** (then the name is required). When
+  the production dialog applies it replaces the plain confirmation of that action (never two prompts); otherwise the
+  old flow is unchanged.
+- **Grid edits** (`ConsolePane.submitEdits`, before `apply_edits`; `confirmProdEdits`): rows Data source · database,
+  Changes ("2 updates, 1 insert, 3 deletes" — `summarizeEdits` / `editCountsText`), Table(s); warning when rows are
+  deleted; the SQL block = `editStatements` (the shape of the backend's `build_edit`: quoted identifiers, values written
+  as literals for reading — the backend still binds them as parameters), first 8 / ≤ 1600 chars, then `-- +N more`
+  (`statementListText`). Cancel → nothing is sent, the changes stay pending. Grid edits never trigger Settings ›
+  Confirm risky statements (each targets one row by its key).
+- **Redis** (`classifyRedisCommand`, mirrors `db/redis.rs is_write_command`; tokenizer `redisArgs`): reads pass; writes
+  (SET…, DEL, UNLINK, EXPIRE*, HSET, LPUSH, INCR*, *STORE, SORT … STORE, CONFIG SET / REWRITE / RESETSTAT, ACL changes,
+  SCRIPT / FUNCTION changes, EVAL / FCALL, JSON.*…) are writes; FLUSHDB, FLUSHALL, SWAPDB, SHUTDOWN, SCRIPT / FUNCTION
+  FLUSH are destructive. Console runs (`confirmProdCommands`: every non-comment line of the statements; one → Data
+  source · dbN, Command, Key / Keys, warning, the command line; several → summary). Explorer / key tab
+  (`confirmProdRedisAction`): Set TTL (`EXPIRE key n` / `PERSIST key`, after the TTL prompt), Delete key (`DEL key`,
+  replaces the plain confirm), folder › delete the loaded keys (bulk: destructive → typed data source name; note "Only
+  keys already loaded…").
+- **Kafka** (`classifyKafkaCommand`: `produce`, `create topic` = writes, `delete topic` = destructive; `KafkaAction` +
+  `kafkaActionText` for the panes): console lines as above; Produce message dialog (topic, partition, the equivalent
+  `produce …` line), Create topic, Reset offsets (group, topic, target, partition count) via `confirmProdKafka`.
+  **Delete topic** on production: the production dialog replaces the type-the-topic prompt and always needs a typed name
+  — the data source name when "Type the data source name" is on, else the topic name. The Kafka dialogs' Escape handler
+  leaves an open production dialog alone.
+- `OpsConfirmOptions.typeLabel` (accessible label of the typed field). Connection dialog texts and the PRODUCTION bar
+  note mention the new coverage (bar: "FLUSHDB / FLUSHALL ask for the name", "delete topic asks for the name").
+- Still not covered: Run SQL file and Import data (their own production warnings).
+
+### Error help for Redis / Kafka
+- `ERROR_HELP` entries may carry `drivers` (only those drivers match); `errorArticleFor(msg, {vault, driver})` (pure)
+  is used by `helpForError`. New articles (topic Troubleshooting): `trouble-redis-command` (unknown command, wrong
+  number of arguments, syntax error, quoting, WRONGTYPE, not an integer / float, MULTI / SUBSCRIBE / SELECT refused,
+  read-only), `trouble-redis-server` (READONLY replica, MOVED / ASK / CROSSSLOT / CLUSTERDOWN, OOM, NOPERM, LOADING,
+  BUSY, MISCONF, MASTERDOWN, NOSCRIPT), `trouble-kafka-command` (the console language, Usage / Expected name=value /
+  numbers / timestamps, read-only), `trouble-kafka-admin` (already exists, unknown topic, replication factor,
+  partitions, authorization, policy violation, group must be Empty, message too large). Cross-source entries are
+  limited to the SQL drivers; Redis / Kafka errors never lead to SQL articles.
+- `errorHelpButton(msg, {vault, driver, command})`: for the command articles the popover's tip line is the command's
+  syntax (`REDIS_COMMANDS` / `KAFKA_COMMANDS` signature; unknown Redis command → spelling / module note; unknown Kafka
+  command → the command list). Used by the console error view (driver + the failed line for Redis / Kafka consoles),
+  the key tab ("Could not read the key"), the Kafka topic and group tabs and the Kafka dialogs' error lines (produce,
+  create topic, reset offsets). AI (Fix with AI) stays SQL-only: it isn't offered in Redis / Kafka consoles.
+
+### SQL Server actual plan (ANALYZE)
+- `analyzeSupported("mssql") = true`. `explainRequest` for SQL Server: estimated `SET SHOWPLAN_XML ON` / statement /
+  `SET SHOWPLAN_XML OFF`; ANALYZE `SET STATISTICS XML ON` / statement / `SET STATISTICS XML OFF` (separate executes,
+  OFF always runs). The statement is sent as `/*datatrip:showplan*/ <statement>` (`MSSQL_SHOWPLAN_MARKER`).
+- Backend `mssql::stream`: a statement starting with that marker runs in **plan mode** — no `SELECT @@ROWCOUNT`
+  appended (this also fixes the estimated plan of INSERT / UPDATE / DELETE / MERGE, whose XML was swallowed by the
+  row-count handling), result sets whose first column name contains "showplan" (`Microsoft SQL Server 2005 XML
+  Showplan`) are returned as one column `Showplan` with one row per plan, every other result set (the rows of an
+  analyzed SELECT) is read and dropped.
+- Writes: after the same ANALYZE confirmation as PostgreSQL, inside `BEGIN TRANSACTION` … `ROLLBACK TRANSACTION`; in a
+  manual / typed transaction `SAVE TRANSACTION dt_explain` … `ROLLBACK TRANSACTION dt_explain` (no RELEASE;
+  `db::tx_control` treats `ROLLBACK TRAN <name>` as a savepoint rollback).
+- Parser (`parseMssqlXml(xml, sql, analyze)`): `RunTimeInformation / RunTimeCountersPerThread` of each RelOp → rows =
+  Σ ActualRows over threads; executions = Σ ActualExecutions, except a parallel operator every active thread ran at
+  most once counts as 1; `actRows` = rows / executions (per execution, like PostgreSQL's per-loop rows), `loops` =
+  executions; inclusive `totalMs` = the largest ActualElapsedms of a thread (batch-mode operators report their own time:
+  their children's inclusive time is added); `removed` = Σ ActualRowsRead − rows; details line "Actual rows: N,
+  executions: N, threads, rows read, CPU, logical reads, batch mode". An operator without counters never ran (0 rows,
+  0 executions). `QueryTimeStats ElapsedTime` → execution time, `QueryPlan CompileTime` → planning time (first
+  statement). Self time, misestimate flags (×N under / over), slowest node and the index hint then work as for
+  PostgreSQL; without ActualElapsedms (before SQL Server 2016 SP1) the share falls back to cost. Plan header: "Actual
+  plan (STATISTICS XML)".
+

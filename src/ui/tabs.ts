@@ -1,6 +1,6 @@
 // What the shell needs from anything that lives in a capsule tab (SQL / Redis console, Redis key viewer).
 export interface TabPane {
-  /** v0.16: "ddl" = Show DDL tab, "design" = table designer (neither is restored on launch). */
+  /** v0.16: "ddl" = Show DDL tab, "design" = table designer. v0.17: sessions and DDL tabs are restored on launch, designers aren't. */
   readonly kind: "console" | "key" | "topic" | "group" | "sessions" | "ddl" | "design";
   readonly el: HTMLElement;
   /** Controls shown in the capsule while this tab is active (may be empty). */

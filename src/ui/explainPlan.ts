@@ -84,10 +84,16 @@ export function mysqlHasAnalyze(serverVersion: string): boolean {
   return v[0] > 8 || (v[0] === 8 && (v[1] > 0 || v[2] >= 18));
 }
 
-/** Whether the dialect / server can run EXPLAIN ANALYZE. */
+/** Whether the dialect / server can run EXPLAIN ANALYZE (SQL Server: the actual plan via SET STATISTICS XML). */
 export function analyzeSupported(driver: Driver, serverVersion: string): boolean {
-  return driver === "postgres" || (driver === "mysql" && mysqlHasAnalyze(serverVersion));
+  return driver === "postgres" || driver === "mssql" || (driver === "mysql" && mysqlHasAnalyze(serverVersion));
 }
+
+/**
+ * Put in front of a SQL Server statement run under SET SHOWPLAN_XML / SET STATISTICS XML: the backend
+ * (`db/mssql.rs`) then returns only the showplan result sets (one row each) instead of the statement's own results.
+ */
+export const MSSQL_SHOWPLAN_MARKER = "/*datatrip:showplan*/";
 
 /** The explain statement(s) for `sql` (one statement, no trailing `;`). */
 export function explainRequest(driver: Driver, sql: string, opts: { analyze: boolean; buffers: boolean; serverVersion: string }): ExplainRequest | null {
@@ -104,7 +110,12 @@ export function explainRequest(driver: Driver, sql: string, opts: { analyze: boo
     return { pre: [], sql: `EXPLAIN FORMAT=JSON ${body}`, post: [], format: "mysql-json", analyze: false };
   }
   if (driver === "sqlite") return { pre: [], sql: `EXPLAIN QUERY PLAN ${body}`, post: [], format: "sqlite", analyze: false };
-  if (driver === "mssql") return { pre: ["SET SHOWPLAN_XML ON"], sql: body, post: ["SET SHOWPLAN_XML OFF"], format: "mssql-xml", analyze: false };
+  if (driver === "mssql") {
+    // ANALYZE: the statement runs with STATISTICS XML (actual rows / time per operator); else the estimated plan
+    const sql = `${MSSQL_SHOWPLAN_MARKER} ${body}`;
+    if (opts.analyze) return { pre: ["SET STATISTICS XML ON"], sql, post: ["SET STATISTICS XML OFF"], format: "mssql-xml", analyze: true };
+    return { pre: ["SET SHOWPLAN_XML ON"], sql, post: ["SET SHOWPLAN_XML OFF"], format: "mssql-xml", analyze: false };
+  }
   return null;
 }
 
@@ -534,10 +545,71 @@ function attrs(tag: string): Record<string, string> {
 
 const unbracket = (s: string | undefined): string | null => (s ? s.replace(/^\[|\]$/g, "") : null);
 
-export function parseMssqlXml(xml: string, sql = ""): Plan {
+interface MssqlRuntime {
+  threads: number;
+  rows: number;
+  execs: number;
+  /** Threads that executed the operator at least once, and the most executions of one thread. */
+  activeThreads: number;
+  maxExecs: number;
+  rowsRead: number | null;
+  /** Largest ActualElapsedms of a thread (threads run side by side). */
+  elapsedMs: number | null;
+  cpuMs: number | null;
+  logicalReads: number | null;
+  batch: boolean;
+}
+
+/** Sums one RunTimeCountersPerThread element into the operator's runtime numbers. */
+function addRuntime(rt: MssqlRuntime, a: Record<string, string>): void {
+  const rows = num(a.ActualRows) ?? 0;
+  const execs = num(a.ActualExecutions) ?? 0;
+  rt.threads++;
+  rt.rows += rows;
+  rt.execs += execs;
+  if (execs > 0) rt.activeThreads++;
+  rt.maxExecs = Math.max(rt.maxExecs, execs);
+  const read = num(a.ActualRowsRead);
+  if (read !== null) rt.rowsRead = (rt.rowsRead ?? 0) + read;
+  const el = num(a.ActualElapsedms);
+  if (el !== null) rt.elapsedMs = Math.max(rt.elapsedMs ?? 0, el);
+  const cpu = num(a.ActualCPUms);
+  if (cpu !== null) rt.cpuMs = (rt.cpuMs ?? 0) + cpu;
+  const lr = num(a.ActualLogicalReads);
+  if (lr !== null) rt.logicalReads = (rt.logicalReads ?? 0) + lr;
+  if (a.ActualExecutionMode === "Batch") rt.batch = true;
+}
+
+/**
+ * Applies the actual numbers like PostgreSQL's: rows per execution (ActualRows summed over the threads / the
+ * executions), loops = executions — a parallel operator that every thread ran once counts as one execution —, the
+ * inclusive time (the slowest thread's ActualElapsedms; batch-mode operators report their own time only, made
+ * inclusive afterwards) and the rows a scan read but its predicate removed (ActualRowsRead − ActualRows).
+ */
+function applyRuntime(n: PlanNode, rt: MssqlRuntime): void {
+  const loops = rt.activeThreads > 1 && rt.maxExecs <= 1 ? 1 : Math.max(rt.execs, 0);
+  n.loops = loops;
+  n.actRows = loops > 0 ? rt.rows / loops : 0;
+  if (rt.elapsedMs !== null) n.totalMs = rt.elapsedMs;
+  if (rt.rowsRead !== null && rt.rowsRead > rt.rows) n.removed = rt.rowsRead - rt.rows;
+  const bits = [`Actual rows: ${rt.rows}`, `executions: ${rt.execs}`];
+  if (rt.activeThreads > 1) bits.push(`threads: ${rt.activeThreads}`);
+  if (rt.rowsRead !== null) bits.push(`rows read: ${rt.rowsRead}`);
+  if (rt.cpuMs !== null) bits.push(`CPU: ${rt.cpuMs} ms`);
+  if (rt.logicalReads !== null) bits.push(`logical reads: ${rt.logicalReads}`);
+  if (rt.batch) bits.push("batch mode");
+  n.extras.push(bits.join(", "));
+}
+
+export function parseMssqlXml(xml: string, sql = "", analyze = false): Plan {
   const roots: PlanNode[] = [];
   const stack: PlanNode[] = [];
-  const re = /<(\/?)(RelOp|Object|Predicate|ScalarOperator|SeekPredicates|MissingIndex|ColumnGroup|Column)\b([^>]*?)(\/?)>/g;
+  const re = /<(\/?)(RelOp|Object|Predicate|ScalarOperator|SeekPredicates|MissingIndex|ColumnGroup|Column|RunTimeInformation|RunTimeCountersPerThread|QueryTimeStats|QueryPlan)\b([^>]*?)(\/?)>/g;
+  const runtime = new Map<PlanNode, MssqlRuntime>();
+  let inRuntime = false;
+  let planningMs: number | null = null;
+  let executionMs: number | null = null;
+  let firstPlan = true;
   let m: RegExpExecArray | null;
   let inPredicate = false;
   let seekDepth = 0;
@@ -548,8 +620,34 @@ export function parseMssqlXml(xml: string, sql = ""): Plan {
   while ((m = re.exec(xml))) {
     const closing = m[1] === "/";
     const tag = m[2];
-    const a = closing ? {} : attrs(m[3]);
+    const a: Record<string, string> = closing ? {} : attrs(m[3]);
     const selfClosing = m[4] === "/";
+    if (tag === "QueryPlan") {
+      // the first statement's plan (STATISTICS XML returns one per statement it ran)
+      if (!closing && firstPlan) planningMs = num(a.CompileTime);
+      if (closing) firstPlan = false;
+      continue;
+    }
+    if (tag === "QueryTimeStats") {
+      if (!closing && firstPlan && executionMs === null) executionMs = num(a.ElapsedTime);
+      continue;
+    }
+    if (tag === "RunTimeInformation") {
+      inRuntime = !closing && !selfClosing;
+      continue;
+    }
+    if (tag === "RunTimeCountersPerThread") {
+      const owner = stack[stack.length - 1];
+      if (!closing && inRuntime && owner) {
+        let rt = runtime.get(owner);
+        if (!rt) {
+          rt = { threads: 0, rows: 0, execs: 0, activeThreads: 0, maxExecs: 0, rowsRead: null, elapsedMs: null, cpuMs: null, logicalReads: null, batch: false };
+          runtime.set(owner, rt);
+        }
+        addRuntime(rt, a);
+      }
+      continue;
+    }
     if (tag === "RelOp") {
       if (closing) {
         stack.pop();
@@ -605,9 +703,27 @@ export function parseMssqlXml(xml: string, sql = ""): Plan {
       else curMissing.cols.push(unbracket(a.Name) ?? a.Name);
     }
   }
-  if (!roots.length) throw new Error("No plan returned (SHOWPLAN_XML)");
-  for (const n of flatten(roots)) n.detail = n.extras.filter((x) => !x.startsWith("Logical:")).join(" · ");
-  const plan = finish("mssql-xml", false, roots, xml, null, null, sql, "mssql");
+  if (!roots.length) throw new Error(analyze ? "No plan returned (STATISTICS XML)" : "No plan returned (SHOWPLAN_XML)");
+  const all = flatten(roots);
+  const actual = runtime.size > 0;
+  if (actual) {
+    for (const n of all) {
+      const rt = runtime.get(n);
+      // an operator that never ran (other branch, startup filter) has no counters: 0 rows, 0 executions
+      if (rt) applyRuntime(n, rt);
+      else {
+        n.actRows = 0;
+        n.loops = 0;
+      }
+    }
+    // batch-mode operators report their own time: add the children's (inclusive, like row mode), bottom-up
+    for (let i = all.length - 1; i >= 0; i--) {
+      const n = all[i];
+      if (runtime.get(n)?.batch && n.totalMs !== null) n.totalMs += n.children.reduce((x, c) => x + (c.totalMs ?? 0), 0);
+    }
+  }
+  for (const n of all) n.detail = n.extras.filter((x) => !x.startsWith("Logical:") && !x.startsWith("Actual rows:")).join(" · ");
+  const plan = finish("mssql-xml", actual, roots, xml, actual ? planningMs : null, actual ? executionMs : null, sql, "mssql");
   if (missing.length && missing[0].cols.length) {
     const mi = missing[0];
     const tbl = (mi.schema ? `[${mi.schema}].` : "") + `[${mi.table}]`;
@@ -630,7 +746,7 @@ export function parsePlan(format: PlanFormat, rows: unknown[][], analyze: boolea
   }
   if (format === "mysql-json") return parseMysqlJson(String(rows[0][0] ?? ""), sql);
   if (format === "mysql-tree") return parseMysqlTree(rows.map((r) => String(r[0] ?? "")).join("\n"), sql);
-  return parseMssqlXml(String(rows[0][0] ?? ""), sql);
+  return parseMssqlXml(String(rows[0][0] ?? ""), sql, analyze);
 }
 
 // ---------------------------------------------------------------- hints

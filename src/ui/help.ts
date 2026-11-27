@@ -2,12 +2,14 @@
 // articles; compact article popovers for errors ("What does this mean?") and the small ? hints next to tricky
 // dialog fields. Content: src/help/articles.ts, rendered by a tiny Markdown-subset renderer that only builds DOM
 // nodes (never innerHTML of text).
-import { ARTICLES, ERROR_HELP, TOPICS } from "../help/articles";
+import { ARTICLES, TOPICS, errorArticleFor } from "../help/articles";
 import type { HelpArticle, HelpTopic, TopicId } from "../help/articles";
 import { clear, copyText, h, icon } from "./dom";
 import { ACTIONS, bindingOf, formatBinding, shortcutLabel } from "./keymap";
 import type { ActionId } from "./keymap";
 import { toast } from "./toast";
+import { REDIS_COMMANDS } from "./redis";
+import { KAFKA_COMMANDS } from "./kafka";
 import "../styles/help.css";
 
 /** What "Try it" buttons need from the shell. */
@@ -447,24 +449,46 @@ export function openHelpPopover(anchor: HTMLElement, id: string, tip?: string): 
   };
 }
 
+export interface ErrorHelpContext {
+  /** The data source uses Vault. */
+  vault?: boolean;
+  /** Driver of the data source ("redis", "kafka", "postgres"…): driver-specific articles only match their driver. */
+  driver?: string;
+  /** The Redis / Kafka command that failed: its syntax is shown on top of the command articles. */
+  command?: string;
+}
+
 /** The troubleshooting article for an error message, or null. */
-export function helpForError(msg: string, ctx: { vault?: boolean } = {}): string | null {
-  for (const m of ERROR_HELP) {
-    if (m.vaultOnly && !ctx.vault) continue;
-    if (m.re.test(msg)) return m.id;
+export function helpForError(msg: string, ctx: ErrorHelpContext = {}): string | null {
+  return errorArticleFor(msg, ctx);
+}
+
+/** "Syntax: HSET key field value …" for a Redis / Kafka console command (the command's own syntax, not SQL). */
+export function commandSyntaxTip(driver: string | undefined, command: string | undefined): string | undefined {
+  const word = command?.trim().split(/\s+/)[0] ?? "";
+  if (!word) return undefined;
+  if (driver === "redis") {
+    const name = word.toUpperCase();
+    const hit = REDIS_COMMANDS.find((c) => c.name.toUpperCase() === name);
+    return hit ? `Syntax: ${hit.sig}` : `${name} isn't a command DataTrip knows — check the spelling (module commands need the module on the server).`;
   }
-  return null;
+  if (driver === "kafka") {
+    const hit = KAFKA_COMMANDS.find((c) => c.name === word.toLowerCase());
+    return hit ? `Syntax: ${hit.sig}` : `Commands: ${KAFKA_COMMANDS.map((c) => c.name).join(", ")}`;
+  }
+  return undefined;
 }
 
 /** "? What does this mean" for a known error (null when there is no article for it). */
-export function errorHelpButton(msg: string, ctx: { vault?: boolean } = {}): HTMLButtonElement | null {
+export function errorHelpButton(msg: string, ctx: ErrorHelpContext = {}): HTMLButtonElement | null {
   const id = helpForError(msg, ctx);
   if (!id) return null;
+  const tip = id === "trouble-redis-command" || id === "trouble-kafka-command" ? commandSyntaxTip(ctx.driver, ctx.command) : undefined;
   const b = h("button", { class: "btn sm help-err-btn", type: "button", title: "Open the matching help article" }, h("span", { class: "help-q", "aria-hidden": "true" }, "?"), "What does this mean?");
   b.addEventListener("click", (e) => {
     e.stopPropagation();
     if (pop) closeHelpPopover();
-    else openHelpPopover(b, id);
+    else openHelpPopover(b, id, tip);
   });
   return b;
 }

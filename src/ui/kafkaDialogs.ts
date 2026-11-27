@@ -5,6 +5,8 @@ import { TextEditor } from "./editor";
 import { clear, errMsg, h, icon } from "./dom";
 import { fmtInt, kafkaSid, loadOverview, overviewOf, toLocalInput } from "./kafka";
 import { promptDialog } from "./prompt";
+import { errorHelpButton } from "./help";
+import { confirmProdKafka } from "./prodUi";
 import { store } from "./state";
 import { toast } from "./toast";
 
@@ -12,11 +14,18 @@ const MOD = /Mac/.test(navigator.userAgent) ? "⌘" : "Ctrl+";
 
 const isReadOnly = (connId: string): boolean => store.conns.get(connId)?.config.readOnly === true;
 
+/** v0.17: an error line of a dialog with the "What does this mean?" help button when an article matches. */
+function showErr(el: HTMLElement, e: unknown, command?: string): void {
+  const msg = errMsg(e);
+  el.replaceChildren(h("span", null, msg), errorHelpButton(msg, { driver: "kafka", command }) ?? "");
+}
+
 /** Overlay shell shared by the dialogs here: Escape / click outside close it. */
 function shell(dialog: HTMLElement, onClose: () => void): { overlay: HTMLElement; close: () => void } {
   const overlay = h("div", { class: "overlay" }, dialog);
   const onKey = (e: KeyboardEvent): void => {
-    if (e.key === "Escape") {
+    // a production confirmation on top handles its own Escape
+    if (e.key === "Escape" && !document.querySelector(".ops-confirm")) {
       e.stopPropagation();
       close();
     }
@@ -189,14 +198,21 @@ export function openProduceDialog(o: ProduceOpts): void {
     }
     const headers: KafkaHeader[] = hdrRows.filter((r) => r.k.value.trim() !== "").map((r) => ({ key: r.k.value.trim(), value: r.v.value }));
     const text = editor?.getText() ?? "";
+    const key = inKey.value === "" ? null : inKey.value;
     btnSend.disabled = true;
+    // v0.17: production sources confirm first
+    const prod = await confirmProdKafka(store.conns.get(o.connId)?.config, { kind: "produce", topic: o.topic, partition, key, value: text === "" ? null : text, headers: headers.length });
+    if (prod === false) {
+      btnSend.disabled = false;
+      return;
+    }
     try {
-      const r = await api.kafkaProduce(sid, { topic: o.topic, partition, key: inKey.value === "" ? null : inKey.value, value: text === "" ? null : text, headers });
+      const r = await api.kafkaProduce(sid, { topic: o.topic, partition, key, value: text === "" ? null : text, headers });
       toast(`Sent to p${r.partition} @ ${fmtInt(r.offset)}`, "ok");
       o.onSent?.(r);
       if (!keepOpen.checked) close();
     } catch (e) {
-      err.textContent = errMsg(e);
+      showErr(err, e, "produce");
     } finally {
       btnSend.disabled = false;
     }
@@ -253,6 +269,12 @@ export function openCreateTopicDialog(connId: string): Promise<string | null> {
         return;
       }
       btn.disabled = true;
+      // v0.17: production sources confirm first
+      const prod = await confirmProdKafka(store.conns.get(connId)?.config, { kind: "create topic", topic: name, partitions: parts, replication: rf });
+      if (prod === false) {
+        btn.disabled = false;
+        return;
+      }
       try {
         await api.kafkaCreateTopic(sid, name, parts, rf);
         done = true;
@@ -261,7 +283,7 @@ export function openCreateTopicDialog(connId: string): Promise<string | null> {
         toast(`Created topic ${name}`, "ok");
         void loadOverview(connId, true);
       } catch (e) {
-        err.textContent = errMsg(e);
+        showErr(err, e, "create");
         btn.disabled = false;
       }
     };
@@ -284,12 +306,17 @@ export async function deleteTopicFlow(connId: string, topic: string): Promise<bo
     toast("This connection is read-only", "info");
     return false;
   }
-  const typed = await promptDialog("Delete topic", `Type “${topic}” to confirm`, "", "Delete topic", [], {
-    icon: "trash",
-    hint: "This permanently deletes the topic and every message in it.",
-    validate: (v) => (v === topic ? null : "The name doesn't match."),
-  });
-  if (typed !== topic) return false;
+  // v0.17: on a production source its confirmation (typed data source or topic name) replaces the plain one
+  const prod = await confirmProdKafka(store.conns.get(connId)?.config, { kind: "delete topic", topic });
+  if (prod === false) return false;
+  if (prod === null) {
+    const typed = await promptDialog("Delete topic", `Type “${topic}” to confirm`, "", "Delete topic", [], {
+      icon: "trash",
+      hint: "This permanently deletes the topic and every message in it.",
+      validate: (v) => (v === topic ? null : "The name doesn't match."),
+    });
+    if (typed !== topic) return false;
+  }
   const sid = kafkaSid(connId);
   if (!sid) return false;
   try {
@@ -433,13 +460,22 @@ export function openResetOffsetsDialog(connId: string, group: KafkaGroupDetail, 
       return;
     }
     btnReset.disabled = true;
+    // v0.17: production sources confirm first
+    const parts = group.offsets.filter((x) => x.topic === selTopic.value).length;
+    const v = value();
+    const toText = to === "timestamp" && v !== null ? `timestamp ${new Date(v).toISOString()}` : to;
+    const prod = await confirmProdKafka(store.conns.get(connId)?.config, { kind: "reset offsets", group: group.groupId, topic: selTopic.value, to: toText, value: to === "offset" ? v : null, partitions: parts });
+    if (prod === false) {
+      btnReset.disabled = false;
+      return;
+    }
     try {
       const n = await api.kafkaResetOffsets(sid, group.groupId, selTopic.value, to, value());
       toast(`Reset ${n} partition${n === 1 ? "" : "s"} of ${selTopic.value}`, "ok");
       close();
       onDone();
     } catch (e) {
-      err.textContent = errMsg(e);
+      showErr(err, e);
       btnReset.disabled = false;
     }
   };

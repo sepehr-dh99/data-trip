@@ -10,7 +10,9 @@ import { showMenu } from "./menu";
 import { SqlEditor } from "./editor";
 import { kafkaNames, loadOverview } from "./kafka";
 import { ResultGrid } from "./grid";
-import type { PagingState } from "./grid";
+import type { GridViewState, PagingState } from "./grid";
+import { LIVE_CONSOLES, planHibernation } from "./hibernate";
+import type { HibConsole } from "./hibernate";
 import { store } from "./state";
 import { buildCompletionSchema, buildFilteredSql, connColor, countSql, detectEditContext, nextOrder, orderMarks, pagedSql, pagingFirstPageOnly, parseFilterable, qualifiedName, quoteIdent } from "./sqlutil";
 import { getSettings } from "./settings";
@@ -29,7 +31,7 @@ import { FilterBar } from "./filterBar";
 import type { FilterState } from "./filterBar";
 import { toast } from "./toast";
 import type { TabPane } from "./tabs";
-import { sentinelLabel } from "./redis";
+import { dbLabel, sentinelLabel } from "./redis";
 import { AiAssist } from "./aiPanel";
 import { docWithoutPending } from "./aiEditor";
 import { FileBinding } from "./sqlFiles";
@@ -39,7 +41,7 @@ import type { ParamRun, PreparedRun } from "./consoleOps";
 import { parseRemembered } from "./params";
 import type { RememberedParams } from "./params";
 import { closeParamsPopover } from "./paramsPopover";
-import { prodBar } from "./prodUi";
+import { confirmProdCommands, confirmProdEdits, prodBar } from "./prodUi";
 import { analyzeSupported } from "./explainPlan";
 import { renderPlanView } from "./explainView";
 import { updateSettings } from "./settings";
@@ -88,6 +90,11 @@ interface ResultItem {
   fedSources?: FedSource[];
   /** v0.16: ran with parameters (chips above the result, Edit parameters). */
   params?: ParamRun | null;
+  /**
+   * v0.17: the grid was released (console hibernated): `slot` stands where its element was, `state` rebuilds the
+   * view; `released` = the row count when the rows were dropped too ("Results released to save memory").
+   */
+  hib?: { state: GridViewState | null; slot: HTMLElement; released: number | null };
 }
 
 /** An extra data source attached to a console for cross-source queries. */
@@ -175,8 +182,8 @@ let counter = 0;
 
 // ---------------------------------------------------------------- v0.15 safeguards (module-wide)
 
-/** Only this many most recently used consoles keep a live CodeMirror view; the others hibernate theirs. */
-const LIVE_EDITORS = 10;
+/** Only this many most recently used consoles keep a live CodeMirror view (and result grids); the others hibernate theirs. */
+const LIVE_EDITORS = LIVE_CONSOLES;
 /** Consoles, most recently used first. */
 const consoleOrder: ConsolePane[] = [];
 let idleTimer: number | undefined;
@@ -187,7 +194,23 @@ function touchConsole(c: ConsolePane): void {
   if (i >= 0) consoleOrder.splice(i, 1);
   consoleOrder.unshift(c);
   for (const old of consoleOrder.slice(LIVE_EDITORS)) old.hibernateEditor();
+  sweepResults();
   if (idleTimer === undefined) idleTimer = window.setInterval(idleSweep, 30_000);
+}
+
+/**
+ * v0.17: consoles beyond the 10 most recently used release their result grids (rebuilt when shown again); those
+ * keeping more rows than `data.hibernateResultRows` drop the rows too. Never visible / running / pending-edit ones.
+ */
+function sweepResults(): void {
+  const plan = planHibernation(
+    consoleOrder.map((c) => c.hibInfo()),
+    { live: LIVE_EDITORS, rowBudget: getSettings().data.hibernateResultRows },
+  );
+  const list = [...consoleOrder];
+  plan.forEach((a, i) => {
+    if (a !== "keep") list[i]?.hibernateResults(a === "release");
+  });
 }
 
 /** Closes the database session of consoles idle for `data.idleDisconnectMinutes` (0 = never). */
@@ -440,6 +463,108 @@ export class ConsolePane implements TabPane {
     this.editor.hibernate();
   }
 
+  // ---------------------------------------------------------------- v0.17 result-grid hibernation
+
+  private get shown(): boolean {
+    return this.alive && this.el.isConnected && !this.el.classList.contains("hidden");
+  }
+
+  /** What the hibernation planner needs (hibernate.ts). */
+  hibInfo(): HibConsole {
+    let rows = 0;
+    for (const it of this.items) if (it.last && (!it.hib || it.hib.released === null)) rows += it.last.rows.length;
+    return { visible: this.shown, busy: this.running, pending: this.items.some((i) => i.grid?.hasPending() === true), rows };
+  }
+
+  /** Releases the result grids of this hidden console (rows kept); `release` drops the rows too. */
+  hibernateResults(release: boolean): void {
+    if (!this.alive || this.running || this.shown) return;
+    if (this.items.some((i) => i.grid?.hasPending() === true)) return;
+    for (const it of this.items) {
+      if (it.grid && it.last) this.sleepItem(it);
+      if (release && it.hib && it.hib.released === null && it.last) this.releaseItem(it);
+    }
+  }
+
+  /** Destroys an item's grid (DOM, listeners) and leaves an empty slot in its place. */
+  private sleepItem(it: ResultItem): void {
+    const g = it.grid;
+    if (!g || !g.el.parentNode) return;
+    const state = g.viewState();
+    const slot = h("div", { class: "r-hib", "aria-hidden": "true" });
+    const isView = it.view === g.el;
+    if (isView && g.el.classList.contains("hidden")) slot.classList.add("hidden");
+    g.el.replaceWith(slot);
+    if (isView) it.view = slot;
+    it.grid = undefined;
+    it.hib = { state, slot, released: null };
+    g.dispose();
+  }
+
+  /** Drops a hibernated item's rows (column info and the count stay) and shows "Results released…". */
+  private releaseItem(it: ResultItem): void {
+    const hib = it.hib;
+    const last = it.last;
+    if (!hib || !last) return;
+    hib.released = last.rows.length;
+    it.last = { ...last, rows: [] };
+    const slot = hib.slot;
+    const hidden = slot.classList.contains("hidden");
+    slot.className = "r-message r-released" + (hidden ? " hidden" : "");
+    slot.removeAttribute("aria-hidden");
+    const cols = last.columns.map((c) => c.name);
+    const colText = cols.length > 6 ? `${cols.slice(0, 6).join(", ")}, … (${cols.length} columns)` : cols.join(", ");
+    const n = hib.released;
+    const btn = h("button", { class: "btn sm", type: "button", title: "Run the statement again on this console's session" }, icon("refresh", 13), "Run again");
+    btn.addEventListener("click", () => void this.runAgain(it));
+    slot.replaceChildren(
+      icon("table", 20),
+      h("div", { class: "r-message-title" }, "Results released to save memory"),
+      h("div", { class: "r-message-sub" }, `${n.toLocaleString()} row${n === 1 ? "" : "s"}${colText ? " · " + colText : ""}`),
+      h("pre", { class: "r-sql" }, it.sql),
+      btn,
+    );
+  }
+
+  /** Rebuilds a hibernated item's grid from the kept result (scroll, selection, widths, sort, filter restored). */
+  private wakeItem(it: ResultItem): ResultGrid | null {
+    const hib = it.hib;
+    const last = it.last;
+    if (!hib || !last || !hib.slot.parentNode) return null;
+    const grid = this.makeGrid(() => it);
+    it.grid = grid;
+    if (it.fed) {
+      grid.setOptions({});
+      grid.setResult(last, null, "Cross-source results are read-only", it.maxRows);
+      grid.setExportInfo(this.driver, null);
+    } else this.applyGrid(grid, last, it.maxRows);
+    if (it.paging) grid.setPaging(it.paging);
+    if (it.filter) grid.setServerSort(orderMarks(it.filter.order, this.driver));
+    const isView = it.view === hib.slot;
+    if (isView && hib.slot.classList.contains("hidden")) grid.el.classList.add("hidden");
+    hib.slot.replaceWith(grid.el);
+    if (isView) it.view = grid.el;
+    it.hib = undefined;
+    if (hib.state && hib.released === null) grid.restoreView(hib.state);
+    return grid;
+  }
+
+  /** "Run again" on released results: the same statement (parameters already substituted) on this console's session. */
+  private async runAgain(it: ResultItem): Promise<void> {
+    if (this.running || !it.hib) return;
+    const state = it.hib.state;
+    if (!this.wakeItem(it)) return;
+    this.syncBar();
+    await this.rerun(it);
+    if (this.alive && it.grid && state && it.last && it.last.columns.length === state.widths.length) it.grid.restoreView({ ...state, meta: "" });
+  }
+
+  /** The active result of a console that is shown again gets its grid back. */
+  private wakeResults(): void {
+    const it = this.items[this.activeItem];
+    if (it?.hib && it.hib.released === null && this.shown) this.wakeItem(it);
+  }
+
   /**
    * Closes the console's database session after `ms` without a run, typing or focus — never while a statement
    * runs, in a manual transaction (or a typed BEGIN), with the editor focused, or for Kafka. The next run
@@ -534,6 +659,7 @@ export class ConsolePane implements TabPane {
 
   focus(): void {
     touchConsole(this);
+    this.wakeResults();
     this.editor.focus();
   }
 
@@ -1149,6 +1275,8 @@ export class ConsolePane implements TabPane {
       this.setRunning(false, this.status.text.startsWith("Running") || this.status.text === "Connecting…" ? "Done" : this.status.text);
       this.host.onExecuted(this.connId);
       if (schemaTouched) this.host.onSchemaChanged(this.connId);
+      // v0.17: finished while hidden: its new results may need hibernating
+      if (this.alive && !this.shown) sweepResults();
     }
     if (autoCount && this.alive) await this.countRows(autoCount);
   }
@@ -1335,13 +1463,16 @@ export class ConsolePane implements TabPane {
 
   private activate(i: number): void {
     this.activeItem = i;
+    // v0.17: a hibernated result gets its grid back when it is shown
+    const cur = this.items[i];
+    if (cur?.hib && cur.hib.released === null && this.shown) this.wakeItem(cur);
     this.items.forEach((it, k) => {
       it.tab.classList.toggle("on", k === i);
       it.view.classList.toggle("hidden", k !== i);
       if (k === i) {
         const g = it.grid;
-        if (g && it.last) {
-          this.status.rows = it.last.rows.length;
+        if ((g || it.hib) && it.last) {
+          this.status.rows = it.hib?.released ?? it.last.rows.length;
           this.status.elapsedMs = it.last.elapsedMs;
           this.status.affected = it.last.rowsAffected;
         }
@@ -1520,7 +1651,8 @@ export class ConsolePane implements TabPane {
       btn,
       spot ? this.goToErrorButton(spot, msg) : null,
       reconnect || fed ? null : this.ai.fixActions(sql, msg),
-      errorHelpButton(msg, { vault: store.conns.get(this.connId)?.config.authMethod === "vault" }),
+      // v0.17: the driver picks Redis / Kafka articles (command syntax, not SQL); the failed command adds its syntax
+      errorHelpButton(msg, { vault: store.conns.get(this.connId)?.config.authMethod === "vault", driver: this.driver, command: this.isLineBased ? sql : undefined }),
     );
     this.addItem(total > 1 ? `Error · ${n}` : "Error", sql, view, "err");
   }
@@ -1620,7 +1752,11 @@ export class ConsolePane implements TabPane {
    * the typed name); otherwise the "Confirm risky statements" check — never both.
    */
   private async confirmWrites(stmts: string[]): Promise<boolean> {
-    if (this.isLineBased) return true;
+    // v0.17: Redis / Kafka write commands on a production source (FLUSHDB / FLUSHALL / delete topic: typed name)
+    if (this.isLineBased) {
+      const redis = this.isRedis;
+      return confirmProdCommands({ config: store.conns.get(this.connId)?.config, where: redis ? dbLabel(this.effectiveDatabase) : null, driver: redis ? "redis" : "kafka", lines: stmts });
+    }
     const writes = stmts.filter((s) => this.routeOf(s).kind === "native");
     const prod = await confirmWrites(
       {
@@ -1713,7 +1849,8 @@ export class ConsolePane implements TabPane {
 
   private syncBar(): void {
     const it = this.items[this.activeItem];
-    if (it?.filter) this.bar.show(it.filter, this.driver);
+    // v0.17: released results have no rows to filter until Run again
+    if (it?.filter && !(it.hib && it.hib.released !== null)) this.bar.show(it.filter, this.driver);
     else this.bar.hide();
     this.syncParamBar();
   }
@@ -1845,6 +1982,9 @@ export class ConsolePane implements TabPane {
   }
 
   private async submitEdits(item: ResultItem, edits: RowEdit[]): Promise<void> {
+    // v0.17: production sources confirm the pending changes first (Cancel keeps them pending in the grid). Grid edits
+    // always target one row by its key, so "Confirm risky statements" has nothing to ask here: never two prompts.
+    if (!(await confirmProdEdits({ config: store.conns.get(this.connId)?.config, database: this.effectiveDatabase, driver: this.driver, edits }))) return;
     try {
       const s = await this.ensureSession();
       const n = await api.applyEdits(s.sessionId, edits);

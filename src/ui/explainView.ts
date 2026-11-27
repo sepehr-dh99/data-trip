@@ -51,7 +51,7 @@ export function renderPlanView(plan: Plan, o: PlanViewOptions): HTMLElement {
 
   const info: string[] = [];
   if (plan.analyze) {
-    info.push(plan.format === "pg-json" ? `EXPLAIN ANALYZE${o.buffers ? ", BUFFERS" : ""}` : "EXPLAIN ANALYZE");
+    info.push(plan.format === "pg-json" ? `EXPLAIN ANALYZE${o.buffers ? ", BUFFERS" : ""}` : plan.format === "mssql-xml" ? "Actual plan (STATISTICS XML)" : "EXPLAIN ANALYZE");
     if (plan.executionMs !== null) info.push(`${fmtMs(plan.executionMs)} execution`);
     if (plan.planningMs !== null) info.push(`${fmtMs(plan.planningMs)} planning`);
   } else {

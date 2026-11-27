@@ -19,6 +19,8 @@ export interface OpsConfirmOptions {
   sql?: string;
   /** Require typing this name before the OK button works. */
   typeName?: string;
+  /** Accessible label of the typed-name field (default "Type the data source name"). */
+  typeLabel?: string;
   okLabel: string;
   cancelLabel?: string;
   /** Accent of the ring / icon (production color); default the danger red. */
@@ -42,7 +44,7 @@ export function opsConfirm(o: OpsConfirmOptions): Promise<boolean> {
       resolve(v);
     };
     const typed = o.typeName
-      ? h("input", { class: "input oc-type", type: "text", spellcheck: false, autocomplete: "off", placeholder: o.typeName, "aria-label": "Type the data source name" })
+      ? h("input", { class: "input oc-type", type: "text", spellcheck: false, autocomplete: "off", placeholder: o.typeName, "aria-label": o.typeLabel ?? "Type the data source name" })
       : null;
     const ok = h("button", { class: "btn danger-solid oc-ok", type: "button", onclick: () => tryOk() }, o.okLabel);
     const typedOk = (): boolean => !typed || typed.value === o.typeName;

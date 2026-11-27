@@ -68,6 +68,21 @@ export interface GridOptions {
   minWidths?: number[];
 }
 
+/** v0.17: a grid's view state (result-grid hibernation). */
+export interface GridViewState {
+  top: number;
+  left: number;
+  anchor: { r: number; c: number } | null;
+  head: { r: number; c: number } | null;
+  widths: number[];
+  baseWidths: number[];
+  sortCol: number;
+  sortDir: 1 | -1;
+  filter: string;
+  meta: string;
+  viewer: boolean;
+}
+
 interface InsertRow {
   cells: Cell[];
   touched: Set<number>;
@@ -101,6 +116,10 @@ export class ResultGrid {
   private pgSize!: HTMLButtonElement;
   private pgPage!: HTMLElement;
   private offSettings: (() => void) | null = null;
+  /** v0.17: disconnected by destroy() (result-grid hibernation). */
+  private resizeObs: ResizeObserver | null = null;
+  /** v0.17: last scroll position seen (a hidden console's grid has no layout, so scrollTop reads 0 there). */
+  private seenScroll = { top: 0, left: 0 };
   private lastMaxCol = 0;
   private kinds: ("num" | "date" | "bool" | "key" | "text")[] = [];
 
@@ -261,6 +280,7 @@ export class ResultGrid {
       "scroll",
       () => {
         const x = this.scroller.scrollLeft;
+        this.seenScroll = { top: this.scroller.scrollTop, left: x };
         this.headEl.style.transform = x ? `translate3d(${-x}px,0,0)` : "";
         this.scroller.classList.toggle("hs", x > 0);
         this.schedule();
@@ -271,10 +291,11 @@ export class ResultGrid {
     this.scroller.addEventListener("dblclick", (e) => this.onDblClick(e));
     this.scroller.addEventListener("keydown", (e) => this.onKey(e));
     this.scroller.addEventListener("contextmenu", (e) => this.onContextMenu(e));
-    new ResizeObserver(() => {
+    this.resizeObs = new ResizeObserver(() => {
       this.fitLast();
       this.schedule();
-    }).observe(this.scroller);
+    });
+    this.resizeObs.observe(this.scroller);
     this.lastMaxCol = getSettings().results.maxColWidth;
     let seen = false;
     this.offSettings = onSettingsChange(() => {
@@ -288,6 +309,22 @@ export class ResultGrid {
   destroy(): void {
     this.offSettings?.();
     this.offSettings = null;
+  }
+
+  /** v0.17: tears the grid down for good (hibernation): listeners, observer, frame, value viewer, DOM. */
+  dispose(): void {
+    this.destroy();
+    this.resizeObs?.disconnect();
+    this.resizeObs = null;
+    this.cancelEdit();
+    if (this.viewer?.open) this.viewer.close();
+    if (this.raf) cancelAnimationFrame(this.raf);
+    this.raf = 0;
+    window.clearTimeout(this.flashTimer);
+    this.active.clear();
+    this.pool = [];
+    this.el.remove();
+    this.el.replaceChildren();
   }
 
   private onSettings(): void {
@@ -448,6 +485,7 @@ export class ResultGrid {
     this.rebuildOrder();
     this.scroller.scrollTop = 0;
     this.scroller.scrollLeft = 0;
+    this.seenScroll = { top: 0, left: 0 };
     this.headEl.style.transform = "";
     this.scroller.classList.remove("hs");
     this.updateBar();
@@ -455,6 +493,51 @@ export class ResultGrid {
 
   hasPending(): boolean {
     return this.pendingCount() > 0;
+  }
+
+  /** v0.17: what a rebuilt grid needs to look the same (hibernation): scroll, selection, widths, sort, filter. */
+  viewState(): GridViewState {
+    return {
+      top: this.scroller.clientHeight > 0 ? this.scroller.scrollTop : this.seenScroll.top,
+      left: this.scroller.clientHeight > 0 ? this.scroller.scrollLeft : this.seenScroll.left,
+      anchor: this.anchor ? { ...this.anchor } : null,
+      head: this.head ? { ...this.head } : null,
+      widths: [...this.widths],
+      baseWidths: [...this.baseWidths],
+      sortCol: this.sortCol,
+      sortDir: this.sortDir,
+      filter: this.filterInput.value,
+      meta: this.meta,
+      viewer: this.viewer?.open === true,
+    };
+  }
+
+  /** v0.17: applies a `viewState()` of the same result (after setResult / setPaging / setServerSort). */
+  restoreView(s: GridViewState): void {
+    if (s.widths.length === this.cols.length && this.cols.length > 0) {
+      this.widths = [...s.widths];
+      this.baseWidths = s.baseWidths.length === this.cols.length ? [...s.baseWidths] : [...s.widths];
+      this.widthVersion++;
+    }
+    this.sortCol = !this.serverSort && s.sortCol < this.cols.length ? s.sortCol : -1;
+    this.sortDir = s.sortDir;
+    this.filterInput.value = s.filter;
+    this.filter = s.filter.trim().toLowerCase();
+    this.anchor = s.anchor ? { ...s.anchor } : null;
+    this.head = s.head ? { ...s.head } : null;
+    if (s.meta) this.setMeta(s.meta);
+    this.buildHeader();
+    this.fitLast();
+    this.rebuildOrder();
+    const apply = (): void => {
+      this.scroller.scrollTop = s.top;
+      this.scroller.scrollLeft = s.left;
+    };
+    this.seenScroll = { top: s.top, left: s.left };
+    apply();
+    // not laid out yet when the console was still hidden: once more on the next frame
+    requestAnimationFrame(apply);
+    if (s.viewer && this.head) this.openValueViewer();
   }
 
   focus(): void {

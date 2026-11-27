@@ -159,15 +159,27 @@ fn cell_to_value(row: &tiberius::Row, idx: usize, data: &ColumnData<'static>) ->
     }
 }
 
+/// Prefix of a statement DataTrip explains under `SET SHOWPLAN_XML ON` / `SET STATISTICS XML ON`
+/// (frontend `MSSQL_SHOWPLAN_MARKER`): only the showplan result sets are returned, one row each.
+const SHOWPLAN_MARKER: &str = "/*datatrip:showplan*/";
+
+/// The XML showplan result set's column ("Microsoft SQL Server 2005 XML Showplan").
+fn is_showplan_column(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("showplan")
+}
+
 pub fn stream<'a>(
     client: &'a mut MssqlClient,
     sql: &'a str,
     sink: &'a mut dyn RowSink,
 ) -> futures::future::BoxFuture<'a, AppResult<StreamEnd>> {
     Box::pin(async move {
+        // Explain: the statement's own results (rows of an analyzed SELECT) are skipped, the plans are the result.
+        let plan_mode = sql.trim_start().starts_with(SHOWPLAN_MARKER);
         let kw = first_keyword(sql);
         // For plain DML, append SELECT @@ROWCOUNT to learn the affected row count.
-        let dml = matches!(kw.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")
+        let dml = !plan_mode
+            && matches!(kw.as_str(), "INSERT" | "UPDATE" | "DELETE" | "MERGE")
             && !sql.to_uppercase().contains("OUTPUT");
         let batch = if dml {
             let sep = if sql.trim_end().ends_with(';') {
@@ -185,9 +197,36 @@ pub fn stream<'a>(
         let mut count: Option<u64> = None;
         let mut stopped = false;
         let mut sent_cols = false;
+        let mut in_plan = false;
 
         while let Some(item) = qs.try_next().await? {
             match item {
+                QueryItem::Metadata(meta) if plan_mode => {
+                    in_plan =
+                        matches!(meta.columns().first(), Some(c) if is_showplan_column(c.name()));
+                    if in_plan && !sent_cols {
+                        sink.columns(&[ColumnMeta {
+                            name: "Showplan".to_string(),
+                            type_name: "Xml".to_string(),
+                        }])?;
+                        sent_cols = true;
+                    }
+                }
+                QueryItem::Row(row) if plan_mode => {
+                    if !in_plan {
+                        continue;
+                    }
+                    let cells: Vec<Value> = row
+                        .cells()
+                        .take(1)
+                        .enumerate()
+                        .map(|(i, (_, d))| cell_to_value(&row, i, d))
+                        .collect();
+                    if !sink.row(cells)? {
+                        stopped = true;
+                        break;
+                    }
+                }
                 QueryItem::Metadata(meta) => {
                     sets += 1;
                     if !dml && sets == 1 {

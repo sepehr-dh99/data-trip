@@ -47,7 +47,9 @@ import { maybeStartTour, startTour } from "./tour";
 import { checkForUpdates, initUpdates, setBeforeRestart } from "./updates";
 import { initDataTools } from "./dataTools";
 import { importData, openDesigner, showDdl } from "./dataActions";
-import type { Workspace, WsTab } from "./workspace";
+import type { Workspace, WsSessions, WsTab } from "./workspace";
+import { DdlPane } from "./ddlPane";
+import type { FileMemo } from "./sqlFiles";
 
 const IS_MAC = /Mac/.test(navigator.userAgent);
 const MOD = IS_MAC ? "⌘" : "Ctrl+";
@@ -62,6 +64,10 @@ interface ClosedTab {
   schema: string | null;
   sql: string;
   name: string | null;
+  /** v0.17: the console's .sql file binding (path, baseline, mtime, dirty) — Save keeps writing to that file. */
+  file?: FileMemo | null;
+  /** v0.17: Sessions & locks filters. */
+  sessions?: WsSessions;
 }
 const MAX_CLOSED = 25;
 
@@ -206,6 +212,7 @@ export class App {
     // v0.16: Show DDL, table designer and Import data open tabs / dialogs through this host.
     initDataTools({
       addTab: (pane) => {
+        if (pane instanceof DdlPane) pane.onChange = () => this.saveWorkspaceSoon();
         this.tabs.push(pane);
         this.stack.appendChild(pane.el);
         this.activate(pane);
@@ -343,9 +350,11 @@ export class App {
       else if (t instanceof KeyPane) tabs.push({ kind: "key", key, name, connId: t.connId, title: t.key, database: t.effectiveDatabase, keyType: t.keyType });
       else if (t instanceof TopicPane) tabs.push({ kind: "topic", key, name, connId: t.connId, title: t.topic, database: null });
       else if (t instanceof GroupPane) tabs.push({ kind: "group", key, name, connId: t.connId, title: t.groupId, database: null });
+      else if (t instanceof SessionsPane) tabs.push({ kind: "sessions", key, name, connId: t.connId, title: t.title, database: null, sessions: t.snapshot() });
+      else if (t instanceof DdlPane) tabs.push({ kind: "ddl", key, name, connId: t.connId, title: t.title, database: t.target.database, ddl: t.snapshot() });
     }
-    // Every open tab has an entry, so indexes match this.tabs.
-    const savedTabs = this.tabs.filter((t) => t.kind !== "ddl" && t.kind !== "design");
+    // Every open tab but table designers (v0.17: not restored) has an entry, so indexes match.
+    const savedTabs = this.tabs.filter((t) => t.kind !== "design");
     const active = this.active && tabs.length === savedTabs.length ? savedTabs.indexOf(this.active) : -1;
     return { version: 1, tabs, active };
   }
@@ -384,6 +393,24 @@ export class App {
       if (c) pane.restoreState(c);
       return pane;
     }
+    if (t.kind === "sessions") {
+      // v0.17: connects and loads when first shown
+      const pane = new SessionsPane(t.connId, { state: t.sessions ?? null, ensure: () => this.ensureConn(t.connId) });
+      pane.onChange = () => this.saveWorkspaceSoon();
+      this.strip.adopt(pane, t.key, t.name);
+      return pane;
+    }
+    if (t.kind === "ddl") {
+      // v0.17: the DDL is read again when the tab is first shown
+      const d = t.ddl;
+      const drv = store.conns.get(t.connId)?.config.driver;
+      if (!d || !drv || !FED_DRIVERS.has(drv)) throw new Error("not a SQL data source");
+      const pane = new DdlPane({ connId: t.connId, database: d.database, schema: d.schema, name: d.name, kind: d.kind, arguments: d.arguments, table: d.table }, { lazy: true, options: d.options });
+      pane.onChange = () => this.saveWorkspaceSoon();
+      this.strip.adopt(pane, t.key, t.name);
+      return pane;
+    }
+    if (t.kind !== "key" && t.kind !== "topic" && t.kind !== "group") throw new Error("not restored");
     const pane = new RestoredPane(t.kind, t);
     this.strip.adopt(pane, t.key, t.name);
     return pane;
@@ -699,12 +726,13 @@ export class App {
 
   /** Opens (or focuses) the tab of a Kafka consumer group. */
   /** v0.16: opens (or focuses) the Sessions & locks tab of a data source (its own dedicated session). */
-  private async openSessions(connId: string): Promise<void> {
+  private async openSessions(connId: string, state: WsSessions | null = null): Promise<void> {
     const drv = store.conns.get(connId)?.config.driver;
     if (drv !== "sqlite" && !(await this.ensureConn(connId))) return;
     let pane = this.tabs.find((t): t is SessionsPane => t instanceof SessionsPane && t.matches(connId));
     if (!pane) {
-      pane = new SessionsPane(connId);
+      pane = new SessionsPane(connId, { state });
+      pane.onChange = () => this.saveWorkspaceSoon();
       this.tabs.push(pane);
       this.stack.appendChild(pane.el);
     }
@@ -810,6 +838,8 @@ export class App {
       schema: c ? c.schema : null,
       sql: c ? c.sqlText : "",
       name: this.strip.manualName(t),
+      file: c ? c.file.memo() : null,
+      sessions: t instanceof SessionsPane ? t.snapshot() : undefined,
     });
     if (this.closed.length > MAX_CLOSED) this.closed.shift();
   }
@@ -823,7 +853,14 @@ export class App {
     }
     if (!store.conns.has(c.connId)) return this.reopenTab();
     if (c.kind === "console") {
-      await this.openConsole(c.connId, { sql: c.sql, title: c.title, table: c.table ?? undefined, database: c.database, schema: c.schema }, c.name);
+      const pane = await this.openConsole(c.connId, { sql: c.sql, title: c.title, table: c.table ?? undefined, database: c.database, schema: c.schema }, c.name);
+      // v0.17: back on the same .sql file (path, baseline, mtime, unsaved changes), so Save and FILE_CHANGED still work
+      if (pane && c.file) pane.file.adopt(c.file);
+      return;
+    }
+    if (c.kind === "sessions") {
+      await this.openSessions(c.connId, c.sessions ?? null);
+      if (c.name && this.active) this.strip.setManualName(this.active, c.name);
       return;
     }
     if (c.kind === "key") await this.openKey(c.connId, c.database ?? store.conns.get(c.connId)?.defaultDb ?? "0", c.title, "");

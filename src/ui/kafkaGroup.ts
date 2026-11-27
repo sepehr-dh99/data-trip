@@ -5,6 +5,7 @@ import type { KafkaGroupDetail } from "../types";
 import { clear, copyText, errMsg, h, icon } from "./dom";
 import { fmtInt, kafkaSid, loadOverview, memberByPartition, memberLabel, overviewOf, stateClass, stateLabel } from "./kafka";
 import { openResetOffsetsDialog } from "./kafkaDialogs";
+import { errorHelpButton } from "./help";
 import { store } from "./state";
 import type { TabPane } from "./tabs";
 import { toast } from "./toast";
@@ -171,7 +172,7 @@ export class GroupPane implements TabPane {
     clear(this.bodyEl);
     const d = this.data;
     if (this.error && !d) {
-      this.bodyEl.append(h("div", { class: "r-message err", role: "alert" }, icon("alert", 20), h("div", { class: "r-message-title" }, "Could not read the group"), h("div", { class: "r-error-text" }, this.error)));
+      this.bodyEl.append(h("div", { class: "r-message err", role: "alert" }, icon("alert", 20), h("div", { class: "r-message-title" }, "Could not read the group"), h("div", { class: "r-error-text" }, this.error), errorHelpButton(this.error, { driver: "kafka" })));
       return;
     }
     if (!d) {

@@ -13,6 +13,7 @@ import { shortcutLabel } from "./keymap";
 import { highlightSql } from "./sqlHighlight";
 import type { DbTarget } from "./dataTools";
 import { consoleDb, dataHost, sessionFor } from "./dataTools";
+import type { WsDdl } from "./workspace";
 
 const KIND_LABEL: Record<DdlKind, string> = {
   table: "Table",
@@ -57,8 +58,14 @@ export class DdlPane implements TabPane {
   private text = "";
   private seq = 0;
   private toggles: { key: "indexes" | "comments" | "qualified"; btn: HTMLButtonElement; enabled: boolean }[] = [];
+  /** v0.17: restored on launch: the DDL is read when the tab is first shown. */
+  private lazy = false;
+  /** v0.17: the toggles changed (the shell saves the workspace). */
+  onChange: (() => void) | null = null;
 
-  constructor(readonly target: DbTarget) {
+  /** `init.lazy`: restored on launch — read the DDL on first show; `init.options`: the saved toggles. */
+  constructor(readonly target: DbTarget, init: { lazy?: boolean; options?: WsDdl["options"] } = {}) {
+    if (init.options) this.opts = { ...init.options };
     const kind = target.kind as DdlKind;
     this.connId = target.connId;
     this.database = consoleDb(target.connId, target.database);
@@ -74,6 +81,7 @@ export class DdlPane implements TabPane {
           this.opts[key] = !this.opts[key];
           this.syncToggles();
           void this.load();
+          this.onChange?.();
         } },
         h("span", { class: "dd-box", "aria-hidden": "true" }),
         label,
@@ -98,7 +106,14 @@ export class DdlPane implements TabPane {
     const foot = h("div", { class: "dd-foot" }, this.foot, h("div", { class: "spacer" }), this.toastEl, h("span", null, `${shortcutLabel("showDdl") || "Show DDL"} from any table, view or routine`));
     this.el = h("div", { class: "ddl-pane" }, head, this.body, foot);
     this.syncToggles();
-    void this.load();
+    if (init.lazy) this.lazy = true;
+    else void this.load();
+  }
+
+  /** v0.17: what restore on launch saves for this tab. */
+  snapshot(): WsDdl {
+    const t = this.target;
+    return { kind: t.kind as DdlKind, database: t.database, schema: t.schema, name: t.name ?? "", arguments: t.arguments ?? null, table: t.table ?? null, options: { ...this.opts } };
   }
 
   private syncToggles(): void {
@@ -117,6 +132,10 @@ export class DdlPane implements TabPane {
   }
   focus(): void {
     this.body.focus({ preventScroll: true });
+    if (this.lazy) {
+      this.lazy = false;
+      void this.load();
+    }
   }
   async dispose(): Promise<void> {}
   dropSession(): void {}

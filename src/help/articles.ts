@@ -155,10 +155,40 @@ A SELECT shows the first page (Settings › Results grid › Page size); **Load 
 ## History
 Every statement you run is kept per data source: **Query history** ({bind:Mod-Shift-H}) — click to insert, double-click to run. Settings › Data & history sets how long it is kept.
 
+## Many consoles
+Open as many consoles as you like: the ones you haven't used lately sleep to save memory and wake up as they were when you come back. Your tabs come back at the next start too. See [Many consoles, memory and restored tabs](#many-consoles).
+
 > Lost the connection (VPN dropped, server restarted)? Read-only statements reconnect and run again by themselves; others show a Reconnect button. See [Connection lost](#trouble-connection-lost).`,
     keywords: "run execute statement cursor gutter cancel transaction commit rollback auto-commit manual history format paging load more count",
     tryIt: { label: "Try it in a new console", sql: "-- Put the cursor on a statement and press Run\nSELECT 1 AS one;\n\nSELECT 2 AS two;\n" },
-    related: ["results", "sql-files", "shortcuts"],
+    related: ["results", "sql-files", "many-consoles", "shortcuts"],
+  },
+  {
+    id: "many-consoles",
+    topic: "console",
+    title: "Many consoles, memory and restored tabs",
+    lead: "DataTrip keeps the 10 consoles you used most recently fully alive. The others sleep — nothing is lost — so memory stays bounded however many tabs are open.",
+    body: `## Sleeping consoles
+- A console you haven't used among the last 10 releases its editor and its result grid. Its text, undo history, cursor, results and settings stay.
+- When you open it again, the editor and the grid come back as they were: scroll position, selected cells, column widths, sort and the filter text.
+- A console with pending grid edits (not submitted yet), a running statement or the one on screen never sleeps.
+
+## Released results
+A sleeping console that holds more result rows than **Settings › Data & history › Release hidden results above** (100,000 rows by default; **Never** turns this off) also lets go of the rows. Its result then reads **Results released to save memory**, with the row count and the columns it had.
+- **Run again** runs that statement once more on the console's session — with the same parameter values — and shows fresh rows.
+- Nothing is re-run by itself: a released result stays released until you click Run again or run something new.
+
+## Tabs that come back
+With **Settings › Data & history › Restore consoles on launch** on, DataTrip reopens your tabs at the next start, without connecting anything until you look at them:
+- Consoles with their text, cursor, database, schema, attached sources and **.sql file**: a console bound to a file is still bound to it (● for unsaved changes; Save writes to the same file and still notices when the file changed on disk).
+- **Sessions & locks** tabs with their filters and auto-refresh interval; they connect and start refreshing when shown.
+- **Show DDL** tabs with their toggles; the DDL is read from the database again when you first open the tab.
+- Redis key and Kafka topic / group tabs.
+- Table designer tabs aren't restored (unsaved designs would be stale) — open the table again with Edit table…. Tabs of data sources you deleted are left out.
+
+{key:reopenTab} (**Reopen closed tab**) brings back a console you just closed with its text and its .sql file binding — including unsaved changes — and a Sessions & locks tab with its filters. Results aren't kept.`,
+    keywords: "memory performance slow many tabs hibernate sleep released results run again restore launch reopen closed tab workspace restart session file binding",
+    related: ["consoles", "sql-files", "sessions-locks", "show-ddl"],
   },
 
   // ------------------------------------------------------------------ results
@@ -509,6 +539,63 @@ Also good to know: a name that is no data source, database or schema is underlin
     keywords: "authentication failed password access denied login failed user wrong credentials",
     related: ["connect", "trouble-vault-denied"],
   },
+  // ------------------------------------------------------------------ v0.17: Redis / Kafka errors
+  {
+    id: "trouble-redis-command",
+    topic: "trouble",
+    title: "A Redis command failed",
+    lead: "Redis rejected the command itself: its name, its arguments, or the type of the key it works on.",
+    body: `- **ERR unknown command 'x'**: check the spelling. Commands of modules (JSON.*, FT.*) only exist when the module is loaded on the server. Completion in the console lists the known commands with their arguments.
+- **ERR wrong number of arguments** / **syntax error**: compare with the command's syntax (shown above when DataTrip knows it). Arguments are separated by spaces — quote values that contain spaces: \`SET greeting "hello world"\`. In "double quotes" \`\\n\`, \`\\t\`, \`\\"\` and \`\\xHH\` are escapes; 'single quotes' are literal.
+- **WRONGTYPE Operation against a key holding the wrong kind of value**: the key exists with another type (e.g. \`GET\` on a hash). \`TYPE key\` tells which; use HGETALL / LRANGE / SMEMBERS / ZRANGE / XRANGE, or open the key from the explorer.
+- **value is not an integer or out of range** / **not a valid float**: INCR, EXPIRE, LRANGE… need numbers.
+- MULTI / EXEC, SUBSCRIBE / MONITOR and SELECT are not run by the console: each line runs on its own, and the database is picked in the explorer.
+- "This connection is read-only": the data source is read-only, so writes are refused. On a **production** data source writes ask first ([Production data sources](#production-safety)).
+
+> Redis consoles run commands, not SQL: one command per line, \`#\` / \`//\` lines are comments, no \`;\` at the end.`,
+    keywords: "redis error wrongtype unknown command wrong number of arguments syntax error quotes integer float multi select",
+    related: ["redis", "trouble-redis-server"],
+  },
+  {
+    id: "trouble-redis-server",
+    topic: "trouble",
+    title: "Redis refused the command",
+    lead: "The command was fine, but the server can't run it right now or not for you: replica, cluster, memory, permissions.",
+    body: `- **READONLY You can't write against a read only replica**: you're connected to a replica. Connect to the primary, or use [Redis Sentinel](#redis-sentinel) so DataTrip finds it.
+- **MOVED / ASK / CROSSSLOT / CLUSTERDOWN**: the server is a Redis Cluster node. DataTrip talks to one node: keys of other slots answer MOVED, multi-key commands need keys of one slot (hash tags \`{user:42}:a\`).
+- **OOM command not allowed when used memory > 'maxmemory'**: the server is full — delete or expire keys, or raise maxmemory / the eviction policy.
+- **NOPERM**: the ACL user may not run this command or touch this key. \`ACL WHOAMI\` shows the user; ask for the permission.
+- **LOADING** (server still loading its data), **BUSY** (a script is running), **MISCONF** (snapshots fail, writes are stopped), **MASTERDOWN**: wait, or check the server's logs.
+- **NOSCRIPT**: EVALSHA of a script the server doesn't have — run it with EVAL once.`,
+    keywords: "redis readonly replica moved ask crossslot cluster oom maxmemory noperm acl loading busy misconf noscript",
+    related: ["redis", "redis-sentinel", "trouble-redis-command"],
+  },
+  {
+    id: "trouble-kafka-command",
+    topic: "trouble",
+    title: "A Kafka console command failed",
+    lead: "Kafka consoles run DataTrip's own command language, one command per line — not SQL.",
+    body: `- Commands: \`topics\`, \`groups\`, \`brokers\`, \`describe topic <t> [configs]\`, \`describe group <g>\`, \`consume <t> [--from-beginning|--latest|--from-timestamp <ISO>|--offset <n>] [--partition <n>] [--limit <n>] [--key-contains <s>] [--value-contains <s>]\`, \`produce <t> [key=<k>] [partition=<n>] [header.<k>=<v>] value=<v>\`, \`create topic <t> [partitions=<n>] [replication=<n>]\`, \`delete topic <t>\`.
+- **Expected name=value**: produce arguments are \`name=value\` pairs; quote a value with spaces: \`value="hello world"\`.
+- **must be a number** / **needs a value**: \`--limit\`, \`--offset\`, \`--partition\`, partitions= and replication= take whole numbers; \`--from-timestamp\` takes ISO 8601 (2026-05-01T12:00:00Z) or epoch milliseconds.
+- "This connection is read-only": read-only Kafka data sources can't produce, create or delete topics or reset offsets. On a **production** data source these ask first ([Production data sources](#production-safety)).`,
+    keywords: "kafka console command usage unknown command produce consume expected name value number timestamp",
+    related: ["kafka", "trouble-kafka-admin"],
+  },
+  {
+    id: "trouble-kafka-admin",
+    topic: "trouble",
+    title: "Kafka refused a topic or group change",
+    lead: "The brokers rejected creating, deleting or writing to a topic, or resetting a consumer group.",
+    body: `- **Topic already exists** / **Unknown topic or partition** / topic "x" not found: check the name (topic names are case-sensitive); the explorer's topic list may need a refresh.
+- **Invalid replication factor**: it can't exceed the number of brokers. **Invalid partitions**: at least 1; a topic's partitions can only grow.
+- **… authorization failed**: the user's ACLs don't allow it (Topic: Write / Create / Delete, Group: Read, Cluster: Create). Ask the cluster's admin.
+- **Policy violation**: the brokers' create-topic policy rejected the settings, or topic deletion is disabled (\`delete.topic.enable=false\`).
+- **must be Empty** (reset offsets): stop the group's consumers first — offsets of a group with active members can't be moved.
+- **Message size too large**: the message exceeds the topic's \`max.message.bytes\` / the broker's limit.`,
+    keywords: "kafka topic already exists unknown topic replication factor partitions authorization acl policy violation reset offsets empty group message too large",
+    related: ["kafka", "trouble-kafka-command"],
+  },
   // ------------------------------------------------------------------ v0.16
   {
     id: "query-parameters",
@@ -538,11 +625,13 @@ WHERE customer_id = :customer_id AND created_at >= :from_date;
     lead: "See how the database runs a statement: the plan tree with estimated vs actual rows, time per step and an index hint.",
     body: `1. Put the caret in a statement and press {key:explain} (or **Explain** in the console toolbar, Console › Explain plan, ⌘K).
 2. The plan replaces the results: each node with its relation / index, rows estimated → actual (×N flags a misestimate), self time or share of cost, and cost. The slowest node is marked; click a node for its details.
-3. **ANALYZE** executes the statement for real timings (PostgreSQL, MySQL 8.0.18+); **BUFFERS** adds I/O (PostgreSQL). A write is only analyzed after you confirm, inside BEGIN … ROLLBACK.
+3. **ANALYZE** executes the statement for real timings (PostgreSQL, MySQL 8.0.18+, SQL Server); **BUFFERS** adds I/O (PostgreSQL). A write is only analyzed after you confirm, inside BEGIN … ROLLBACK (SQL Server: BEGIN TRANSACTION … ROLLBACK TRANSACTION; in a manual transaction a savepoint).
 4. **Raw** shows the text plan; **Copy plan** copies it. A full scan with a filter on a column gets a hint and **Copy CREATE INDEX**.
 
-> PostgreSQL uses EXPLAIN (FORMAT JSON), MySQL EXPLAIN FORMAT=JSON / EXPLAIN ANALYZE, SQLite EXPLAIN QUERY PLAN and SQL Server SHOWPLAN_XML (estimated plan).`,
-    keywords: "explain analyze query plan slow performance index seq scan cost buffers showplan",
+> PostgreSQL uses EXPLAIN (FORMAT JSON), MySQL EXPLAIN FORMAT=JSON / EXPLAIN ANALYZE, SQLite EXPLAIN QUERY PLAN and SQL Server SHOWPLAN_XML (estimated plan) or, with ANALYZE, SET STATISTICS XML (actual plan).
+
+> SQL Server actual plans: rows are summed over all threads (a parallel operator counts as one execution), the time of an operator is its slowest thread's elapsed time (SQL Server 2016 SP1 and later report it; older servers show actual rows and the cost share instead), and the details list executions, threads, rows read, CPU and logical reads. A missing index suggested by SQL Server wins over DataTrip's own hint.`,
+    keywords: "explain analyze query plan slow performance index seq scan cost buffers showplan statistics xml actual execution plan",
     tryIt: { label: "Explain the statement at the cursor", command: "explain" },
     related: ["consoles", "query-parameters"],
   },
@@ -555,6 +644,7 @@ WHERE customer_id = :customer_id AND created_at >= :from_date;
 - Lock-wait chains are traced: the banner names the session at the head of the chain (**Select blocker**), blocked sessions are tinted.
 - Select a row for the full query, **Copy query**, **Cancel query** or **Kill session**. The confirmation shows the exact command (PostgreSQL \`pg_cancel_backend\` / \`pg_terminate_backend\`, MySQL \`KILL QUERY\` / \`KILL\`, SQL Server \`KILL\`).
 - The tab queries through its own session, which can't be cancelled or killed. SQLite has no server sessions.
+- The tab comes back at the next start with its filters and refresh interval (it connects when you show it).
 
 > Listing other users' sessions and killing them needs privileges (PostgreSQL pg_signal_backend / superuser, MySQL PROCESS / CONNECTION_ADMIN, SQL Server VIEW SERVER STATE / ALTER ANY CONNECTION).`,
     keywords: "processlist pg_stat_activity blocking locks deadlock kill cancel terminate running queries activity monitor",
@@ -583,8 +673,12 @@ WHERE customer_id = :customer_id AND created_at >= :from_date;
 - **Confirm before writes** (on by default): INSERT, UPDATE, DELETE, MERGE and DDL first show the statement kind, table, WHERE filter and estimated rows (PostgreSQL / MySQL planner estimate). UPDATE / DELETE without WHERE get a warning.
 - **Type the data source name for DROP / TRUNCATE** (on by default): an extra step for statements that remove whole tables or all rows.
 - Plain SELECTs run as usual. On production sources this confirmation replaces "Confirm risky statements" (you're never asked twice).
+- **Grid edits**: **Submit** (or {bind:Mod-S} in the grid) first shows the pending changes — how many updates, inserts and deletes, the table, and the exact statements (values written in; the first 8, then "+N more"). **Cancel** keeps the changes pending.
+- **Redis**: write commands in a console (SET, DEL, UNLINK, EXPIRE, HSET, LPUSH, INCR, CONFIG SET…) and the explorer / key tab actions (Set TTL, Delete key) show the command first; reads (GET, HGETALL, SCAN…) run as usual. FLUSHDB, FLUSHALL, SWAPDB, SHUTDOWN and deleting all keys under a folder also ask for the data source name.
+- **Kafka**: Produce message, Create topic, Reset offsets and the console's \`produce\` / \`create topic\` ask first; **Delete topic** asks for the data source name (or the topic name when "Type the data source name" is off).
+- Not covered: Run SQL file and Import data keep their own production warning.
 - AI is blocked for production data sources while "Block AI for production data sources" is on (names containing "prod" and read-only sources still count when nothing is marked).`,
-    keywords: "production prod safety confirm writes drop truncate guard color bar dangerous",
+    keywords: "production prod safety confirm writes drop truncate guard color bar dangerous grid edits submit redis flushdb flushall kafka produce delete topic reset offsets",
     related: ["connect", "sessions-locks", "ai-assistant"],
   },
 
@@ -616,7 +710,7 @@ On an editable result, **✎ Edit** opens the value in an editor. JSON is checke
 - **Schema-qualified** writes \`schema.table\` names.
 - **Copy**, or **Open in console** to edit and run a changed version (nothing runs until you do).
 
-{key:showDdl} works on the object selected in the explorer, or on the table of the active console.
+{key:showDdl} works on the object selected in the explorer, or on the table of the active console. DDL tabs come back at the next start; the DDL is read again when you open the tab.
 
 > PostgreSQL and SQL Server DDL is assembled from the system catalog; MySQL uses SHOW CREATE …; SQLite shows the statement stored in sqlite_master.`,
     keywords: "ddl create statement definition source script schema export structure show create",
@@ -655,8 +749,18 @@ Rows are written with bound parameters in multi-row INSERTs, kept under each ser
   },
 ];
 
-/** Error text → troubleshooting article (first match wins). `vault`: the data source uses Vault. */
-export const ERROR_HELP: { re: RegExp; id: string; vaultOnly?: boolean }[] = [
+const SQL_DRIVERS = ["postgres", "mysql", "sqlite", "mssql"] as const;
+
+/**
+ * Error text → troubleshooting article (first match wins). `vault`: only for data sources using Vault; `drivers`:
+ * only for those drivers (Redis / Kafka command errors never lead to SQL articles and vice versa).
+ */
+export const ERROR_HELP: { re: RegExp; id: string; vaultOnly?: boolean; drivers?: readonly string[] }[] = [
+  // v0.17: Redis / Kafka command errors
+  { re: /WRONGTYPE|wrong number of arguments|unknown (sub)?command|syntax error|Unbalanced (single )?quotes|closing quote must be followed|is not an integer|out of range|not a valid float|Command name must be valid UTF-8|Transactions \(MULTI|Streaming commands|SELECT is not supported|^Empty command|connection is read-only/i, id: "trouble-redis-command", drivers: ["redis"] },
+  { re: /READONLY|\bMOVED \d|\bASK \d|CROSSSLOT|CLUSTERDOWN|TRYAGAIN|\bOOM\b|maxmemory|\bLOADING\b|\bBUSY\b|MASTERDOWN|MISCONF|NOREPLICAS|NOPERM|NOSCRIPT|EXECABORT/, id: "trouble-redis-server", drivers: ["redis"] },
+  { re: /Unknown command "|^Usage: |Expected name=value|Unknown (produce|create topic) argument|Unknown consume option|must be a number, got|needs a value|Unbalanced quotes in command|produce needs at least|Cannot parse timestamp|Unknown start position|^Empty command|connection is read-only/i, id: "trouble-kafka-command", drivers: ["kafka"] },
+  { re: /already exists|Unknown ?topic ?or ?part|Topic "[^"]*" (not found|has no partition|is not available)|Invalid ?replication ?factor|Invalid ?partitions|Policy ?violation|authorization ?failed|must be Empty|Non ?empty ?group|Message ?size ?too ?large|Record ?too ?large|Consumer group "[^"]*" not found|has partitions 0/i, id: "trouble-kafka-admin", drivers: ["kafka"] },
   { re: /Kubernetes-internal|host name not found/i, id: "trouble-kafka-host" },
   { re: /advertise|No messages arrived within|partition leaders/i, id: "trouble-kafka-no-messages" },
   { re: /BrokerTransportFailure|bootstrap servers can be reached|Kafka handshake failed|Could not connect to Kafka/i, id: "trouble-kafka-transport" },
@@ -665,9 +769,19 @@ export const ERROR_HELP: { re: RegExp; id: string; vaultOnly?: boolean }[] = [
   { re: /permission denied|password authentication failed|role .* does not exist|access denied|login failed/i, id: "trouble-vault-denied", vaultOnly: true },
   { re: /LIBFFI|libffi|GLIBC_|version `[^']*' not found/i, id: "trouble-appimage-ai" },
   { re: /Updates aren't set up/i, id: "trouble-updates" },
-  { re: /matches more than one data source/i, id: "trouble-cross-ambiguous" },
-  { re: /No data source named|is neither a database nor a schema|is not a database on/i, id: "cross-source" },
+  { re: /matches more than one data source/i, id: "trouble-cross-ambiguous", drivers: SQL_DRIVERS },
+  { re: /No data source named|is neither a database nor a schema|is not a database on/i, id: "cross-source", drivers: SQL_DRIVERS },
   { re: /connection (was )?(closed|reset|lost|aborted)|broken pipe|server closed the connection|lost connection|server has gone away|unexpected eof|terminating connection/i, id: "trouble-connection-lost" },
   { re: /connection refused|timed out|could not translate host|name or service not known|failed to lookup address|no route to host|nodename nor servname|No such host/i, id: "trouble-cant-connect" },
   { re: /password authentication failed|Access denied for user|Login failed for user|authentication failed|WRONGPASS|NOAUTH/i, id: "trouble-auth" },
 ];
+
+/** The troubleshooting article for an error (pure; `driver` = the data source's driver when known). */
+export function errorArticleFor(msg: string, ctx: { vault?: boolean; driver?: string } = {}): string | null {
+  for (const m of ERROR_HELP) {
+    if (m.vaultOnly && !ctx.vault) continue;
+    if (m.drivers && !(ctx.driver && m.drivers.includes(ctx.driver))) continue;
+    if (m.re.test(msg)) return m.id;
+  }
+  return null;
+}
