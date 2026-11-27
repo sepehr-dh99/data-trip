@@ -937,9 +937,38 @@ fn consume_blocking(c: &KafkaConn, req: KafkaConsumeRequest) -> AppResult<KafkaC
     }
     let _ = c.consumer.unassign();
     if kept.is_empty() && scanned == 0 && !pending.is_empty() {
-        if let Some(e) = last_err {
-            return Err(AppError::new(format!("Consume failed: {}", e)));
+        // Messages exist in the range but none arrived: usually the partition leaders advertise an
+        // address this computer can't reach (e.g. Kubernetes-internal names). Say which.
+        let waiting: u64 = pending
+            .iter()
+            .map(|p| {
+                let high = marks.get(p).map(|m| m.1).unwrap_or(0);
+                let from = start.get(p).copied().unwrap_or(high);
+                (high - from).max(0) as u64
+            })
+            .sum();
+        let diag = leader_diagnosis(c, topic, &pending);
+        let mut msg = format!(
+            "No messages arrived within {:.0} s, although partition{} {} hold{} {} message{} in this range.",
+            timeout_ms as f64 / 1000.0,
+            if pending.len() == 1 { "" } else { "s" },
+            pending
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if pending.len() == 1 { "s" } else { "" },
+            waiting,
+            if waiting == 1 { "" } else { "s" }
+        );
+        if let Some(d) = diag {
+            msg.push(' ');
+            msg.push_str(&d);
         }
+        if let Some(e) = last_err {
+            msg.push_str(&format!(" Last error: {}.", e));
+        }
+        return Err(AppError::new(msg));
     }
     kept.sort_by_key(|m| (m.timestamp_ms.unwrap_or(0), m.partition, m.offset));
     if latest && kept.len() > limit {
@@ -952,6 +981,62 @@ fn consume_blocking(c: &KafkaConn, req: KafkaConsumeRequest) -> AppResult<KafkaC
         reached_end: pending.is_empty(),
         scanned,
     })
+}
+
+/// Explains why the leaders of `parts` can't be read from: the address each leader advertises
+/// (metadata), whether this computer can resolve it and open a TCP connection to it.
+fn leader_diagnosis(c: &KafkaConn, topic: &str, parts: &BTreeSet<i32>) -> Option<String> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let md = c.consumer.fetch_metadata(Some(topic), CALL_TIMEOUT).ok()?;
+    let t = md.topics().iter().find(|t| t.name() == topic)?;
+    let mut leaders: BTreeSet<i32> = BTreeSet::new();
+    for p in t.partitions() {
+        if parts.contains(&p.id()) {
+            leaders.insert(p.leader());
+        }
+    }
+    let mut unresolved: Vec<String> = Vec::new();
+    let mut unreachable: Vec<String> = Vec::new();
+    let mut ok: Vec<String> = Vec::new();
+    for id in leaders {
+        let Some(b) = md.brokers().iter().find(|b| b.id() == id) else {
+            unreachable.push(format!("broker {} (not in metadata)", id));
+            continue;
+        };
+        let addr = format!("{}:{}", b.host(), b.port());
+        match addr.to_socket_addrs().ok().and_then(|mut it| it.next()) {
+            None => unresolved.push(addr),
+            Some(sa) => match TcpStream::connect_timeout(&sa, Duration::from_secs(3)) {
+                Ok(_) => ok.push(addr),
+                Err(e) => unreachable.push(format!("{} ({})", addr, e)),
+            },
+        }
+    }
+    if !unresolved.is_empty() {
+        return Some(format!(
+            "The partition leaders advertise {}, which this computer can't resolve. Listing topics works \
+             through the bootstrap servers, but messages are read from each leader at the address it \
+             advertises — here a name that only exists inside the cluster. Ask your infrastructure team \
+             for an external listener reachable over VPN, or map those names to reachable IPs in your \
+             hosts file.",
+            unresolved.join(", ")
+        ));
+    }
+    if !unreachable.is_empty() {
+        return Some(format!(
+            "The partition leaders can't be reached from this computer: {}. Check the VPN / firewall \
+             for those addresses.",
+            unreachable.join(", ")
+        ));
+    }
+    if !ok.is_empty() {
+        return Some(format!(
+            "The partition leaders ({}) accept connections; try again with a longer wait or check the \
+             security protocol.",
+            ok.join(", ")
+        ));
+    }
+    None
 }
 
 pub fn consume(

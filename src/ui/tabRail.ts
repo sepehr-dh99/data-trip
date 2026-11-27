@@ -158,6 +158,10 @@ export class TabStrip {
   private hiddenTop: TabPane[] = [];
   private closeAll: (() => void) | null = null;
   private editing = false;
+  /** Tab being renamed inline (closing it must not leave the strip frozen). */
+  private editingTab: TabPane | null = null;
+  /** Ends an inline rename without saving (used when its tab goes away). */
+  private cancelRename: (() => void) | null = null;
   private pending = false;
   private drag: TabPane | null = null;
   private railW: number;
@@ -365,6 +369,8 @@ export class TabStrip {
   forget(t: TabPane): void {
     this.meta.delete(t);
     this.els.delete(t);
+    // Closing the tab that is being renamed ends the rename, so the next render() isn't deferred forever.
+    if (this.editingTab === t) this.cancelRename?.();
   }
 
   /** Stable key of a tab (pinned tabs, custom groups, restore on launch). */
@@ -571,6 +577,7 @@ export class TabStrip {
       });
       tab.addEventListener("dblclick", (ev) => {
         ev.preventDefault();
+        if (ev.target instanceof Element && ev.target.closest(".tab-close")) return;
         this.startRename(t, title);
       });
       tab.addEventListener("contextmenu", (ev) => {
@@ -781,6 +788,7 @@ export class TabStrip {
     });
     row.addEventListener("dblclick", (ev) => {
       ev.preventDefault();
+      if (ev.target instanceof Element && ev.target.closest(".rt-close")) return;
       this.startRename(t, name);
     });
     row.addEventListener("contextmenu", (ev) => {
@@ -838,6 +846,7 @@ export class TabStrip {
   private startRename(t: TabPane, label: HTMLElement): void {
     if (this.editing) return;
     this.editing = true;
+    this.editingTab = t;
     const before = this.nameOf(t);
     const input = h("input", { class: "tab-rename", type: "text", value: before, spellcheck: false, "aria-label": "Tab name" });
     input.size = Math.max(6, before.length + 1);
@@ -849,8 +858,11 @@ export class TabStrip {
       if (done) return;
       done = true;
       this.editing = false;
+      this.editingTab = null;
+      this.cancelRename = null;
       const v = input.value.trim();
-      if (save && v !== before) this.setManualName(t, v === autoName(t) ? null : v || null);
+      const alive = this.host.tabs().includes(t);
+      if (save && alive && v !== before) this.setManualName(t, v === autoName(t) ? null : v || null);
       else this.render();
       if (this.pending) {
         this.pending = false;
@@ -871,9 +883,12 @@ export class TabStrip {
     });
     input.addEventListener("input", () => (input.size = Math.max(6, input.value.length + 1)));
     input.addEventListener("blur", () => finish(true));
+    this.cancelRename = () => finish(false);
     for (const ev of ["click", "dblclick", "pointerdown", "mousedown"]) input.addEventListener(ev, (e) => e.stopPropagation());
     input.focus();
     input.select();
+    // Could not take focus (row already detached): don't leave the strip frozen waiting for a blur.
+    if (document.activeElement !== input) finish(false);
   }
 
   /** Rename from a menu: inline when the tab is on screen, else a prompt. */
