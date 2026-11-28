@@ -1,6 +1,7 @@
 // A console tab: SQL editor on top, results below (grid / message / error).
 // Its run controls (Run / Cancel, Run all, transaction pill) are mounted by the shell into the
 // floating capsule while this console is active.
+import { isDesktop, preferences } from "../platform";
 import { api } from "../api";
 import type { Driver, FedResult, FedSource, FedStep, QueryResult, RowEdit, SchemaNode, SessionInfo } from "../types";
 import { clear, errMsg, h, icon } from "./dom";
@@ -796,7 +797,7 @@ export class ConsolePane implements TabPane {
   // ---------------------------------------------------------------- format
 
   /** Format SQL: the selection, else the statement at the cursor (one undo step; the trailing `;` stays). */
-  formatSql(): void {
+  async formatSql(): Promise<void> {
     if (this.isLineBased || !canFormat(this.driver)) return;
     const t = this.editor.formatTarget();
     if (!t) {
@@ -805,12 +806,14 @@ export class ConsolePane implements TabPane {
     }
     let out: string;
     try {
-      out = formatSqlText(t.text, this.driver).trim();
+      out = (await formatSqlText(t.text, this.driver)).trim();
     } catch (e) {
       const msg = errMsg(e).split("\n")[0].trim();
       toast(`Couldn't format: ${msg.length > 140 ? msg.slice(0, 140) + "…" : msg}`, "error");
       return;
     }
+    const current = this.editor.formatTarget();
+    if (current?.from !== t.from || current.to !== t.to || current.text !== t.text) return;
     if (out && out !== t.text) this.editor.replaceRange(t.from, t.to, out);
     this.editor.focus();
   }
@@ -1286,7 +1289,7 @@ export class ConsolePane implements TabPane {
    * statement only reads, reconnects the data source's sessions silently. True when the statement may run again.
    */
   private async reconnectForRetry(sql: string, err: unknown): Promise<boolean> {
-    if (!getSettings().data.autoReconnect || this.isLineBased || !this.autoCommit) return false;
+    if (!isDesktop() || !getSettings().data.autoReconnect || this.isLineBased || !this.autoCommit) return false;
     if (!isConnectionLost(rawMsg(err)) || !isReadOnlyStatement(sql)) return false;
     this.setRunning(true, "Connection lost · reconnecting…");
     try {
@@ -2635,7 +2638,7 @@ export class ConsolePane implements TabPane {
   // ---------------------------------------------------------------- layout
 
   private bindSplitter(sp: HTMLElement): void {
-    const saved = Number(localStorage.getItem("dt.editorH"));
+    const saved = Number(preferences.getItem("dt.editorH"));
     this.editorWrap.style.height = (saved >= 80 ? saved : 236) + "px";
     sp.addEventListener("pointerdown", (e) => {
       e.preventDefault();
@@ -2650,7 +2653,7 @@ export class ConsolePane implements TabPane {
         window.removeEventListener("pointermove", move);
         window.removeEventListener("pointerup", up);
         document.body.classList.remove("resizing-row");
-        localStorage.setItem("dt.editorH", String(Math.round(this.editorWrap.getBoundingClientRect().height)));
+        preferences.setItem("dt.editorH", String(Math.round(this.editorWrap.getBoundingClientRect().height)));
       };
       document.body.classList.add("resizing-row");
       window.addEventListener("pointermove", move);

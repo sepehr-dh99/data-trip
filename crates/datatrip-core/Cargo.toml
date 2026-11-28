@@ -1,0 +1,33 @@
+[package]
+name = "datatrip-core"
+version = "0.5.0"
+edition = "2021"
+publish = false
+
+[features]
+desktop-keychain = ["keyring/apple-native", "keyring/windows-native", "keyring/sync-secret-service"]
+
+[dependencies]
+datatrip-import-format = { path = "../datatrip-import-format" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "chrono", "uuid", "rust_decimal", "json"] }
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "chrono", "rust_decimal"] }
+keyring = { version = "3", default-features = false }
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = "1"
+csv = "1"
+hex = "0.4"
+redis = { version = "0.27", default-features = false, features = ["aio", "tokio-comp", "tokio-rustls-comp", "tls-rustls", "tls-rustls-webpki-roots"] }
+# Keep librdkafka and its vendored OpenSSL independent of the desktop shell.
+rdkafka = { version = "0.37", default-features = false, features = ["cmake-build", "ssl-vendored", "libz-static", "zstd", "tokio"] }
+russh = "0.45"
+russh-keys = "0.45"
+async-trait = "0.1"
+aes-gcm = "0.10"
+libsqlite3-sys = "0.30"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

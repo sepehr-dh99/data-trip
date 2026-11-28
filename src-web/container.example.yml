@@ -1,0 +1,8 @@
+bind: 0.0.0.0:8080
+publicOrigin: http://127.0.0.1:8080
+dataDir: /data
+assetsDir: /app/dist-web
+workspaceKeyEnv: DATATRIP_WEB_WORKSPACE_KEY
+auth:
+  anonymous: true
+databaseEndpoints: []

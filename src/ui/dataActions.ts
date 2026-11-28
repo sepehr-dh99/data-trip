@@ -1,10 +1,8 @@
 // v0.16 entry points: Show DDL (⌥⌘D), New table… / Edit table… (designer) and Import data… — from the explorer's
 // context menus, the command palette and the app menu.
 import { DdlPane } from "./ddlPane";
-import { DesignerPane } from "./designerPane";
-import { openImportWizard } from "./importWizard";
 import type { DbTarget } from "./dataTools";
-import { currentTarget, dataHost, isSqlDriver } from "./dataTools";
+import { currentTarget, dataHost, isSqlDriver, reportError } from "./dataTools";
 import { store } from "./state";
 import { toast } from "./toast";
 
@@ -47,14 +45,16 @@ export function openDesigner(target: DbTarget | null | undefined, create: boolea
   if (e?.config.readOnly) toast(`${e.config.name} is read-only: you can design, but not apply`, "info");
   const editing = !create && t.kind === "table" && !!t.name;
   const h = dataHost();
-  if (editing) {
-    const open = h.tabs().find((p): p is DesignerPane => p instanceof DesignerPane && p.matches(t, false));
-    if (open) {
-      h.activate(open);
-      return;
+  void import("./designerPane").then(({ DesignerPane }) => {
+    if (editing) {
+      const open = h.tabs().find((p): p is InstanceType<typeof DesignerPane> => p instanceof DesignerPane && p.matches(t, false));
+      if (open) {
+        h.activate(open);
+        return;
+      }
     }
-  }
-  h.addTab(new DesignerPane(editing ? t : { ...t, kind: "schema", name: undefined }, !editing));
+    h.addTab(new DesignerPane(editing ? t : { ...t, kind: "schema", name: undefined }, !editing));
+  }).catch((error) => reportError("Could not open table designer", error));
 }
 
 /** Import data… into a table, or into a schema (new or chosen table). */
@@ -66,5 +66,6 @@ export function importData(target?: DbTarget | null): void {
     toast(`${e.config.name} is read-only: importing isn't allowed`, "info");
     return;
   }
-  openImportWizard(t);
+  void import("./importWizard").then(({ openImportWizard }) => openImportWizard(t))
+    .catch((error) => reportError("Could not open import", error));
 }

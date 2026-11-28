@@ -1,5 +1,5 @@
 // "Import from DataGrip" dialog: paste Copy Settings text or pick .idea/dataSources.xml.
-import { open } from "@tauri-apps/plugin-dialog";
+import { open } from "../platform";
 import { api } from "../api";
 import { parseDataGrip } from "../import/datagrip";
 import type { ImportCandidate } from "../import/datagrip";

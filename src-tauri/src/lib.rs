@@ -2,41 +2,17 @@
 
 pub mod ai;
 pub mod app_menu;
-pub mod child_env;
 pub mod commands;
-pub mod credentials;
-pub mod db;
 pub mod ddl;
-pub mod ddlgen;
-pub mod error;
-pub mod export;
-pub mod federation;
-pub mod fedsql;
 pub mod import;
-pub mod importfmt;
-pub mod model;
-pub mod profiles;
-pub mod session;
 pub mod sqlfile;
-pub mod ssh;
-pub mod store;
 pub mod updater;
-pub mod vault;
 
-use std::sync::Arc;
+pub use datatrip_core::{
+    child_env, credentials, db, ddlgen, error, export, federation, fedsql, importfmt, model,
+    profiles, session, ssh, store, vault, AppState,
+};
 use tauri::Manager;
-
-/// Shared application state, managed by Tauri.
-pub struct AppState {
-    pub store: Arc<store::Store>,
-    pub vault_cache: Arc<vault::VaultCache>,
-    pub creds: credentials::CredentialSource,
-    pub sessions: session::SessionRegistry,
-    pub profiles: Arc<profiles::Profiles>,
-    pub tunnels: Arc<ssh::TunnelManager>,
-    /// The pending Vault OIDC browser sign-in, if any.
-    pub oidc: vault::OidcLogins,
-}
 
 pub fn run() {
     // macOS: native menu bar (custom items emit the "menu" event); Windows / Linux: none.
@@ -48,30 +24,12 @@ pub fn run() {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&config_dir)?;
             std::fs::create_dir_all(&data_dir)?;
-            let store = tauri::async_runtime::block_on(store::Store::open(&config_dir, &data_dir))?;
-            let store = Arc::new(store);
-            let vault_cache = Arc::new(vault::VaultCache::new());
-            let profiles = Arc::new(profiles::Profiles::new(&config_dir, store.clone()));
-            let tunnels = Arc::new(ssh::TunnelManager::new(profiles.clone(), &data_dir));
-            let creds = credentials::CredentialSource::new(
-                store.clone(),
-                vault_cache.clone(),
-                profiles.clone(),
-                tunnels.clone(),
-            );
+            let state = tauri::async_runtime::block_on(AppState::open(&config_dir, &data_dir))?;
             app.manage(ai::AiState::default());
             app.manage(updater::UpdaterState::default());
             app.manage(sqlfile::SqlFileRuns::default());
             app.manage(import::ImportRuns::default());
-            app.manage(AppState {
-                store,
-                vault_cache,
-                creds,
-                sessions: session::SessionRegistry::new(),
-                profiles,
-                tunnels,
-                oidc: vault::OidcLogins::new(),
-            });
+            app.manage(state);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

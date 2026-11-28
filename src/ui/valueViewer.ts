@@ -2,6 +2,7 @@
 // Text | JSON (formatted, colored, foldable) | Hex (default for binary), Wrap, size + line count, Copy; on
 // editable results ✎ Edit with live JSON validation and "Save to grid" (a pending cell edit, submitted like
 // any other). Formatting logic: valueFormat.ts.
+import { preferences } from "../platform";
 import "../styles/data.css";
 import type { Cell } from "../types";
 import { clear, copyText, h, icon } from "./dom";
@@ -39,7 +40,7 @@ export class ValueViewer {
   private cell: ViewerCell | null = null;
   private mode: ValueMode = "text";
   private modeChosenFor: string | null = null;
-  private wrap = localStorage.getItem(WRAP_KEY) !== "0";
+  private wrap = preferences.getItem(WRAP_KEY) !== "0";
   private folded = new Set<string>();
   private editing = false;
   private editor: TextEditor | null = null;
@@ -63,7 +64,7 @@ export class ValueViewer {
     this.btnEdit = h("button", { class: "btn sm", type: "button", onclick: () => this.startEdit() }, "✎ Edit");
     this.wrapBtn = h("button", { class: "vv-wrap", type: "button", role: "switch", onclick: () => {
       this.wrap = !this.wrap;
-      localStorage.setItem(WRAP_KEY, this.wrap ? "1" : "0");
+      preferences.setItem(WRAP_KEY, this.wrap ? "1" : "0");
       this.paint();
     } }, h("span", { class: "sw sm", "aria-hidden": "true" }), "Wrap");
     this.foldBtn = h("button", { class: "btn xs", type: "button", onclick: () => this.foldAll() }, "Fold all");

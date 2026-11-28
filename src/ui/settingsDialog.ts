@@ -1,6 +1,7 @@
 // Settings window (board I): sections Editor, Appearance, Results grid, Console tabs, Keymap, Data & history.
 // Every control writes through updateSettings(), so changes apply instantly and are saved to settings.json.
 import { api } from "../api";
+import { isDesktop } from "../platform";
 import { confirmDialog } from "./confirm";
 import { clear, errMsg, h } from "./dom";
 import { HISTORY_CHANGED } from "./history";
@@ -97,6 +98,7 @@ class SettingsWindow {
     });
     const nav = h("nav", { class: "st-nav" }, h("div", { class: "st-title" }, "Settings"), h("label", { class: "st-search" }, this.svg(SVG_SEARCH), search));
     for (const s of SECTIONS) {
+      if (s.id === "updates" && !isDesktop()) continue;
       const b = h("button", { class: "st-cat", type: "button", onclick: () => this.go(s.id) }, h("span", { class: "st-ic", style: `background:${s.color}` }, s.short), s.label);
       this.navBtns.set(s.id, b);
       nav.appendChild(b);
@@ -121,7 +123,7 @@ class SettingsWindow {
     this.buildTabs();
     this.buildKeymap();
     this.buildData();
-    this.buildUpdates();
+    if (isDesktop()) this.buildUpdates();
     this.section("ai", buildAiSettings({
       row: (t, d, c, x) => this.row(t, d, c, x),
       toggle: (l, g, st) => this.toggle(l, g, st),
@@ -601,7 +603,7 @@ class SettingsWindow {
     const hib = this.row("Release hidden results above", "Consoles you haven't used among the last 10 free their result grids; above this many rows per console the rows are dropped too and come back with Run again", hibSel, "memory hibernate release results rows consoles");
     const clearBtn = h("button", { class: "st-pill", type: "button", onclick: () => void this.clearHistory(clearBtn) }, "Clear history…");
     const wipe = this.row("Clear query history", "Delete every entry of every data source from the History panel", clearBtn, "delete remove history");
-    this.section("data", [keep, restore, confirm, auto, idle, hib, wipe]);
+    this.section("data", [keep, restore, confirm, ...(isDesktop() ? [auto] : []), idle, hib, wipe]);
   }
 
   // ------------------------------------------------------------------ Updates

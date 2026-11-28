@@ -1,0 +1,12 @@
+.git
+.idea
+**/target
+src-tauri
+dist
+dist-web
+node_modules
+src/generated
+.datatrip-web
+**/gen
+crates/datatrip-core/Cargo.lock
+crates/datatrip-import-format/Cargo.lock

@@ -32,7 +32,7 @@ import { assignVaultProfile } from "./vaultAssign";
 import { VaultChips } from "./vaultChips";
 import { openVaultProfilesDialog } from "./vaultDialog";
 import { getSettings, onSettingsChange, updateSettings } from "./settings";
-import { openSettings } from "./settingsDialog";
+import { openSettings } from "./dialogs";
 import { formatBinding, shortcutLabel } from "./keymap";
 import { FED_DRIVERS, TABLE_DRAG_MIME, setTableDrag, sourceRef } from "./federation";
 import { prodOptions, prodTagClass } from "./prodSafety";

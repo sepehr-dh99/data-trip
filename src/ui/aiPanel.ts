@@ -10,7 +10,8 @@ import { toast } from "./toast";
 import { getSettings } from "./settings";
 import { shortcutLabel } from "./keymap";
 import { splitOptionsFor } from "./sqlutil";
-import { openSettings } from "./settingsDialog";
+import { isDesktop } from "../platform";
+import { openSettings } from "./dialogs";
 import { store } from "./state";
 import {
   AI_DRIVERS,
@@ -521,7 +522,8 @@ export class AiAssist {
       error,
       crossSource: plan !== null,
     };
-    const result = await api.aiGenerate(req);
+    const sourceIds = isDesktop() ? undefined : [this.host.connId(), ...(plan?.involved.map((source) => source.connId) ?? [])];
+    const result = await api.aiGenerate(req, sourceIds);
     return { result, tables: count, cross: plan };
   }
 

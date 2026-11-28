@@ -1,6 +1,7 @@
 // Restore consoles on launch: the open tabs (manual order, active tab, console text / cursor / bindings / attached
 // cross-source sources, Redis key / Kafka topic / group tabs, v0.17: Sessions & locks and Show DDL tabs) are saved to <config>/workspace.json through the
 // backend (debounced, and flushed when the window goes away) and reopened lazily on the next start.
+import { isDesktop } from "../platform";
 import { api } from "../api";
 import { h, icon } from "./dom";
 import { typeInfo } from "./redis";
@@ -194,7 +195,8 @@ export function parseWorkspace(raw: unknown): Workspace {
 export async function loadWorkspace(): Promise<Workspace> {
   try {
     return parseWorkspace(await api.getWorkspace());
-  } catch {
+  } catch (error) {
+    if (!isDesktop()) throw error;
     return parseWorkspace(null);
   }
 }
@@ -213,7 +215,7 @@ export class WorkspaceSaver {
   private saving: Promise<void> | null = null;
 
   constructor(private collect: () => Workspace | null) {
-    const flush = (): void => this.flush();
+    const flush = (): void => { void this.flush(); };
     window.addEventListener("beforeunload", flush);
     window.addEventListener("pagehide", flush);
     window.addEventListener("blur", flush);
@@ -231,11 +233,13 @@ export class WorkspaceSaver {
   }
 
   /** Writes now if a save is pending. */
-  flush(): void {
-    if (this.timer === undefined) return;
-    window.clearTimeout(this.timer);
-    this.timer = undefined;
-    this.write();
+  async flush(): Promise<void> {
+    if (this.timer !== undefined) {
+      window.clearTimeout(this.timer);
+      this.timer = undefined;
+      this.write();
+    }
+    await this.saving;
   }
 
   /** Forgets the pending save (restore turned off). */
@@ -261,6 +265,7 @@ export class WorkspaceSaver {
         () => {
           // Best effort: the next change retries.
           if (this.last === json) this.last = "";
+          if (!isDesktop()) window.dispatchEvent(new Event("dt-workspace-save-failed"));
         },
       );
     // Keep writes in order (atomic rename on the backend; the newest must land last).

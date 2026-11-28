@@ -1,5 +1,6 @@
 // Settings › AI assistant (board N, "AI settings" scene): provider cards with live status, model / key / endpoint
 // fields and the three privacy toggles. Built with the settings window's own row / toggle helpers.
+import { isDesktop } from "../platform";
 import { api } from "../api";
 import type { AiModel, AiModels, AiProviderId, AiProviderStatus } from "../types";
 import { errMsg, h } from "./dom";
@@ -138,7 +139,7 @@ export function buildAiSettings(kit: SettingsKit): SettingsItem[] {
   keyInput.addEventListener("keydown", (e: KeyboardEvent) => {
     if (e.key === "Enter") saveKey.click();
   });
-  const keyRow = kit.row("API key", "Stored in the system keychain; DataTrip never shows it again", h("div", { class: "st-ctl" }, keyInput, saveKey, clearKey), "openai key secret token");
+  const keyRow = kit.row("API key", isDesktop() ? "Stored in the system keychain; DataTrip never shows it again" : "Stored encrypted in your workspace", h("div", { class: "st-ctl" }, keyInput, saveKey, clearKey), "openai key secret token");
   const base = kit.textField("Base URL", () => S().ai.baseUrl, (v) => updateSettings((s) => (s.ai.baseUrl = v)), true, 260);
   base.placeholder = "https://api.openai.com/v1";
   const baseRow = kit.row("Base URL", "Any OpenAI-compatible /chat/completions endpoint", base, "endpoint url openai compatible azure");
@@ -164,7 +165,7 @@ export function buildAiSettings(kit: SettingsKit): SettingsItem[] {
     // a class, not `hidden`: the settings search owns `hidden`
     modelRow.el.classList.toggle("ai-off", p === "ollama");
     keyRow.el.classList.toggle("ai-off", p !== "openai");
-    baseRow.el.classList.toggle("ai-off", p !== "openai");
+    baseRow.el.classList.toggle("ai-off", p !== "openai" || !isDesktop());
     omRow.el.classList.toggle("ai-off", p !== "ollama");
   });
 

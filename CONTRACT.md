@@ -10,6 +10,11 @@ over clever code; no macros/APIs you are unsure exist in the pinned major versio
 
 ## Layout
 
+The paths below describe the original desktop layout. Shared Rust modules now live in
+`crates/datatrip-core/src/` and the import parser in `crates/datatrip-import-format/src/`.
+Tauri IPC remains in `src-tauri/src/`; the headless adapter is `src-web/src/`. See [WEB.md](WEB.md)
+for launch, configuration, deployment and validation. The existing IPC wire contract still applies.
+
 ```
 package.json  index.html  vite.config.ts  tsconfig.json
 src/                    frontend (vanilla TS)
@@ -1248,4 +1253,3 @@ plan), `src/help/articles.ts` (`errorArticleFor`).
   statement). Self time, misestimate flags (×N under / over), slowest node and the index hint then work as for
   PostgreSQL; without ActualElapsedms (before SQL Server 2016 SP1) the share falls back to cost. Plan header: "Actual
   plan (STATISTICS XML)".
-

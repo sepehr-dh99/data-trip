@@ -1,5 +1,5 @@
-// Typed wrappers around Tauri commands. Contract: see CONTRACT.md.
-import { invoke } from "@tauri-apps/api/core";
+// Typed wrappers around shared operations. Contract: see CONTRACT.md.
+import { invoke } from "./platform";
 import type {
   ConnectionConfig,
   DatabaseNode,
@@ -204,7 +204,8 @@ export const api = {
   /** Which AI providers are installed / configured / running. */
   aiProviders: () => call<AiProviderStatus[]>("ai_providers"),
   /** One generation (write / fix / explain / refine). Never executes anything. Cancelled → error "AI_CANCELLED: …". */
-  aiGenerate: (request: AiRequest) => call<AiResult>("ai_generate", { request }),
+  aiGenerate: (request: AiRequest, sourceIds?: string[]) =>
+    call<AiResult>("ai_generate", sourceIds === undefined ? { request } : { request, sourceIds }),
   aiCancel: () => call<null>("ai_cancel"),
   /** Stores (or with null clears) the OpenAI-compatible API key in the keychain; it is never read back. */
   aiSetApiKey: (key: string | null) => call<null>("ai_set_api_key", { key }),

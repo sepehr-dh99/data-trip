@@ -743,7 +743,7 @@ input[type="search"]::-webkit-search-decoration {
   justify-content: center;
   pointer-events: none;
 }
-html.mac .shell.no-sidebar .cap-wrap {
+html.desktop.mac .shell.no-sidebar .cap-wrap {
   left: 84px;
 }
 .capsule,
@@ -2698,13 +2698,13 @@ input[type="checkbox"] {
 }
 
 /* ================================================================== 18 platform overrides */
-html.mac .traffic-strip {
+html.desktop.mac .traffic-strip {
   display: flex;
 }
-html.mac .side-top {
+html.desktop.mac .side-top {
   padding-top: 0;
 }
-html.mac .side-logo {
+html.desktop.mac .side-logo {
   display: none;
 }
 /* Linux / WebKitGTK: smaller blur radii and denser surfaces keep compositing smooth. */

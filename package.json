@@ -4,10 +4,16 @@
   "version": "0.5.0",
   "type": "module",
   "scripts": {
+    "local": "node scripts/run-local.mjs",
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "web:dev": "vite --config vite.web.config.ts",
+    "web:build": "npm run web:wasm && npm run web:assets",
+    "web:assets": "npm run typecheck && vite build --config vite.web.config.ts",
+    "web:wasm": "node scripts/build-web-wasm.mjs",
+    "web:server": "cargo run --manifest-path src-web/Cargo.toml --"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.18.0",

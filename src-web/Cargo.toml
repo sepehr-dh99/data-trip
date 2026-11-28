@@ -1,0 +1,33 @@
+[package]
+name = "datatrip-web"
+version = "0.5.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+datatrip-core = { path = "../crates/datatrip-core" }
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs"] }
+tower-http = { version = "0.6", features = ["fs", "compression-gzip", "set-header"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+argon2 = { version = "0.5", features = ["std"] }
+openidconnect = "4"
+url = { version = "2", features = ["serde"] }
+sha2 = "0.10"
+rpassword = "7"
+hex = "0.4"
+futures = "0.3"
+fs2 = "0.4"
+tokio-util = { version = "0.7", features = ["io", "rt"] }
+percent-encoding = "2"
+tempfile = "3"
+
+[profile.dev]
+debug = 0
+
+[profile.release]
+strip = true

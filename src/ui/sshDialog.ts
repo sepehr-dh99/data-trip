@@ -1,5 +1,5 @@
 // SSH configurations: cached list, manager dialog (two panes), host-key trust dialogs and "Test SSH".
-import { open } from "@tauri-apps/plugin-dialog";
+import { open } from "../platform";
 import { api } from "../api";
 import type { SshCheck, SshProfile } from "../types";
 import { clear, errMsg, h, icon } from "./dom";
@@ -224,7 +224,7 @@ export function openSshProfilesDialog(opts: SshDialogOpts = {}): void {
               type: "button",
               onclick: async () => {
                 try {
-                  const p = await open({ multiple: false, directory: false, title: "Choose SSH private key", defaultPath: "~/.ssh" });
+                  const p = await open({ multiple: false, directory: false, title: "Choose SSH private key", defaultPath: "~/.ssh", purpose: "material" });
                   if (typeof p === "string") inKey.value = p;
                 } catch (e) {
                   show("err", errMsg(e));

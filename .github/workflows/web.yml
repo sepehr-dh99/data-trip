@@ -1,0 +1,71 @@
+name: web
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: datatrip
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 55432:5432
+        options: --health-cmd pg_isready --health-interval 5s --health-timeout 3s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-web -> target
+      - run: npm ci
+      - run: cargo install --locked wasm-bindgen-cli --version 0.2.130
+      - run: npm run web:build
+      - run: |
+          npm install --prefix "$RUNNER_TEMP/datatrip-browser" playwright
+          "$RUNNER_TEMP/datatrip-browser/node_modules/.bin/playwright" install --with-deps chromium firefox webkit
+      - run: node scripts/check-operation-parity.mjs
+      - run: cargo test --locked --manifest-path src-web/Cargo.toml
+      - run: cargo test --manifest-path crates/datatrip-core/Cargo.toml
+      - run: cargo test --manifest-path crates/datatrip-import-format/Cargo.toml
+      - name: Verify HTTP uses the shared native PostgreSQL operations
+        run: |
+          export DATATRIP_WEB_WORKSPACE_KEY="$(openssl rand -hex 32)"
+          cargo build --locked --manifest-path src-web/Cargo.toml
+          src-web/target/debug/datatrip-web --config src-web/dev.yml &
+          server=$!
+          sed 's/:8080$/:8082/; s/:1421$/:8082/; s@.datatrip-web/dev@.datatrip-web/ci@' src-web/dev.yml > "$RUNNER_TEMP/web.yml"
+          src-web/target/debug/datatrip-web --config "$RUNNER_TEMP/web.yml" &
+          production=$!
+          npm run web:dev &
+          vite=$!
+          trap 'kill "$vite" "$server" "$production" 2>/dev/null || true' EXIT
+          curl -fsS --retry 20 --retry-connrefused http://127.0.0.1:8080/readyz
+          curl -fsS --retry 20 --retry-connrefused http://127.0.0.1:8082/readyz
+          curl -fsS --retry 20 --retry-connrefused http://127.0.0.1:1421/api/v1/session
+          node scripts/test-web-postgres.mjs
+          DATATRIP_TEST_FED=1 DATATRIP_TEST_SQLITE_SNAPSHOT=1 node scripts/test-web-files.mjs
+          export PLAYWRIGHT_MODULE="$RUNNER_TEMP/datatrip-browser/node_modules/playwright/index.mjs"
+          node scripts/test-web-auth.mjs
+          DATATRIP_TEST_DEV_ORIGIN=http://127.0.0.1:1421 node scripts/test-web-browser.mjs
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t datatrip-web:smoke .
+      - run: bash scripts/test-web-image.sh datatrip-web:smoke

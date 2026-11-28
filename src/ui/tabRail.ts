@@ -1,6 +1,7 @@
 // Console tabs: the top strip (tabs that fit + "+N more" list + ⋯ menu) and the left / right rail (filter, grouping,
 // sorting, pinned tabs, custom groups, drag to reorder). Tab names follow Settings › Tabs › Tab names; manual names,
 // pinned tabs and custom groups are stored in the settings (tabs keyed by a stable key, see tabKey()).
+import { preferences } from "../platform";
 import type { ConnectionConfig } from "../types";
 import { DRIVER_LABELS } from "../types";
 import { clear, h, icon } from "./dom";
@@ -185,7 +186,7 @@ export class TabStrip {
   ) {
     this.collapsed = new Set(readJson<string[]>(COLLAPSED_KEY, []));
     this.savedNames = readJson<Record<string, string>>(NAMES_KEY, {});
-    this.railW = Math.max(RAIL_MIN, Math.min(RAIL_MAX, Number(localStorage.getItem("dt.tabRailW")) || 248));
+    this.railW = Math.max(RAIL_MIN, Math.min(RAIL_MAX, Number(preferences.getItem("dt.tabRailW")) || 248));
 
     this.moreBtn = h("button", { class: "cap-more", type: "button", "aria-haspopup": "dialog", hidden: true, onclick: () => this.toggleAll() }, "+0 more ▾");
     this.menuBtn = h("button", { class: "cap-icon cap-tabmenu", type: "button", title: "Tab options", "aria-label": "Tab options", "aria-haspopup": "menu", onclick: () => this.openTabOptions() }, icon("dots", 16));
@@ -326,7 +327,7 @@ export class TabStrip {
         window.removeEventListener("pointermove", move);
         window.removeEventListener("pointerup", up);
         document.body.classList.remove("resizing-col");
-        localStorage.setItem("dt.tabRailW", String(Math.round(this.railW)));
+        preferences.setItem("dt.tabRailW", String(Math.round(this.railW)));
         this.host.changed();
       };
       document.body.classList.add("resizing-col");
@@ -1279,7 +1280,7 @@ export class TabStrip {
 
 function readJson<T>(key: string, fallback: T): T {
   try {
-    const raw = localStorage.getItem(key);
+    const raw = preferences.getItem(key);
     if (!raw) return fallback;
     const v = JSON.parse(raw) as unknown;
     return v && typeof v === "object" ? (v as T) : fallback;
@@ -1290,7 +1291,7 @@ function readJson<T>(key: string, fallback: T): T {
 
 function writeJson(key: string, v: unknown): void {
   try {
-    localStorage.setItem(key, JSON.stringify(v));
+    preferences.setItem(key, JSON.stringify(v));
   } catch {
     /* storage full / disabled: names stay for this session */
   }

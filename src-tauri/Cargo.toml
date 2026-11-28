@@ -16,26 +16,18 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-updater = "2"
+datatrip-core = { path = "../crates/datatrip-core", features = ["desktop-keychain"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util", "process"] }
-tokio-util = { version = "0.7", features = ["compat"] }
-futures = "0.3"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "mysql", "sqlite", "chrono", "uuid", "rust_decimal", "json"] }
-tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "chrono", "rust_decimal"] }
-keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+keyring = "3"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-rust_decimal = "1"
-csv = "1"
-hex = "0.4"
-redis = { version = "0.27", default-features = false, features = ["aio", "tokio-comp", "tokio-rustls-comp", "tls-rustls", "tls-rustls-webpki-roots"] }
-# librdkafka is built from source with cmake (needs cmake + a C/C++ toolchain); OpenSSL is vendored. No GSSAPI.
-rdkafka = { version = "0.37", default-features = false, features = ["cmake-build", "ssl-vendored", "libz-static", "zstd", "tokio"] }
-russh = "0.45"
-russh-keys = "0.45"
-async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+tempfile = "3"
 
 [profile.release]
 opt-level = 3
