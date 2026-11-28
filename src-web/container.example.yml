@@ -5,4 +5,5 @@ assetsDir: /app/dist-web
 workspaceKeyEnv: DATATRIP_WEB_WORKSPACE_KEY
 auth:
   anonymous: true
-databaseEndpoints: []
+restrictDatabaseEndpoint: true
+restrictVaultServer: true

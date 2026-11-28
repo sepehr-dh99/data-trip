@@ -98,12 +98,12 @@ impl CredentialSource {
         mut self,
         resolve: impl Fn(&ConnectionConfig) -> AppResult<ConnectionConfig> + Send + Sync + 'static,
         vault_policy: impl Fn(VaultConfig) -> AppResult<VaultConfig> + Send + Sync + 'static,
-        sentinel_endpoints: Arc<[std::net::SocketAddr]>,
+        sentinel_endpoints: Option<Arc<[std::net::SocketAddr]>>,
         force_read_only: bool,
     ) -> Self {
         self.hosted = Some(Arc::new(resolve));
         self.vault_policy = Some(Arc::new(vault_policy));
-        self.sentinel_endpoints = Some(sentinel_endpoints);
+        self.sentinel_endpoints = sentinel_endpoints;
         self.force_read_only = force_read_only;
         self
     }

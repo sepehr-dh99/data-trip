@@ -83,15 +83,15 @@ async function stop() {
   child.kill("SIGTERM");
   assert.deepEqual(await closed, [0, null]);
 }
-async function launch(auth, { dir = `case-${++serial}`, sessionSeconds = 300, invalid = false, providers = false } = {}) {
+async function launch(auth, { dir = `case-${++serial}`, sessionSeconds = 300, invalid = false, providers = false, endpoints = {} } = {}) {
   const free = createServer();
   const origin = await listen(free);
   await new Promise((resolve) => free.close(resolve));
   const file = `${temp}/current.yml`;
   await writeFile(file, JSON.stringify({
     bind: origin.slice(7), publicOrigin: origin, dataDir: `${temp}/${dir}`, assetsDir: "dist-web",
-    workspaceKeyEnv: "DATATRIP_TEST_KEY", auth, sessionSeconds, databaseEndpoints: [],
-    ...(providers && { vaultServers: [issuer], openaiUrl: `${issuer}v1`, ollamaUrl: issuer }),
+    workspaceKeyEnv: "DATATRIP_TEST_KEY", auth, sessionSeconds, ...endpoints,
+    ...(providers && { openaiUrl: `${issuer}v1`, ollamaUrl: issuer }),
   }));
   child = spawn(bin, ["--config", file], { env, stdio: ["ignore", "ignore", "pipe"] });
   let output = "";
@@ -160,6 +160,42 @@ try {
   const guest = browser(guestOrigin);
   assert.deepEqual(await entry(guest), { session: null, anonymous: true, local: false, oidc: false });
   assert.equal((await guest.send("login/guest", {})).status, 200);
+  const postgres = { driver: "postgres", name: "Local database", host: "localhost", port: 5432 };
+  const saveConnection = (browser, config) => browser.send("operations/save_connection", { config });
+  const vaultProfile = { id: "fixture-vault", name: "Fixture Vault", address: issuer, tokenSource: "keychain" };
+  const saveVault = (browser, profile = vaultProfile) => browser.send("operations/save_vault_profile", { profile });
+  assert.equal((await saveConnection(guest, postgres)).status, 200);
+  assert.equal((await saveConnection(guest, { ...postgres, host: "/tmp" })).status, 400);
+  assert.equal((await saveConnection(guest, { ...postgres, driver: "kafka" })).status, 403);
+  assert.equal((await saveVault(guest)).status, 200);
+  assert.match((await saveVault(guest, { ...vaultProfile, tokenSource: "env" })).value.message, /requires a workspace token/);
+  assert.match((await saveVault(guest, { ...vaultProfile, address: "file:///tmp/vault" })).value.message, /valid HTTP or HTTPS/);
+  await stop();
+  const unrestricted = browser(await launch({ anonymous: true }, { endpoints: {
+    restrictDatabaseEndpoint: false, databaseEndpoints: [], restrictVaultServer: false, vaultServers: [],
+  } }));
+  assert.equal((await unrestricted.send("login/guest", {})).status, 200);
+  assert.equal((await saveConnection(unrestricted, postgres)).status, 200);
+  const sentinel = { driver: "redis", name: "Sentinel", redis: { mode: "sentinel", sentinels: ["localhost:26379"] } };
+  assert.equal((await saveConnection(unrestricted, sentinel)).status, 200);
+  assert.equal((await saveVault(unrestricted)).status, 200);
+  await stop();
+  const restricted = browser(await launch({ anonymous: true }, { endpoints: {
+    restrictDatabaseEndpoint: true, databaseEndpoints: ["127.0.0.1:5432"],
+    restrictVaultServer: true, vaultServers: [issuer],
+  } }));
+  assert.equal((await restricted.send("login/guest", {})).status, 200);
+  assert.equal((await saveConnection(restricted, postgres)).status, 403);
+  assert.equal((await saveConnection(restricted, { ...postgres, host: "127.0.0.1" })).status, 200);
+  assert.equal((await saveConnection(restricted, { ...postgres, host: "127.0.0.1", port: 5433 })).status, 403);
+  assert.equal((await saveConnection(restricted, sentinel)).status, 403);
+  assert.equal((await saveVault(restricted)).status, 200);
+  assert.match((await saveVault(restricted, { ...vaultProfile, address: `${issuer}other` })).value.message, /outside the instance's allowed servers/);
+  await stop();
+  const denyAll = browser(await launch({ anonymous: true }, { endpoints: { restrictDatabaseEndpoint: true, restrictVaultServer: true } }));
+  assert.equal((await denyAll.send("login/guest", {})).status, 200);
+  assert.equal((await saveConnection(denyAll, { ...postgres, host: "127.0.0.1" })).status, 403);
+  assert.match((await saveVault(denyAll)).value.message, /outside the instance's allowed servers/);
   await stop();
   const localOrigin = await launch(local, { dir: "named", providers: true });
   const a = browser(localOrigin);
@@ -199,7 +235,7 @@ try {
   const unauthorizedCancel = await a.send("operations/cancel", { sessionId });
   assert.match(unauthorizedCancel.value.message, /Session not found/);
   assert.deepEqual((await b.send("operations/list_connections", {})).value, []);
-  const profile = { id: "fixture-vault", name: "Fixture Vault", address: issuer, tokenSource: "keychain" };
+  const profile = vaultProfile;
   const vault = await a.send("operations/save_vault_profile", { profile, token: "fixture-vault-token" });
   assert.equal(vault.status, 200);
   assert.ok(!JSON.stringify(vault.value).includes("fixture-vault-token"));

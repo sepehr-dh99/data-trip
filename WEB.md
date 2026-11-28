@@ -31,7 +31,7 @@ npm run web:server -- --config src-web/dev.yml
 npm run web:dev
 ```
 
-Open `http://127.0.0.1:1421`. Vite proxies `/api` to `127.0.0.1:8080`. `DATATRIP_WEB_DEV_PORT` and `DATATRIP_WEB_API` override the Vite endpoints; set `publicOrigin` in the server config to match the browser origin. `src-web/dev.yml` explicitly opts in to guest access, allows a disposable PostgreSQL server on `127.0.0.1:55432`, and writes to `.datatrip-web/dev`. Use a dedicated directory per instance; never point web at the desktop app directories.
+Open `http://127.0.0.1:1421`. Vite proxies `/api` to `127.0.0.1:8080`. `DATATRIP_WEB_DEV_PORT` and `DATATRIP_WEB_API` override the Vite endpoints; set `publicOrigin` in the server config to match the browser origin. `src-web/dev.yml` explicitly opts in to guest access and writes to `.datatrip-web/dev`. Use a dedicated directory per instance; never point web at the desktop app directories.
 
 To build and run web without Vite:
 
@@ -76,15 +76,23 @@ auth:
       - id: operator-1
         username: operator
         passwordHash: "<replace with the generated Argon2id hash>"
+restrictDatabaseEndpoint: true
 databaseEndpoints:
   - 10.42.1.20:5432
+restrictVaultServer: true
+vaultServers:
+  - "https://vault.example.org:8200"
 ```
 
 Omit `local` or `oidc` for a single sign-in method. Register `https://datatrip.example.org/api/v1/login/oidc/callback` with the instance identity provider. OIDC discovery failure prevents startup, even with other configured modes. For mixed mode add `anonymous: true` under `auth`. For guest-only mode use `auth: { anonymous: true }`; expired guests are removed. With the key omitted, anonymous access is disabled.
 
-`databaseEndpoints` accepts IP:port entries, including Redis Sentinel endpoints and their advertised nodes. PostgreSQL, MySQL/MariaDB, SQL Server and Redis use these entries; SQLite uses workspace file IDs. `sshEndpoints` similarly restricts SSH profiles; configure the bastion to restrict forwarded destinations. `vaultServers` accepts a list of approved base URLs, `openaiUrl` and `ollamaUrl` take a single approved base URL each. Use browser uploads for credentials that are files. Hosted Vault uses workspace tokens and supports an independent `/api/v1/vault-oidc/callback` over HTTPS; workstation token files and environment credentials are desktop-only. Hosted AI never invokes the workstation CLI. Restrict database users' privileges at the database; UI prompts and session read-only settings are safeguards and cannot replace database grants.
+`restrictDatabaseEndpoint` defaults to `false`, so you can omit `databaseEndpoints` and use a DNS hostname or IP address in the connection form. Set it to `true` to enforce the optional `databaseEndpoints` allowlist. Entries are exact numeric IP:port pairs, including Redis Sentinel endpoints and their advertised nodes. When restriction is enabled, an omitted or empty list denies all network database connections. SQLite uses workspace file IDs in either mode.
 
-`kafkaNetworkPolicy` defaults to `false`. Only enable it when deployment egress filtering is in place for **all** broker addresses and the bootstrap endpoints are listed in `databaseEndpoints`. librdkafka follows broker advertisements, so an initial-address allowlist alone does not constrain discovery. Apply default-deny egress for the runtime, including DNS, OIDC, Vault, AI, SSH and the allowed database destinations. Use trusted database servers and provider endpoints.
+`restrictVaultServer` defaults to `false`, so `vaultServers` can be omitted. Set it to `true` to enforce the list of Vault HTTP or HTTPS base URLs. With restriction enabled, an omitted or empty list denies all Vault servers. Both modes require a workspace token (Keychain or OIDC). The hosted Vault OIDC callback is `/api/v1/vault-oidc/callback` over HTTPS; workstation token files and environment credentials are desktop-only.
+
+`sshEndpoints` independently restricts SSH profiles; configure the bastion to restrict forwarded destinations. `openaiUrl` and `ollamaUrl` take a single approved base URL each. Use browser uploads for credentials that are files. Hosted AI never invokes the workstation CLI. Restrict database users' privileges at the database; UI prompts and session read-only settings are safeguards and cannot replace database grants.
+
+`kafkaNetworkPolicy` defaults to `false`. Only enable it when deployment egress filtering is in place for **all** broker addresses. When `restrictDatabaseEndpoint` is enabled, list the Kafka bootstrap endpoints in `databaseEndpoints` as well. librdkafka follows broker advertisements, so an initial-address allowlist alone does not constrain discovery. Apply default-deny egress for the runtime, including DNS, OIDC, Vault, AI, SSH and the allowed database destinations. Use trusted database servers and provider endpoints.
 
 Set `readOnly: true` to force read-only connections for the entire hosted instance. Provision database roles with matching grants, especially for stored functions or routines whose side effects cannot be inferred from a query.
 

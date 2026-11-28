@@ -257,7 +257,7 @@ impl Runtime {
             AppState::with_tunnels(workspace.store.clone(), workspace.profiles.clone(), tunnels);
         let dir = workspace.dir.clone();
         let vault_dir = dir.clone();
-        let vault_servers = self.config.vault_servers.clone();
+        let vault_servers = self.config.restricted_vault_servers().map(<[_]>::to_vec);
         core.creds = core.creds.with_hosted_policy(
             move |config| crate::files::database_files(&dir, config),
             move |mut config| {
@@ -265,17 +265,28 @@ impl Runtime {
                 let url = config
                     .address
                     .as_deref()
-                    .and_then(|address| url::Url::parse(address).ok());
-                if !url.is_some_and(|url| vault_servers.contains(&url))
-                    || !matches!(
-                        config.token_source,
-                        VaultTokenSource::Keychain | VaultTokenSource::Oidc
-                    )
+                    .and_then(|address| url::Url::parse(address).ok())
+                    .filter(crate::config::valid_http_endpoint)
+                    .ok_or_else(|| {
+                        AppError::new("Hosted Vault requires a valid HTTP or HTTPS base URL")
+                    })?;
+                if vault_servers
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(&url))
                 {
                     return Err(AppError::new(
-                        "Hosted Vault requires an approved server and a workspace token",
+                        "Vault address is outside the instance's allowed servers",
                     ));
                 }
+                if !matches!(
+                    config.token_source,
+                    VaultTokenSource::Keychain | VaultTokenSource::Oidc
+                ) {
+                    return Err(AppError::new(
+                        "Hosted Vault requires a workspace token (Keychain or OIDC)",
+                    ));
+                }
+                config.address = Some(url.to_string());
                 config.ca_cert_path = config
                     .ca_cert_path
                     .as_deref()
@@ -284,7 +295,7 @@ impl Runtime {
                 config.hosted = true;
                 Ok(config)
             },
-            self.config.database_endpoints.clone().into(),
+            self.config.restricted_database_endpoints().map(Arc::from),
             self.config.read_only,
         );
         let token = Uuid::new_v4();

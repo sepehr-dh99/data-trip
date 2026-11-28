@@ -112,6 +112,7 @@ fn validated_config(runtime: &Runtime, config: &ConnectionConfig) -> WebResult<(
             "This connection uses options unavailable on the hosted runtime",
         ));
     }
+    let allowed = runtime.config.restricted_database_endpoints();
     let port = match config.driver {
         Driver::Postgres => 5432,
         Driver::Mysql => 3306,
@@ -131,24 +132,34 @@ fn validated_config(runtime: &Runtime, config: &ConnectionConfig) -> WebResult<(
                 .unwrap_or_default()
                 .split(',')
                 .map(str::trim);
-            return check_endpoints(runtime, bootstrap, config.port.unwrap_or(9092));
+            return check_endpoints(allowed, bootstrap, config.port.unwrap_or(9092));
         }
     };
     if let Some(redis) = &config.redis {
         if config.driver == Driver::Redis && redis.mode == RedisMode::Sentinel {
-            return check_endpoints(runtime, redis.sentinels.iter().map(String::as_str), 26379);
+            return check_endpoints(allowed, redis.sentinels.iter().map(String::as_str), 26379);
         }
     }
+    // PostgreSQL treats a host starting with "/" as a local Unix socket directory.
+    if config.driver == Driver::Postgres
+        && config
+            .host
+            .as_deref()
+            .is_some_and(|host| host.starts_with('/'))
+    {
+        return Err(WebError::new(
+            StatusCode::BAD_REQUEST,
+            "Hosted PostgreSQL connections require a TCP host",
+        ));
+    }
+    let Some(allowed) = allowed else {
+        return Ok(());
+    };
     let ip = config
         .host
         .as_deref()
         .and_then(|host| host.parse::<IpAddr>().ok());
-    if ip.is_some_and(|ip| {
-        runtime
-            .config
-            .database_endpoints
-            .contains(&SocketAddr::new(ip, config.port.unwrap_or(port)))
-    }) {
+    if ip.is_some_and(|ip| allowed.contains(&SocketAddr::new(ip, config.port.unwrap_or(port)))) {
         return Ok(());
     }
     Err(WebError::new(
@@ -158,22 +169,24 @@ fn validated_config(runtime: &Runtime, config: &ConnectionConfig) -> WebResult<(
 }
 
 fn check_endpoints<'a>(
-    runtime: &Runtime,
+    allowed: Option<&[SocketAddr]>,
     entries: impl Iterator<Item = &'a str>,
     port: u16,
 ) -> WebResult<()> {
     let addresses: Vec<_> = entries.take(17).collect();
     if !addresses.is_empty()
         && addresses.len() <= 16
-        && addresses.iter().all(|address| {
-            let endpoint = address.parse::<SocketAddr>().ok().or_else(|| {
-                address
-                    .trim_matches(['[', ']'])
-                    .parse::<IpAddr>()
-                    .ok()
-                    .map(|ip| SocketAddr::new(ip, port))
-            });
-            endpoint.is_some_and(|endpoint| runtime.config.database_endpoints.contains(&endpoint))
+        && allowed.is_none_or(|allowed| {
+            addresses.iter().all(|address| {
+                let endpoint = address.parse::<SocketAddr>().ok().or_else(|| {
+                    address
+                        .trim_matches(['[', ']'])
+                        .parse::<IpAddr>()
+                        .ok()
+                        .map(|ip| SocketAddr::new(ip, port))
+                });
+                endpoint.is_some_and(|endpoint| allowed.contains(&endpoint))
+            })
         })
     {
         return Ok(());

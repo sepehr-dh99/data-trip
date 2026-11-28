@@ -11,3 +11,4 @@ src-tauri/target/
 src-tauri/gen/
 src-tauri/tauri.updater-ci.conf.json
 .DS_Store
+.idea

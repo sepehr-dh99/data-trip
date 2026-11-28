@@ -12,14 +12,19 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub assets_dir: PathBuf,
     pub auth: Auth,
-    pub database_endpoints: Vec<SocketAddr>,
+    #[serde(default)]
+    database_endpoints: Vec<SocketAddr>,
+    #[serde(default)]
+    restrict_database_endpoint: bool,
     #[serde(default)]
     pub read_only: bool,
     /// Enable only when every network connection from the runtime is filtered at deployment.
     #[serde(default)]
     pub kafka_network_policy: bool,
     #[serde(default)]
-    pub vault_servers: Vec<Url>,
+    vault_servers: Vec<Url>,
+    #[serde(default)]
+    restrict_vault_server: bool,
     #[serde(default)]
     pub ssh_endpoints: Vec<SocketAddr>,
     pub openai_url: Option<Url>,
@@ -42,6 +47,15 @@ fn drain_seconds() -> u64 {
 
 fn idle_seconds() -> u64 {
     900
+}
+
+pub fn valid_http_endpoint(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url.host().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 
 #[derive(Deserialize)]
@@ -76,6 +90,16 @@ pub struct Oidc {
 }
 
 impl Config {
+    pub fn restricted_database_endpoints(&self) -> Option<&[SocketAddr]> {
+        self.restrict_database_endpoint
+            .then_some(self.database_endpoints.as_slice())
+    }
+
+    pub fn restricted_vault_servers(&self) -> Option<&[Url]> {
+        self.restrict_vault_server
+            .then_some(self.vault_servers.as_slice())
+    }
+
     pub fn load(path: &str) -> Result<(Self, [u8; 32])> {
         let mut config: Self = serde_yaml::from_slice(
             &std::fs::read(path).context("Read web config")?,
@@ -133,13 +157,7 @@ impl Config {
             .chain(config.openai_url.iter())
             .chain(config.ollama_url.iter())
         {
-            if !matches!(url.scheme(), "http" | "https")
-                || url.host().is_none()
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.query().is_some()
-                || url.fragment().is_some()
-            {
+            if !valid_http_endpoint(url) {
                 bail!("Invalid Vault or AI endpoint configuration");
             }
         }
