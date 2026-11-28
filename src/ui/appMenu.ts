@@ -1,11 +1,9 @@
 // The app menu. macOS: the native menu bar (built in src-tauri/src/lib.rs, same ids) sends a Tauri event "menu"
 // with the item id. Windows / Linux: no native menu bar; the ☰ button at the left of the console tab bar opens the
 // same structure as an in-app two-level dropdown. Both end up in App.runCommand(id).
-import { listen } from "@tauri-apps/api/event";
+import { hasNativeMenu, listen } from "../platform";
 import { showMenu } from "./menu";
 import type { MenuItem } from "./menu";
-
-export const IS_MAC = /Mac/.test(navigator.userAgent);
 
 /** Ids of the custom menu items (native menu ids in lib.rs must match). */
 export type MenuCommand =
@@ -48,6 +46,7 @@ export type MenuCommand =
   | "helpShortcuts"
   | "helpPalette"
   | "checkUpdates"
+  | "signOut"
   | "saveFile"
   | "saveFileAs"
   | "exportSelection"
@@ -79,6 +78,7 @@ export interface AppMenuSection {
 
 /** Listens for native menu clicks (macOS). Harmless elsewhere and outside Tauri (dev preview). */
 export function listenNativeMenu(run: (id: string) => void): void {
+  if (!hasNativeMenu()) return;
   try {
     void listen<string>("menu", (e) => run(String(e.payload))).catch(() => undefined);
   } catch {

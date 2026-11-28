@@ -1,0 +1,22 @@
+bind: 127.0.0.1:8080
+publicOrigin: http://127.0.0.1:1421
+dataDir: .datatrip-web/dev
+assetsDir: dist-web
+workspaceKeyEnv: DATATRIP_WEB_WORKSPACE_KEY
+auth:
+  anonymous: true
+
+# Set to true to allow only the numeric IP:port pairs listed below.
+# When false (the default), the list is optional and connections can use DNS hostnames.
+restrictDatabaseEndpoint: false
+#databaseEndpoints:
+#  - 127.0.0.1:55432
+#  - 172.25.1.75:5432
+#  - 172.25.1.75:5433
+#  - 172.25.1.75:5434
+#  - 172.25.1.35:5432
+
+# Set to true to allow only the Vault base URLs listed below.
+restrictVaultServer: false
+# vaultServers:
+#   - "https://vault.example.com:8200"

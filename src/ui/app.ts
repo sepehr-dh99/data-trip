@@ -6,8 +6,7 @@ import { DRIVER_LABELS } from "../types";
 import { confirmDialog } from "./confirm";
 import { ConsolePane } from "./console";
 import type { ConsoleHost } from "./console";
-import { openConnectionDialog } from "./connDialog";
-import { openImportDialog } from "./importDialog";
+import { openConnectionDialog, openImportDialog, openSettings } from "./dialogs";
 import { brandMark, clear, copyText, errMsg, h, icon } from "./dom";
 import { Explorer } from "./explorer";
 import type { OpenConsoleOpts } from "./explorer";
@@ -21,7 +20,8 @@ import type { KeyHost } from "./keyView";
 import type { TabPane } from "./tabs";
 import { TabStrip, autoName } from "./tabRail";
 import { formatBinding, matchAction, shortcutLabel } from "./keymap";
-import { IS_MAC as MENU_MAC, listenNativeMenu, showAppMenu } from "./appMenu";
+import { listenNativeMenu, showAppMenu } from "./appMenu";
+import { getPlatform, hasNativeMenu, isDesktop, preferences } from "../platform";
 import type { AppMenuEntry, AppMenuSection, MenuCommand } from "./appMenu";
 import { isPaletteOpen, openPalette } from "./palette";
 import type { PaletteItem } from "./palette";
@@ -31,7 +31,6 @@ import { closeMenu } from "./menu";
 import { qualifiedName } from "./sqlutil";
 import { openVaultProfilesDialog } from "./vaultDialog";
 import { openSshProfilesDialog } from "./sshDialog";
-import { openSettings } from "./settingsDialog";
 import { Navigator } from "./navigator";
 import { openScopePicker } from "./scopePicker";
 import { store } from "./state";
@@ -93,7 +92,7 @@ export class App {
   private btnAdd!: HTMLButtonElement;
   private stack = h("div", { class: "stack" });
   private empty = h("div", { class: "empty-state" });
-  private sidebarW = Number(localStorage.getItem("dt.sidebarW")) || 288;
+  private sidebarW = Number(preferences.getItem("dt.sidebarW")) || 288;
   private selectedConn: string | null = null;
   private prevStatus = new Map<string, string>();
   private btnHistory!: HTMLButtonElement;
@@ -244,8 +243,10 @@ export class App {
     });
     window.addEventListener("paste", (e) => this.onPaste(e));
     // In-app updates: the open tabs are saved right before an update restarts the app.
-    setBeforeRestart(() => this.saver.flush());
-    void initUpdates();
+    if (isDesktop()) {
+      setBeforeRestart(() => this.saver.flush());
+      void initUpdates();
+    }
   }
 
   private inEditable(t: EventTarget | null): boolean {
@@ -297,7 +298,14 @@ export class App {
     void vaults.load();
     // Restore consoles on launch (without the connection list every tab would be dropped: then don't restore
     // and don't save either, so the saved workspace survives for the next start).
-    if (loaded && getSettings().data.restoreConsoles) await this.restoreWorkspace();
+    if (loaded && getSettings().data.restoreConsoles) {
+      try {
+        await this.restoreWorkspace();
+      } catch (error) {
+        loaded = false;
+        toast(`Could not restore your workspace. Reload to try again: ${errMsg(error)}`, "error");
+      }
+    }
     this.wsReady = loaded;
     // First launch: the welcome tour (once; Help › Welcome tour restarts it).
     maybeStartTour();
@@ -483,7 +491,7 @@ export class App {
     this.capsule = capsule;
 
     // macOS: the strip above the content can move the window (there is no native title bar).
-    const dragStrip = h("div", { class: "sheet-drag", "aria-hidden": "true", ...(IS_MAC ? { "data-tauri-drag-region": "" } : {}) });
+    const dragStrip = h("div", { class: "sheet-drag", "aria-hidden": "true", ...(hasNativeMenu() ? { "data-tauri-drag-region": "" } : {}) });
     const sheet = h(
       "section",
       { class: "sheet", "aria-label": "Workspace" },
@@ -511,7 +519,7 @@ export class App {
         window.removeEventListener("pointermove", move);
         window.removeEventListener("pointerup", up);
         document.body.classList.remove("resizing-col");
-        localStorage.setItem("dt.sidebarW", String(this.sidebarW));
+        preferences.setItem("dt.sidebarW", String(this.sidebarW));
       };
       document.body.classList.add("resizing-col");
       window.addEventListener("pointermove", move);
@@ -556,7 +564,7 @@ export class App {
 
   /** Windows / Linux: ☰ at the left of the tab bar opens the app menu (macOS has the native menu bar). */
   private appMenuButton(): HTMLElement | null {
-    if (MENU_MAC) return null;
+    if (hasNativeMenu()) return null;
     const glyph = h("span", { class: "ico", "aria-hidden": "true" });
     glyph.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>';
     const btn = h("button", { class: "cap-icon cap-menu", type: "button", title: "Menu", "aria-label": "Menu", "aria-haspopup": "menu" }, glyph);
@@ -941,7 +949,9 @@ export class App {
           null,
           hasConns
             ? "Double-click a table (or click a Redis key, Kafka topic or group) in the explorer to open it, or start a blank console and write some SQL."
-            : "DataTrip works with PostgreSQL, MySQL / MariaDB, SQLite, SQL Server, Redis and Kafka. Credentials stay in your system keychain.",
+            : `DataTrip works with PostgreSQL, MySQL / MariaDB, SQLite, SQL Server, Redis and Kafka. ${
+                isDesktop() ? "Credentials stay in your system keychain." : "Saved passwords and tokens are encrypted in your workspace."
+              }`,
         ),
         h(
           "div",
@@ -979,7 +989,7 @@ export class App {
     };
     switch (id as MenuCommand) {
       case "about":
-        toast("DataTrip — a fast, lightweight database IDE", "info");
+        toast(isDesktop() ? "DataTrip — a fast, lightweight database IDE" : `DataTrip Web ${getPlatform().version ?? ""}`.trim(), "info");
         return;
       case "settings":
         openSettings();
@@ -1076,7 +1086,11 @@ export class App {
       case "welcomeTour":
         startTour();
         return;
+      case "signOut":
+        void this.saver.flush().then(() => getPlatform().signOut?.());
+        return;
       case "checkUpdates":
+        if (!isDesktop()) return;
         void checkForUpdates(true);
         return;
       case "runStatement":
@@ -1231,7 +1245,8 @@ export class App {
     act("newCrossSource", "New cross-source console", "layers", "", "federated join several data sources");
     act("attachSource", "Attach source to this console…", "layers", "", "cross-source federated", !c || c.isLineBased);
     act("crossSourceGuide", "How do cross-source queries work?", "layers", "", "guide help example");
-    act("checkUpdates", "Check for updates…", "refresh", "", "update upgrade new version release");
+    if (isDesktop()) act("checkUpdates", "Check for updates…", "refresh", "", "update upgrade new version release");
+    else act("signOut", "Sign out", "close", "", "account logout");
     act("reconnect", curName ? `Reconnect ${curName}` : "Reconnect data source", "refresh", k("reconnect"), "connection", !cur);
     act("formatSql", "Format SQL", "sort", k("formatSql"), "beautify pretty", !c || c.isLineBased);
     act("explain", "Explain plan", "layers", k("explain"), "explain analyze query plan performance index slow", !c || c.isLineBased);
@@ -1412,7 +1427,7 @@ export class App {
           { id: "keyboardShortcuts", label: "Keyboard shortcuts…" },
           { id: "crossSourceGuide", label: "Cross-source queries guide" },
           { id: "commandPalette", label: "Command palette…", hint: k("commandPalette") },
-          { id: "checkUpdates", label: "Check for updates…" },
+          isDesktop() ? { id: "checkUpdates", label: "Check for updates…" } : { id: "signOut", label: "Sign out" },
         ],
       },
     ];

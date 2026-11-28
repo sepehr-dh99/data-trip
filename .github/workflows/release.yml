@@ -64,6 +64,9 @@ jobs:
       - name: cargo check
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
+      - name: Shared operation registration
+        run: node scripts/check-operation-parity.mjs
+
       - name: cargo clippy
         continue-on-error: true
         run: cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
@@ -147,9 +150,20 @@ jobs:
         shell: bash
         env:
           KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          DATATRIP_UPDATER_PUBKEY: ${{ vars.TAURI_UPDATER_PUBKEY }}
         run: |
           if [ -n "$KEY" ]; then
-            echo "args=--config src-tauri/tauri.updater.conf.json" >> "$GITHUB_OUTPUT"
+            # The bundler reads the verification key from its merged config; the runtime
+            # also receives the same key from the build environment.
+            node --input-type=module <<'JS'
+            import { readFileSync, writeFileSync } from "node:fs";
+            const pubkey = process.env.DATATRIP_UPDATER_PUBKEY?.trim();
+            if (!pubkey) throw new Error("TAURI_UPDATER_PUBKEY is required for signed updater artifacts");
+            const config = JSON.parse(readFileSync("src-tauri/tauri.updater.conf.json", "utf8"));
+            config.plugins = { updater: { pubkey } };
+            writeFileSync("src-tauri/tauri.updater-ci.conf.json", JSON.stringify(config));
+          JS
+            echo "args=--config src-tauri/tauri.updater-ci.conf.json" >> "$GITHUB_OUTPUT"
           else
             echo "No TAURI_SIGNING_PRIVATE_KEY secret: building without update signatures."
           fi

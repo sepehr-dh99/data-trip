@@ -2,6 +2,7 @@
 // document (CSS variables + classes) and change notification. The frontend owns the shape; the backend stores
 // the raw JSON verbatim.
 import { api } from "../api";
+import { isDesktop } from "../platform";
 import { DEFAULT_THEME, TOKEN_KEYS, getTheme } from "./themes";
 import type { TokenKey } from "./themes";
 import { getDensity, setDensity } from "./prefs";
@@ -302,7 +303,8 @@ export async function loadSettings(): Promise<void> {
   let raw: unknown = {};
   try {
     raw = await api.getSettings();
-  } catch {
+  } catch (error) {
+    if (!isDesktop()) throw error;
     raw = {};
   }
   current = mergeSettings(raw);
@@ -333,6 +335,7 @@ function scheduleSave(): void {
     saveTimer = undefined;
     api.saveSettings(current as unknown as Record<string, unknown>).catch(() => {
       /* best effort: the next change retries */
+      if (!isDesktop()) window.dispatchEvent(new Event("dt-workspace-save-failed"));
     });
   }, 300);
 }

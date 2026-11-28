@@ -3,8 +3,7 @@
 // Options (truncate, conflicts, batches, transactions, SQL preview) → Import (progress, counts, failed rows).
 // Parsing / inserting happens in the backend (import_preview / import_run, src-tauri/src/import.rs).
 import "../styles/data.css";
-import { open, save } from "@tauri-apps/plugin-dialog";
-import { listen } from "@tauri-apps/api/event";
+import { open, save, listen } from "../platform";
 import { api } from "../api";
 import type { ImportFailure, ImportFormat, ImportPreview, ImportProgress, ImportRequest, SessionInfo, TableNode } from "../types";
 import { clear, copyText, debounce, errMsg, h, icon } from "./dom";
@@ -283,7 +282,7 @@ class ImportWizard {
   private async chooseFile(): Promise<void> {
     let p: string | null = null;
     try {
-      const r = await open({ multiple: false, directory: false, title: "Import data from…", filters: FILTERS });
+      const r = await open({ multiple: false, directory: false, title: "Import data from…", filters: FILTERS, purpose: "import" });
       p = typeof r === "string" ? r : null;
     } catch (e) {
       toast(`Couldn't open the file dialog: ${errMsg(e)}`, "error");
@@ -709,7 +708,7 @@ class ImportWizard {
     this.seen.clear();
     this.finishedMsg = null;
     this.runErr = null;
-    this.runId = "imp-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+    this.runId = globalThis.crypto.randomUUID?.() ?? "imp-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
     this.render();
     let unlisten: (() => void) | null = null;
     let sess: SessionInfo | null = null;
@@ -830,7 +829,7 @@ class ImportWizard {
 
   private async saveFailures(): Promise<void> {
     const req = this.request();
-    const path = await save({ title: "Save failed rows", defaultPath: this.fileName().replace(/\.[^.]+$/, "") + "_failed.csv", filters: [{ name: "CSV", extensions: ["csv"] }] }).catch(() => null);
+    const path = await save({ title: "Save failed rows", defaultPath: this.fileName().replace(/\.[^.]+$/, "") + "_failed.csv", filters: [{ name: "CSV", extensions: ["csv"] }], purpose: "output" }).catch(() => null);
     if (!path || !req) return;
     const q = (s: string | null): string => (s === null ? "" : /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s);
     const head = ["line", ...req.mapping.map((m) => req.sourceColumns[m.source]), "error"];

@@ -201,3 +201,10 @@ Downloads are verified with the project's update signing key, so this needs a on
 
 Keep the private key safe: every future update must be signed with the same key. Builds made without these
 settings still work, with the updater turned off. On Linux, updates install for the AppImage.
+
+## Hosted web preview
+
+After `npm ci`, use `npm run local` for desktop or `npm run local -- web` for browser development.
+
+DataTrip also has an independent headless web build. See [WEB.md](WEB.md) for launch commands,
+instance configuration, packaging, and the current workflow validation status.

@@ -1,16 +1,17 @@
 // Small localStorage-backed preferences: explorer density, folder collapse state, remembered
 // unchecked databases (scope) and recently opened objects.
+import { preferences } from "../platform";
 
 function get(key: string): string | null {
   try {
-    return localStorage.getItem(key);
+    return preferences.getItem(key);
   } catch {
     return null;
   }
 }
 function set(key: string, value: string): void {
   try {
-    localStorage.setItem(key, value);
+    preferences.setItem(key, value);
   } catch {
     /* storage unavailable: preferences just don't persist */
   }

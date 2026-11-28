@@ -1,0 +1,28 @@
+.web-entry {
+  width: min(26rem, 90vw);
+  margin: 12vh auto;
+  padding: 2rem;
+  border: 1px solid var(--line);
+  border-radius: 1rem;
+  display: grid;
+  gap: 1rem;
+}
+.web-entry form, .web-entry label {
+  display: grid;
+  gap: .5rem;
+}
+.web-entry :is(input, button) {
+  font: inherit;
+  padding: .5rem .7rem;
+  border: 1px solid var(--line);
+  border-radius: .4rem;
+}
+.web-save-failed {
+  position: fixed;
+  z-index: 1000;
+  right: 1rem;
+  bottom: 1rem;
+  padding: .8rem 1rem;
+  border-radius: .5rem;
+  border: 1px solid currentColor;
+}

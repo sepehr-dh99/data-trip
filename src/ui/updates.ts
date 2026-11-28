@@ -2,7 +2,7 @@
 // version exists, download in the background with progress, then restart (or install for the
 // next launch). The backend side is src-tauri/src/updater.rs.
 import "../styles/updates.css";
-import { listen } from "@tauri-apps/api/event";
+import { listen } from "../platform";
 import { api } from "../api";
 import type { UpdateInfo, UpdateStatus } from "../types";
 import { errMsg, h } from "./dom";

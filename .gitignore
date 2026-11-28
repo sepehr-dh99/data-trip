@@ -1,5 +1,14 @@
 node_modules/
 dist/
+dist-web/
+src-web/target/
+crates/*/target/
+crates/datatrip-core/Cargo.lock
+crates/datatrip-import-format/Cargo.lock
+src/generated/
+.datatrip-web/
 src-tauri/target/
 src-tauri/gen/
+src-tauri/tauri.updater-ci.conf.json
 .DS_Store
+.idea

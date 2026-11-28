@@ -1,5 +1,5 @@
 // Connection create/edit dialog.
-import { open } from "@tauri-apps/plugin-dialog";
+import { getPlatform, isDesktop, open, save } from "../platform";
 import { api } from "../api";
 import { DEFAULT_PORTS, DRIVER_LABELS } from "../types";
 import type { AuthMethod, ConnectionConfig, Driver, KafkaConfig, RedisMode, RedisOptions, RedisReadFrom, VaultCheck, VaultConfig, VaultTokenSource } from "../types";
@@ -153,7 +153,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
         class: "btn",
         onclick: async () => {
           try {
-            const p = await open({ multiple: false, directory: false, title });
+            const p = await open({ multiple: false, directory: false, title, purpose: "material" });
             if (typeof p === "string") target.value = p;
           } catch (e) {
             errEl.className = "test-result err";
@@ -633,7 +633,7 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
             class: "btn",
             onclick: async () => {
               try {
-                const p = await open({ multiple: false, directory: false, title: "Choose SQLite database file" });
+                const p = await open({ multiple: false, directory: false, title: "Choose SQLite database file", purpose: "sqlite" });
                 if (typeof p === "string") {
                   inFile.value = p;
                   if (!nameTouched) inName.value = p.split(/[\\/]/).pop() ?? p;
@@ -647,6 +647,27 @@ export function openConnectionDialog(existing: ConnectionConfig | null, onSaved:
           icon("folder", 14),
           "Browse…",
         ),
+        isDesktop() ? null : h("button", {
+          type: "button", class: "btn", onclick: async () => {
+            try {
+              const file = await save({ title: "Create workspace SQLite file", defaultPath: "database.sqlite", purpose: "sqlite" });
+              if (file) {
+                inFile.value = file;
+                if (!nameTouched) inName.value = file.split("/").pop() ?? "SQLite";
+              }
+            } catch (e) {
+              result.className = "test-result err";
+              result.textContent = errMsg(e);
+            }
+          },
+        }, "Create…"),
+        isDesktop() ? null : h("button", {
+          type: "button", class: "btn",
+          onclick: () => {
+            const path = inFile.value.trim();
+            if (path) getPlatform().download?.(path);
+          },
+        }, "Download snapshot"),
       ),
     ),
   );

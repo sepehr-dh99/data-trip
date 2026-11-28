@@ -139,7 +139,7 @@
 .sheet.tabs-right .history-drawer {
   right: calc(var(--rail-w, 248px) + 12px);
 }
-html.mac .shell.no-sidebar .sheet.tabs-left .cap-wrap {
+html.desktop.mac .shell.no-sidebar .sheet.tabs-left .cap-wrap {
   left: calc(var(--rail-w, 248px) + 16px);
 }
 
@@ -164,7 +164,7 @@ html.mac .shell.no-sidebar .sheet.tabs-left .cap-wrap {
   right: 0;
   box-shadow: inset 1px 0 0 var(--hair);
 }
-html.mac .shell.no-sidebar .sheet.tabs-left .tab-rail {
+html.desktop.mac .shell.no-sidebar .sheet.tabs-left .tab-rail {
   padding-top: 28px;
 }
 .rail-head {

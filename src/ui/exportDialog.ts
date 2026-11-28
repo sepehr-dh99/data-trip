@@ -1,5 +1,5 @@
 // Export dialog: format + options on the left, live preview on the right, Copy / Save in the footer.
-import { save } from "@tauri-apps/plugin-dialog";
+import { preferences, save } from "../platform";
 import { api } from "../api";
 import type { Cell, Driver, ExportOptions, ExportTextFormat } from "../types";
 import { clear, copyText, errMsg, h, icon } from "./dom";
@@ -51,13 +51,13 @@ const KEY_FORMAT = "dt.export.format";
 const keyFor = (f: ExportTextFormat): string => "dt.export.opts." + f;
 
 export function lastExportFormat(): ExportTextFormat {
-  const f = localStorage.getItem(KEY_FORMAT) as ExportTextFormat | null;
+  const f = preferences.getItem(KEY_FORMAT) as ExportTextFormat | null;
   return f && FORMATS.includes(f) ? f : "csv";
 }
 
 export function loadPrefs(f: ExportTextFormat): ExportPrefs {
   try {
-    const raw = localStorage.getItem(keyFor(f));
+    const raw = preferences.getItem(keyFor(f));
     if (raw) return { ...DEFAULT_PREFS, ...(JSON.parse(raw) as Partial<ExportPrefs>) };
   } catch {
     /* corrupt entry: fall back to defaults */
@@ -66,7 +66,7 @@ export function loadPrefs(f: ExportTextFormat): ExportPrefs {
 }
 
 function savePrefs(f: ExportTextFormat, p: ExportPrefs): void {
-  localStorage.setItem(keyFor(f), JSON.stringify(p));
+  preferences.setItem(keyFor(f), JSON.stringify(p));
 }
 
 export function prefsToOptions(format: ExportTextFormat, p: ExportPrefs, tableName: string | null): ExportOptions {
@@ -195,7 +195,7 @@ export function openExportDialog(p: ExportDialogParams): void {
   function setFormat(f: ExportTextFormat): void {
     format = f;
     prefs = loadPrefs(f);
-    localStorage.setItem(KEY_FORMAT, f);
+    preferences.setItem(KEY_FORMAT, f);
     refresh();
   }
 
@@ -283,10 +283,13 @@ export function openExportDialog(p: ExportDialogParams): void {
   async function doSave(): Promise<void> {
     if (busy) return;
     const ext = FORMAT_EXT[format];
-    const path = await save({ title: "Export result", defaultPath: "result." + ext, filters: [{ name: FORMAT_LABEL[format], extensions: [ext] }] });
-    if (!path) return;
     setBusy(true);
     try {
+      const path = await save({ title: "Export result", defaultPath: "result." + ext, filters: [{ name: FORMAT_LABEL[format], extensions: [ext] }], purpose: "output" });
+      if (!path) {
+        setBusy(false);
+        return;
+      }
       let n: number;
       if (scope === "all") {
         n = await api.exportQueryWith(await p.getSessionId(), p.sql as string, options(), path);

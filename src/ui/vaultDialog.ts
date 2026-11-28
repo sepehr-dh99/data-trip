@@ -1,5 +1,5 @@
 // Vault profiles manager: two panes (profiles + editor). Replacing a token = paste into the big field.
-import { open } from "@tauri-apps/plugin-dialog";
+import { open } from "../platform";
 import type { VaultProfile, VaultTokenSource } from "../types";
 import { clear, errMsg, h, icon } from "./dom";
 import { confirmDialog } from "./confirm";
@@ -109,7 +109,7 @@ export function openVaultProfilesDialog(opts: VaultDialogOpts = {}): void {
           type: "button",
           onclick: async () => {
             try {
-              const p = await open({ multiple: false, directory: false, title });
+              const p = await open({ multiple: false, directory: false, title, purpose: "material" });
               if (typeof p === "string") target.value = p;
             } catch (e) {
               showErr(errMsg(e));

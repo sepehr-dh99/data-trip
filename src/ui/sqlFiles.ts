@@ -2,8 +2,7 @@
 // Open SQL file (⌘O, "Run it against" picker remembered per file, recent files), Export selection, dropping a
 // .sql file on the window (opens an unbound copy) and Run SQL file (a bottom panel; the backend streams the file
 // from disk, splits and executes it — backend `run_sql_file`).
-import { open, save } from "@tauri-apps/plugin-dialog";
-import { listen } from "@tauri-apps/api/event";
+import { getPlatform, open, save, listen } from "../platform";
 import { EditorState, StateEffect } from "@codemirror/state";
 import type { EditorView } from "@codemirror/view";
 import { api } from "../api";
@@ -554,7 +553,7 @@ export class FileBinding {
   async saveAs(): Promise<boolean> {
     let p: string | null;
     try {
-      p = await save({ title: "Save SQL file", defaultPath: this.path ?? suggestedName(this.hooks.title()), filters: FILTERS });
+      p = await save({ title: "Save SQL file", defaultPath: this.path ?? suggestedName(this.hooks.title()), filters: FILTERS, purpose: "sql" });
     } catch (e) {
       toast(`Couldn't open the save dialog: ${errMsg(e)}`, "error");
       return false;
@@ -566,7 +565,9 @@ export class FileBinding {
       this.hooks.view().dispatch({ effects: StateEffect.appendConfig.of([EditorState.readOnly.of(false)]) });
       this.hideBanner();
     }
-    return this.writeTo(p, null);
+    const written = await this.writeTo(p, null);
+    if (written) getPlatform().download?.(p);
+    return written;
   }
 
   private async writeTo(path: string, expected: number | null): Promise<boolean> {
@@ -615,7 +616,7 @@ export class FileBinding {
     const text = sel || st.doc.toString();
     let p: string | null;
     try {
-      p = await save({ title: sel ? "Export selection as .sql" : "Export console as .sql", defaultPath: suggestedName(this.path ? baseName(this.path).replace(/\.(sql|txt)$/i, "") + (sel ? "_selection" : "_copy") : this.hooks.title()), filters: FILTERS });
+      p = await save({ title: sel ? "Export selection as .sql" : "Export console as .sql", defaultPath: suggestedName(this.path ? baseName(this.path).replace(/\.(sql|txt)$/i, "") + (sel ? "_selection" : "_copy") : this.hooks.title()), filters: FILTERS, purpose: "sql", localCopy: true });
     } catch (e) {
       toast(`Couldn't open the save dialog: ${errMsg(e)}`, "error");
       return;
@@ -623,6 +624,7 @@ export class FileBinding {
     if (!p) return;
     try {
       await api.sqlFileWrite(p, text.endsWith("\n") ? text : text + "\n", null, false);
+      getPlatform().download?.(p);
       addRecent(p);
       toast(`Exported to ${baseName(p)}`, "ok");
     } catch (e) {
@@ -674,7 +676,7 @@ export async function openSqlFile(path?: string): Promise<void> {
   let p = path ?? null;
   if (!p) {
     try {
-      const r = await open({ multiple: false, directory: false, title: "Open SQL file", filters: FILTERS });
+      const r = await open({ multiple: false, directory: false, title: "Open SQL file", filters: FILTERS, purpose: "sql" });
       p = typeof r === "string" ? r : null;
     } catch (e) {
       toast(`Couldn't open the file dialog: ${errMsg(e)}`, "error");
@@ -766,7 +768,7 @@ export async function runSqlFileFlow(o: { console?: ConsolePane; connId?: string
   if (!p) {
     const on = o.console ? connLabel(o.console.connId, o.console.database) : o.connId ? connLabel(o.connId, o.database ?? null) : "";
     try {
-      const r = await open({ multiple: false, directory: false, title: on ? `Run SQL file on ${on}` : "Run SQL file", filters: FILTERS });
+      const r = await open({ multiple: false, directory: false, title: on ? `Run SQL file on ${on}` : "Run SQL file", filters: FILTERS, purpose: "script" });
       p = typeof r === "string" ? r : null;
     } catch (e) {
       toast(`Couldn't open the file dialog: ${errMsg(e)}`, "error");
@@ -923,7 +925,7 @@ class RunPanel {
     const stop = this.btn("Stop", "sr-stop", () => void this.stop(stop));
     this.actions.append(stop);
     this.counts.textContent = "Connecting…";
-    this.runId = "run-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+    this.runId = globalThis.crypto.randomUUID?.() ?? "run-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
     let unlisten: (() => void) | null = null;
     let sess: SessionInfo | null = null;
     try {
